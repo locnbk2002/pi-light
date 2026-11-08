@@ -291,7 +291,7 @@ function fakePage(pageOrigin = origin) {
   return page;
 }
 
-async function loadAddon(options: { token: string; tabs?: Array<{ id: number; url: string; title?: string }>; stored?: Record<string, unknown>; page?: any; attachFails?: boolean; gate?: { group?: () => Promise<void>; attach?: (tabId: number) => Promise<void> } }) {
+async function loadAddon(options: { token: string; tabs?: Array<{ id: number; url: string; title?: string }>; stored?: Record<string, unknown>; page?: any; attachFails?: boolean; gate?: { group?: () => Promise<void>; attach?: (tabId: number) => Promise<void>; remove?: () => Promise<void> } }) {
   const [background, cdpSource] = await Promise.all(["background.js", "cdp.js"].map(f => readFile(new URL(`./browser-addon/${f}`, import.meta.url), "utf8")));
   const listeners: Record<string, Array<(...args: any[]) => void>> = {};
   const event = (name: string) => ({ addListener: (f: (...args: any[]) => void) => { (listeners[name] ??= []).push(f); } });
@@ -320,7 +320,7 @@ async function loadAddon(options: { token: string; tabs?: Array<{ id: number; ur
       onRemoved: event("removed"), onUpdated: event("updated"), onReplaced: event("replaced"),
       get: async (id: number) => { const tab = tabs.get(id); if (!tab) throw new Error("No tab"); return tab; },
       create: async ({ url }: { url: string }) => { const tab = { id: nextId++, url, title: "" }; tabs.set(tab.id, tab); return tab; },
-      remove: async (ids: number | number[]) => { for (const id of [ids].flat()) { tabs.delete(id); removed.push(id); fire("removed", id); } },
+      remove: async (ids: number | number[]) => { await options.gate?.remove?.(); for (const id of [ids].flat()) { tabs.delete(id); removed.push(id); fire("removed", id); } },
       group: async () => { await options.gate?.group?.(); return 5; }
     },
     tabGroups: { update: async () => {} },
@@ -536,13 +536,13 @@ test("add-on only allowlisted CDP methods and fixed page functions", async () =>
   assert.equal((background.match(/chrome\.debugger\.sendCommand/g) ?? []).length, 0);
 });
 
-test("browser tool confirms mutations, refuses them read-only, and returns screenshots as images", async t => {
+test("browser tool: open always asks, bound-tab mutations and console ask, Pi-owned tabs run freely, read-only blocks mutations", async t => {
   const tools: any[] = [];
   const pi = { registerCommand: () => {}, registerTool: (tool: any) => tools.push(tool), on: () => {} };
-  const requests: unknown[] = [];
+  const requests: Array<{ action: string }> = [];
   const fake = ({
-    start: async () => {}, connected: true, tabs: [owned],
-    resolveTab: (name?: string) => (!name || name === "main" ? { ...owned } : undefined),
+    start: async () => {}, connected: true, tabs: [bound, owned],
+    resolveTab: (name?: string) => (!name || name === "bound" ? { ...bound } : name === "main" ? { ...owned } : undefined),
     request: async (action: { action: string }) => { requests.push(action); return action.action === "screenshot" ? { data: "QUJD", width: 2, height: 1 } : { ok: 1 }; }
   });
   let readOnly = false;
@@ -551,29 +551,64 @@ test("browser tool confirms mutations, refuses them read-only, and returns scree
   const confirms: string[] = [];
   let answer = true;
   const ctx = { hasUI: true, mode: "tui", ui: { confirm: async (_title: string, message: string) => { confirms.push(message); return answer; }, notify: () => {} } };
-  const shot = await tool.execute("1", { action: "screenshot" }, undefined, undefined, ctx);
+  const run = (params: object, context: object = ctx) => tool.execute("id", params, undefined, undefined, context);
+
+  const shot = await run({ action: "screenshot" });
   assert.deepEqual(shot.content[1], { type: "image", data: "QUJD", mimeType: "image/jpeg" });
   assert.equal(confirms.length, 0, "reads need no confirmation");
-  await tool.execute("2", { action: "evaluate", code: "document.title" }, undefined, undefined, ctx);
-  assert.match(confirms.at(-1)!, /main \(owned\) https:\/\/example\.com[\s\S]*document\.title/);
+
+  // Opening a tab always asks.
+  await run({ action: "open", url: `${origin}/` });
+  assert.match(confirms.at(-1)!, /new tab[\s\S]*"open"/);
   answer = false;
-  await assert.rejects(tool.execute("3", { action: "click", selector: "a" }, undefined, undefined, ctx), /declined/);
+  await assert.rejects(run({ action: "open", url: `${origin}/` }), /declined/);
   answer = true;
-  readOnly = true;
-  await assert.rejects(tool.execute("4", { action: "open", url: `${origin}/` }, undefined, undefined, ctx), /read-only/);
-  await tool.execute("5", { action: "snapshot" }, undefined, undefined, ctx);
-  const before = confirms.length;
-  await tool.execute("5b", { action: "console" }, undefined, undefined, ctx);
-  assert.equal(confirms.length, before + 1, "console text needs confirmation, even in read-only mode");
+
+  // Pi-owned tab: every action runs without a prompt, even outside the TUI.
+  const owned0 = confirms.length;
+  for (const params of [{ action: "evaluate", code: "1" }, { action: "click", selector: "a" }, { action: "fill", selector: "input", text: "x" }, { action: "press", key: "Enter" }, { action: "navigate", url: "https://other.test/" }, { action: "console" }, { action: "close" }]) {
+    await run({ ...params, tab: "main" }, { ...ctx, mode: "rpc" });
+  }
+  assert.equal(confirms.length, owned0, "Pi-owned tabs never prompt");
+
+  // Bound user tab: mutations and console ask; declining stops the action.
+  await run({ action: "evaluate", code: "document.title" });
+  assert.match(confirms.at(-1)!, /bound \(bound\) https:\/\/example\.com[\s\S]*document\.title/);
+  await run({ action: "console" });
   assert.match(confirms.at(-1)!, /private data/);
   answer = false;
-  await assert.rejects(tool.execute("5c", { action: "console" }, undefined, undefined, ctx), /declined/);
+  await assert.rejects(run({ action: "click", selector: "a" }), /declined/);
+  await assert.rejects(run({ action: "console" }), /declined/);
   answer = true;
-  await assert.rejects(tool.execute("6", { action: "snapshot", tab: "nope" }, undefined, undefined, ctx), /No such controlled tab/);
+  await assert.rejects(run({ action: "click", selector: "a" }, { ...ctx, mode: "rpc" }), /interactive confirmation/);
+
+  // Read-only refuses mutations on every tab, but reads (including console) still work.
+  readOnly = true;
+  const blocked = requests.length;
+  await assert.rejects(run({ action: "open", url: `${origin}/` }), /read-only/);
+  await assert.rejects(run({ action: "click", selector: "a", tab: "main" }), /read-only/);
+  await assert.rejects(run({ action: "evaluate", code: "1", tab: "main" }), /read-only/);
+  await assert.rejects(run({ action: "close", tab: "main" }), /read-only/);
+  assert.equal(requests.length, blocked);
+  await run({ action: "snapshot", tab: "main" });
+  await run({ action: "console", tab: "main" });
+  await run({ action: "console" });
   readOnly = false;
-  await assert.rejects(tool.execute("7", { action: "click", selector: "a" }, undefined, undefined, { ...ctx, mode: "rpc" }), /interactive confirmation/);
-  assert.deepEqual(requests.map(r => (r as { action: string }).action), ["screenshot", "evaluate", "snapshot", "console"]);
+  await assert.rejects(run({ action: "snapshot", tab: "nope" }), /No such controlled tab/);
   t.diagnostic(`tool description length ${tool.description.length}`);
+});
+
+test("a request right after close is not refused as busy", { timeout: 5000 }, async t => {
+  const bridge = new BrowserBridge(19347, 2000);
+  t.after(() => bridge.close());
+  await bridge.start();
+  const addon = await loadAddon({ token: bridge.connectionInfo().token, gate: { remove: () => delay(300).then(() => {}) } });
+  await until(() => bridge.connected, "add-on connection");
+  await bridge.request({ action: "open", url: `${origin}/` });
+  assert.deepEqual(await bridge.request({ action: "close" }, bridge.resolveTab("main")), { closed: "main" });
+  // Previously the add-on stayed busy until the (slow) tab removal finished.
+  assert.deepEqual(plain(await bridge.request({ action: "tabs" })), { tabs: [] });
+  await until(() => addon.removed.length === 1, "tab removed");
 });
 
 test("actual add-on snapshots fit the full UTF-8 response envelope over WebSocket", { timeout: 8000 }, async t => {
@@ -646,6 +681,7 @@ test("disconnect during open, bind or re-adoption leaves no unkept tab or debugg
   await until(() => paused, "open paused in grouping");
   assert.ok(addon.attached.has(100));
   vm.runInContext("dropAll('test disconnect')", addon.context);
+  await until(() => addon.removed.length > 0, "in-flight tab removal");
   assert.deepEqual(addon.removed, [100], "the in-flight tab is closed at disconnect");
   release();
   await delay(20);

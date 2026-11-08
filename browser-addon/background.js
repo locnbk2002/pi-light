@@ -296,7 +296,8 @@ async function run(m, ws) {
     const limit = m.action === "screenshot" ? MAX_SCREENSHOT_RESULT : MAX_RESULT;
     if (new TextEncoder().encode(JSON.stringify(response)).length > limit) throw new Error("Result exceeds limit");
     send(response);
-    if (m.action === "close") { release(t); await chrome.tabs.remove(t.tabId).catch(() => {}); }
+    // Not awaited: the next request may arrive as soon as Pi has the result.
+    if (m.action === "close") { release(t); chrome.tabs.remove(t.tabId).catch(() => {}); }
   } finally { busy = false; }
 }
 

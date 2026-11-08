@@ -32,23 +32,25 @@ Then run `/browser-connect` in Pi and paste the URL and token into the add-on's 
 
 The `browser` tool takes named actions; there is no raw DevTools endpoint.
 
-| Action | What it does | Asks first |
+| Action | What it does | Asks first on your bound tab |
 |---|---|---|
 | `tabs` | List the tabs Pi controls | no |
-| `open {url, name?, keep?}` | Open a background tab Pi owns (default name `main`, grouped as "pi") | yes |
-| `close {tab}` | Close a tab Pi opened | yes |
+| `open {url, name?, keep?}` | Open a background tab Pi owns (default name `main`, grouped as "pi") | always asks |
+| `close {tab}` | Close a tab Pi opened | (Pi-owned only) |
 | `snapshot {mode: text\|ax}` | Visible text and controls, or the accessibility tree (roles and labels); never text typed into fields | no |
 | `screenshot {fullPage?}` | JPEG image, at most 1600 px wide and 8000 px tall | no |
 | `click`, `hover {selector}` | Real mouse input on one visible, uncovered element | click only |
 | `fill {selector, text}` | Real typing into a text field (never password, file or hidden fields) | yes |
 | `press {key}`, `scroll {dy}` | Real key press; mouse wheel | press only |
 | `waitFor {selector \| text, timeoutMs}` | Wait up to 8 s | no |
-| `console` | Last 200 console entries. URLs lose their query strings, but page-logged text can still hold private data | yes (allowed in read-only mode) |
-| `network` | Last 200 requests: method, origin and path, status and type, never headers or query strings | no |
+| `console` | Last 200 console entries. URLs lose their query strings, but page-logged text can still hold private data | yes |
+| `network` | Last 200 requests after Pi attached (a tab's first document request is usually missed): method, origin and path, status and type, never headers or query strings | no |
 | `evaluate {code}` | Run JavaScript in the page and return its JSON value | yes |
 | `navigate {url}` | Go to a URL. A bound tab must stay on its origin; Pi's own tabs may go anywhere over HTTP(S) | yes |
 
-Without `tab`, actions use the bound tab, then `main`, then the only controlled tab. Read-only mode refuses every action that asks first, except `console`.
+Approval: opening a tab always asks. On a tab Pi opened, every other action runs without a prompt, so approving `open` lets Pi browse, type, run scripts and read console output there, signed in as you. On the tab you bound, the actions marked above ask each time. Read-only mode refuses every action that changes something (open, close, click, fill, press, navigate, evaluate) on any tab.
+
+Without `tab`, actions use the bound tab, then `main`, then the only controlled tab.
 
 How control works and what it costs:
 

@@ -94,7 +94,15 @@ export function validateAction(value: unknown, target?: ControlledTab): BrowserA
 }
 export function needsTab(action: BrowserAction): boolean { return !TABLESS.has(action.action); }
 export function isMutation(action: BrowserAction): boolean { return MUTATIONS.has(action.action); }
-export function needsConfirmation(action: BrowserAction): boolean { return isMutation(action) || SENSITIVE_READS.has(action.action); }
+/**
+ * Local confirmation policy (user decision 2026-11-08): opening a tab always asks; actions on the user's
+ * bound tab ask for mutations and console text; Pi-owned tabs run without prompts. Read-only mode is separate.
+ */
+export function needsConfirmation(action: BrowserAction, target?: ControlledTab): boolean {
+  if (action.action === "open") return true;
+  if (target?.kind === "owned") return false;
+  return isMutation(action) || SENSITIVE_READS.has(action.action);
+}
 // Chromium browsers (Brave, Chrome, Edge) use chrome-extension://<32 chars a-p>.
 export function validExtensionOrigin(origin: unknown): boolean {
   return typeof origin === "string" && /^chrome-extension:\/\/[a-p]{32}\/?$/.test(origin);
