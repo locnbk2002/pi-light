@@ -369,6 +369,18 @@ test('routing metadata does not copy human text or private advisor transcripts',
   assert.equal(JSON.stringify(routed).includes(route.requestQuote), false);
 });
 
+test('workflow tells the Opus controller to delegate reviews to Sol, never a same-family model', async () => {
+  const harness = extensionHarness();
+  await currentRoute(harness, 'Fix hello.txt.');
+  const options = { sections: {} as Record<string, string> };
+  await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: options });
+  const workflow = options.sections.locbt_workflow;
+  assert.match(workflow, /implementing model is anthropic\/claude-opus-5-5 \(anthropic family\)/);
+  assert.match(workflow, /ALWAYS pass model: "openai-codex\/gpt-6\.1-sol"/);
+  assert.match(workflow, /consult_advisor conversation with astra/);
+  assert.match(workflow, /different vendor family than the model that implemented/);
+});
+
 test('durable routing bindings never move or disappear from signed history', async () => {
   const harness = extensionHarness();
   await harness.event('input', { text: 'Plan a test feature.', source: 'rpc' });

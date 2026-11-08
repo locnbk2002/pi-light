@@ -42,6 +42,27 @@ export function isLimitOrCapacityError(stopReason: unknown, errorMessage: unknow
 const MODEL_REF = /^[a-z0-9][a-z0-9._-]{0,63}\/[A-Za-z0-9][^\s]{0,199}$/;
 const PROVIDER = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
+/**
+ * Vendor family of a 'provider/model' reference, judged by model id so provider renames
+ * (e.g. claude-bridge serving Claude) do not hide it. Unknown ids fall back to the provider name.
+ */
+export function modelFamily(model: string): string {
+  const { provider, id } = splitModel(model);
+  if (/claude|opus|sonnet|haiku|fable/i.test(id)) return 'anthropic';
+  if (/gpt|codex|(?:^|[-_.])o\d|sol|astra/i.test(id)) return 'openai';
+  if (/gemini/i.test(id)) return 'google';
+  return provider;
+}
+
+/**
+ * Reviewer for work written by `implementer`: the first configured model (controller chain first,
+ * then advisor chains) from a different vendor family, so the review does not share the author's blind spots.
+ */
+export function reviewerModel(chains: ModelChains, implementer: string, isAvailable: (model: string) => boolean = () => true): string | undefined {
+  const family = modelFamily(implementer);
+  return [...chains.controller, ...chains.astra, ...chains.fable].find(model => modelFamily(model) !== family && isAvailable(model));
+}
+
 /** Rename the provider of a 'provider/model' reference (e.g. anthropic -> claude-bridge on a machine logged in elsewhere). */
 export function renameProvider(model: string, providers: Readonly<Record<string, string>>): string {
   const { provider, id } = splitModel(model);

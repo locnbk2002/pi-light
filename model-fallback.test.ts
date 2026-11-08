@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, loadModelChains, parseModelChains, planCandidates, providerExtension,
+import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, loadModelChains, modelFamily, parseModelChains, planCandidates, providerExtension, reviewerModel,
   routeController } from './model-fallback.ts';
 
 const OPUS = 'anthropic/claude-opus-5-5';
@@ -143,4 +143,19 @@ test('providerExtension finds the installed claude-bridge package only', async (
     assert.equal(providerExtension('claude-bridge', dir), path);
     assert.equal(providerExtension('anthropic', dir), undefined);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('cross-family reviewer: Opus work is reviewed by Sol, Sol work by Opus, renames keep the family', () => {
+  assert.equal(modelFamily('anthropic/claude-opus-5-5'), 'anthropic');
+  assert.equal(modelFamily('claude-bridge/claude-opus-5-5'), 'anthropic');
+  assert.equal(modelFamily('openai-codex/gpt-6.1-sol'), 'openai');
+  assert.equal(modelFamily('openai/o4-mini'), 'openai');
+  assert.equal(modelFamily('local/llama-3'), 'local');
+  assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5'), 'openai-codex/gpt-6.1-sol');
+  assert.equal(reviewerModel(DEFAULT_CHAINS, 'openai-codex/gpt-6.1-sol'), 'anthropic/claude-opus-5-5');
+  // Sol unavailable: fall through to the other-family advisor model rather than a same-family one.
+  assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5', m => !m.endsWith('gpt-6.1-sol')), 'openai-codex/gpt-6-astra');
+  assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5', m => modelFamily(m) === 'anthropic'), undefined);
+  const renamed = parseModelChains({ providers: { anthropic: 'claude-bridge' } });
+  assert.equal(reviewerModel(renamed, 'openai-codex/gpt-6.1-sol'), 'claude-bridge/claude-opus-5-5');
 });
