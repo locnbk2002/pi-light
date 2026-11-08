@@ -1,6 +1,5 @@
 "use strict";
-// Compat shim: Firefox `browser` or Chromium `chrome` (promise-returning in MV3).
-const api = globalThis.browser ?? globalThis.chrome;
+const api = chrome;
 const statusElement = document.getElementById("status");
 async function message(payload) {
   try {

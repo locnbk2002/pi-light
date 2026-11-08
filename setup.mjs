@@ -3,7 +3,7 @@
 // Plain JS (no build step) so bootstrap.sh can run it with `node setup.mjs` before Pi loads anything.
 // Never touches credentials (auth.json, AgentKit login, claude-bridge config) or the default model.
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,10 +49,13 @@ function defaultHas(cmd) { return !defaultRun(cmd, ['--version']).missing; }
 
 function browsers(platform, has) {
   const apps = name => platform === 'darwin' && existsSync(`/Applications/${name}.app`);
-  return {
-    firefox: has('firefox') || apps('Firefox'),
-    edge: has('microsoft-edge-stable') || has('microsoft-edge') || apps('Microsoft Edge'),
-  };
+  const found = [
+    ['Brave', 'brave://extensions', ['brave', 'brave-browser'], 'Brave Browser'],
+    ['Chromium', 'chrome://extensions', ['chromium'], 'Chromium'],
+    ['Chrome', 'chrome://extensions', ['google-chrome-stable', 'google-chrome'], 'Google Chrome'],
+    ['Edge', 'edge://extensions', ['microsoft-edge-stable', 'microsoft-edge'], 'Microsoft Edge'],
+  ];
+  return found.filter(([, , cmds, app]) => cmds.some(has) || apps(app)).map(([name, page]) => ({ name, page }));
 }
 
 /**
@@ -101,36 +104,32 @@ export function planSetup({ env = process.env, platform = process.platform, has 
   const out = join(dir, 'pi-light', 'browser');
   const found = browsers(platform, has);
   steps.push({ label: `browser add-on builds in ${out}`, fn: () => buildBrowserAddons(out) });
-  if (found.firefox) notes.push(`Firefox: about:debugging#/runtime/this-firefox > Load Temporary Add-on > ${join(out, 'firefox', 'manifest.json')} (repeat after each Firefox restart).`);
-  if (found.edge) notes.push(`Edge: edge://extensions > Developer mode > Load unpacked > ${join(out, 'chromium')} (stays installed).`);
-  if (!found.firefox && !found.edge) notes.push(`No Firefox or Edge found; add-on builds are in ${out}.`);
+  for (const b of found) notes.push(`${b.name}: ${b.page} > Developer mode > Load unpacked > ${join(out, 'chromium')} (stays installed; reload it there after updates).`);
+  if (!found.length) notes.push(`No Chromium-family browser (Brave, Chromium, Chrome, Edge) found; the add-on build is in ${join(out, 'chromium')}.`);
   notes.push('Not touched: credentials (`pi` /login, `ak login`, claude-bridge config) and the default model.');
   return { dir, steps, notes };
 }
 
 const ADDON_SOURCE = join(PACKAGE_DIR, 'browser-addon');
-// Files shared verbatim by every target; each target only differs by its manifest.
-export const BROWSER_ADDON_SHARED_FILES = ['background.js', 'options.html', 'options.js'];
+// Every file of the unpacked Chromium (MV3) add-on.
+export const BROWSER_ADDON_FILES = ['manifest.json', 'background.js', 'cdp.js', 'options.html', 'options.js'];
 
 /**
- * Writes a loadable unpacked add-on for `target` into `outDir` (created if missing; listed files are overwritten).
- * @param {'firefox' | 'chromium'} target
+ * Writes the loadable unpacked add-on into `outDir` (created if missing; listed files are overwritten).
  * @param {string} outDir
  */
-export function buildBrowserAddon(target, outDir) {
-  if (target !== 'firefox' && target !== 'chromium') throw new Error(`Unsupported browser add-on target: ${String(target)}`);
+export function buildBrowserAddon(outDir) {
   if (typeof outDir !== 'string' || !outDir.trim()) throw new Error('Browser add-on output directory is required');
   const destination = resolve(outDir);
-  // Writing manifest.json into the source tree would shadow the per-target manifests.
   if (destination === resolve(ADDON_SOURCE)) throw new Error('Browser add-on output directory must differ from its source directory');
   mkdirSync(destination, { recursive: true });
-  for (const file of BROWSER_ADDON_SHARED_FILES) copyFileSync(join(ADDON_SOURCE, file), join(destination, file));
-  copyFileSync(join(ADDON_SOURCE, `manifest.${target}.json`), join(destination, 'manifest.json'));
+  for (const file of BROWSER_ADDON_FILES) copyFileSync(join(ADDON_SOURCE, file), join(destination, file));
 }
 
-/** Writes <out>/firefox and <out>/chromium. */
+/** Writes <out>/chromium and removes the <out>/firefox build that older versions wrote. */
 export function buildBrowserAddons(out) {
-  for (const target of /** @type {const} */ (['firefox', 'chromium'])) buildBrowserAddon(target, join(out, target));
+  buildBrowserAddon(join(out, 'chromium'));
+  rmSync(join(out, 'firefox'), { recursive: true, force: true });
 }
 
 export function describePlan(plan) {

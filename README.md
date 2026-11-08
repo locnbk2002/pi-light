@@ -5,7 +5,7 @@ A personal workflow package for the [Pi](https://github.com/earendil-works/pi) c
 - **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to an AgentKit skill. The agent only edits files when you ask for an implementation.
 - **Advisors.** Astra (`gpt-6-astra`) and Fable (`claude-fable-5-1`) give a second opinion through hidden Pi processes. `/advisor astra|fable` opens a direct chat, and `/back` hands the result back to Opus.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol, and each advisor falls back to the other.
-- **Browser bridge.** An add-on for Firefox and Edge lets Pi read and act on one tab that you bind with the toolbar button.
+- **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets Pi open and drive its own tabs in your signed-in browser, and use a tab you bind with the toolbar button. Every click, key press, navigation, script and tab open or close asks you first.
 - **herdr subagent layout.** Up to 3 subagents from `pi-herdr-subagents` stack beside your pane. When a 4th starts, all of them move to their own tabs. `PI_HERDR_MAX_SPLIT` changes the limit, and `PI_HERDR_LAYOUT=tab|split` changes the mode.
 
 ## Install
@@ -19,16 +19,42 @@ You need `pi`, `git` and `node`. For the full setup, also install the AgentKit C
 - the AgentKit `engineer` Pi adapter (pinned version in `setup.json`; needs a matching `ak`, e.g. `ak self-update --beta --yes`) with the skill list in `setup.json`;
 - the latest `pi-effort` and `pi-claude-bridge`, and a pinned upstream `pi-herdr-subagents`;
 - herdr's Pi integration and the subagents plugin link;
-- loadable browser add-on folders in `~/.pi/agent/pi-light/browser/`.
+- a loadable browser add-on folder in `~/.pi/agent/pi-light/browser/chromium/`.
 
 Setup is safe to rerun, either as `/pi-light setup` inside Pi or as `node setup.mjs --dry-run`. It reports deliberate differences instead of reverting them. It never touches credentials or your default model.
 
-Load the browser add-on by hand:
-
-- **Edge:** go to `edge://extensions`, turn on Developer mode, choose **Load unpacked**, and pick `chromium/`.
-- **Firefox:** go to `about:debugging`, choose **Load Temporary Add-on**, and pick `firefox/manifest.json`. You have to load it again after each Firefox restart.
+Load the browser add-on by hand: open `brave://extensions` (or `chrome://extensions`, `edge://extensions`), turn on Developer mode, choose **Load unpacked**, and pick `~/.pi/agent/pi-light/browser/chromium/`. After an update, rerun setup and click the add-on's reload button there. Firefox is not supported.
 
 Then run `/browser-connect` in Pi and paste the URL and token into the add-on's options page.
+
+## Browser tool
+
+The `browser` tool takes named actions; there is no raw DevTools endpoint.
+
+| Action | What it does | Asks first |
+|---|---|---|
+| `tabs` | List the tabs Pi controls | no |
+| `open {url, name?, keep?}` | Open a background tab Pi owns (default name `main`, grouped as "pi") | yes |
+| `close {tab}` | Close a tab Pi opened | yes |
+| `snapshot {mode: text\|ax}` | Visible text and controls, or the accessibility tree (roles and labels); never text typed into fields | no |
+| `screenshot {fullPage?}` | JPEG image, at most 1600 px wide and 8000 px tall | no |
+| `click`, `hover {selector}` | Real mouse input on one visible, uncovered element | click only |
+| `fill {selector, text}` | Real typing into a text field (never password, file or hidden fields) | yes |
+| `press {key}`, `scroll {dy}` | Real key press; mouse wheel | press only |
+| `waitFor {selector \| text, timeoutMs}` | Wait up to 8 s | no |
+| `console` | Last 200 console entries. URLs lose their query strings, but page-logged text can still hold private data | yes (allowed in read-only mode) |
+| `network` | Last 200 requests: method, origin and path, status and type, never headers or query strings | no |
+| `evaluate {code}` | Run JavaScript in the page and return its JSON value | yes |
+| `navigate {url}` | Go to a URL. A bound tab must stay on its origin; Pi's own tabs may go anywhere over HTTP(S) | yes |
+
+Without `tab`, actions use the bound tab, then `main`, then the only controlled tab. Read-only mode refuses every action that asks first, except `console`.
+
+How control works and what it costs:
+
+- The add-on uses the browser's debugger API through a fixed list of allowed DevTools methods, and only on tabs you bound or Pi opened. The browser shows a "debugging this browser" bar while it does; dismissing it releases control of the tab.
+- Tabs Pi opened close when Pi disconnects, unless it opened them with `keep`. Pi never closes a tab it did not open.
+- A bound tab is released when it leaves its origin; bind it again to continue.
+- Page content, console output and evaluated values are untrusted and can contain private data or instructions. This is not secret isolation.
 
 ## Models
 

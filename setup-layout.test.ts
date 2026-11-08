@@ -132,7 +132,7 @@ test('configured machine: nothing to install; pin drift and removed skills are r
   const skills = MANIFEST.agentkit.skills.filter((s: string) => s !== 'ak-security');
   const dir = agentHome(['npm:pi-effort', 'git:github.com/elidickinson/pi-claude-bridge@old', 'git:github.com/modem-dev/pi-herdr-subagents@other'], skills, true);
   const plugin = join(dir, 'git/github.com/modem-dev/pi-herdr-subagents/herdr-plugin');
-  const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => t !== 'firefox' && !t.startsWith('microsoft'),
+  const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => !t.startsWith('microsoft'),
     run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current (v9) (x)' : pluginLine(plugin), missing: false }) });
   assert.deepEqual(plan.steps.filter((s: any) => s.cmd), []);
   assert.ok(plan.notes.some((n: string) => n.includes('without: ak-security')));
@@ -164,10 +164,20 @@ test('applyPlan stops at the first failed step', async () => {
   assert.ok(log.some(l => l.startsWith('FAIL b')));
 });
 
-test('setup builds one loadable add-on directory per browser', () => {
+test('setup builds the Chromium add-on and removes the old Firefox build', () => {
   const out = mkdtempSync(join(tmpdir(), 'addon-out-'));
+  mkdirSync(join(out, 'firefox'));
+  writeFileSync(join(out, 'firefox', 'manifest.json'), '{}');
   buildBrowserAddons(out);
-  assert.equal(JSON.parse(readFileSync(join(out, 'firefox', 'manifest.json'), 'utf8')).background.scripts.length > 0, true);
   assert.ok(JSON.parse(readFileSync(join(out, 'chromium', 'manifest.json'), 'utf8')).background.service_worker);
-  assert.ok(existsSync(join(out, 'chromium', 'background.js')));
+  assert.ok(existsSync(join(out, 'chromium', 'background.js')) && existsSync(join(out, 'chromium', 'cdp.js')));
+  assert.equal(existsSync(join(out, 'firefox')), false);
+});
+
+test('setup notes how to load the add-on in each Chromium-family browser it finds', () => {
+  const dir = agentHome([]);
+  const notes = (has: (t: string) => boolean) => planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has, run: () => ({ ok: true, out: '', missing: false }) }).notes.join('\n');
+  assert.match(notes(t => t === 'brave'), /Brave: brave:\/\/extensions > Developer mode > Load unpacked > .*chromium/);
+  assert.doesNotMatch(notes(t => t === 'brave'), /Edge|Firefox/);
+  assert.match(notes(t => t === 'firefox'), /No Chromium-family browser/);
 });
