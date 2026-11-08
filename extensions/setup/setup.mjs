@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // pi-light machine setup: installs what pi-light needs so a new machine matches the reference one.
-// Plain JS (no build step) so bootstrap.sh can run it with `node setup.mjs` before Pi loads anything.
+// Plain JS (no build step) so bootstrap.sh can run it with `node extensions/setup/setup.mjs` before Pi loads anything.
 // Never touches credentials (auth.json, AgentKit login, claude-bridge config) or the default model.
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
@@ -110,7 +110,7 @@ export function planSetup({ env = process.env, platform = process.platform, has 
   return { dir, steps, notes };
 }
 
-const ADDON_SOURCE = join(PACKAGE_DIR, 'browser-addon');
+const ADDON_SOURCE = join(PACKAGE_DIR, '..', 'browser-bridge', 'browser-addon');
 // Every file of the unpacked Chromium (MV3) add-on.
 export const BROWSER_ADDON_FILES = ['manifest.json', 'background.js', 'cdp.js', 'options.html', 'options.js'];
 

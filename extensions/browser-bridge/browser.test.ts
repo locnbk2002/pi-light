@@ -7,7 +7,7 @@ import { join } from "node:path";
 import vm from "node:vm";
 import { WebSocket } from "ws";
 import { BrowserBridge, registerBrowserTools } from "./browser-bridge.js";
-import { BROWSER_ADDON_FILES, buildBrowserAddon } from "./setup.mjs";
+import { BROWSER_ADDON_FILES, buildBrowserAddon } from "../setup/setup.mjs";
 import { type ControlledTab, MAX_MESSAGE_BYTES, isMutation, validTabs, validateAction, validExtensionOrigin } from "./browser-policy.js";
 
 const EXT = `chrome-extension://${"abcdefghijklmnop".repeat(2)}`;

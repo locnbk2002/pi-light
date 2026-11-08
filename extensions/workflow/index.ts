@@ -3,11 +3,10 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 import { truncateHead } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { Text } from '@earendil-works/pi-tui';
-import { registerBrowserTools } from './browser-bridge.ts';
-import { registerHerdrLayout } from './herdr-layout.ts';
-import { agentDir, agentkitStatus, applyPlan, describePlan, planSetup } from './setup.mjs';
+import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
+import { answerReadOnlyQueries } from '../../lib/read-only-events.ts';
 import { ControllerPolicy, advisorName, handoffDraft, HANDOFF_REQUEST,
-  isOneShotInvocation, nonempty, parseAdvisorArgs, type Advisor } from './controller-policy.ts';
+  nonempty, parseAdvisorArgs, type Advisor } from './controller-policy.ts';
 import { AdvisorSessions, providerErrorSummary, replyModelLabel, resolvePiCliPath, type AdvisorReply } from './rpc-session.ts';
 import { Cooldowns, isLimitOrCapacityError, loadModelChains, modelFamily, planCandidates, reviewerModel, routeController, splitModel,
   VIRTUAL_CONTROLLER, type ControllerRouteDecision } from './model-fallback.ts';
@@ -35,10 +34,6 @@ function modelAvailable(ctx: ExtensionContext, model: string): boolean {
   } catch { return false; }
 }
 
-/** pi-herdr-subagents exports PI_SUBAGENT_ID into every child pane launch (spawn and resume). */
-export function isHerdrSubagentChild(env: NodeJS.ProcessEnv = process.env): boolean {
-  return typeof env.PI_SUBAGENT_ID === 'string' && env.PI_SUBAGENT_ID.length > 0;
-}
 export function hasModelFlag(argv = process.argv.slice(2)): boolean {
   const end = argv.indexOf('--');
   return (end < 0 ? argv : argv.slice(0, end)).some(arg => arg === '--model' || arg.startsWith('--model='));
@@ -82,9 +77,7 @@ export default function piLight(pi: ExtensionAPI): void {
     }
     return;
   }
-  registerHerdrLayout(pi);
-  registerSetupCommand(pi);
-  const personalPolicy = readFileSync(new URL('./skills/locbt-router/SKILL.md', import.meta.url), 'utf8')
+  const personalPolicy = readFileSync(new URL('../../skills/locbt-router/SKILL.md', import.meta.url), 'utf8')
     .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
   const policy = new ControllerPolicy();
   let sessions: AdvisorSessions | undefined;
@@ -99,7 +92,6 @@ export default function piLight(pi: ExtensionAPI): void {
   let controllerModel: string | undefined;
   let fallbackContinuations = 0;
   let nativeFallbackWarned = false;
-  let agentkitWarned = false;
 
   const available = modelAvailable;
   function showControllerModel(ctx: ExtensionContext, model: string): void {
@@ -238,8 +230,8 @@ export default function piLight(pi: ExtensionAPI): void {
     return messages.length === event.messages.length ? undefined : { messages };
   });
 
-  // The browser owner enforces tab binding and owns its own shutdown listener.
-  registerBrowserTools(pi, { isReadOnly: () => policy.isReadOnly });
+  // Feature extensions (browser-bridge) ask for read-only state over the shared event bus.
+  answerReadOnlyQueries(pi.events, () => policy.isReadOnly);
 
   pi.registerTool({
     name: 'consult_advisor', label: 'Consult advisor', executionMode: 'sequential',
@@ -496,10 +488,6 @@ ${reviewPolicy(controllerModel ?? models.chains.controller[0], model => availabl
       ctx.ui.notify(modelNotice, 'warning');
       modelNotice = undefined;
     }
-    if (!agentkitWarned && !agentkitStatus(agentDir()).installed) {
-      agentkitWarned = true;
-      ctx.ui.notify('AgentKit Pi adapter not found: stage skills and the Agent tool are unavailable. Run /pi-light setup.', 'warning');
-    }
     try { await ensureController(ctx); }
     catch { ctx.ui.notify('Opus could not be selected; controller prompts will be blocked.', 'error'); }
   });
@@ -510,28 +498,5 @@ ${reviewPolicy(controllerModel ?? models.chains.controller[0], model => availabl
     stopTerminalInput = undefined;
     active?.abort();
     await sessions?.close();
-  });
-}
-
-/** /pi-light setup [--dry-run]: same plan as `node setup.mjs`, shown and confirmed before anything runs. */
-function registerSetupCommand(pi: ExtensionAPI): void {
-  pi.registerCommand('pi-light', {
-    description: 'Install what pi-light needs on this machine: /pi-light setup [--dry-run]',
-    handler: async (args, ctx) => {
-      const [sub, ...flags] = args.trim().split(/\s+/);
-      if (sub !== 'setup') { ctx.ui.notify('Usage: /pi-light setup [--dry-run]', 'info'); return; }
-      const plan = planSetup();
-      const summary = describePlan(plan);
-      if (flags.includes('--dry-run') || !plan.steps.length) { ctx.ui.notify(summary, 'info'); return; }
-      if (!ctx.hasUI || !await ctx.ui.confirm('Apply pi-light setup?', summary)) { ctx.ui.notify('Setup cancelled.', 'info'); return; }
-      const log: string[] = [];
-      const ok = await applyPlan(plan, async (cmd: string, cmdArgs: string[]) => {
-        ctx.ui.setStatus('pi-light-setup', `setup: ${cmd} ${cmdArgs.slice(0, 2).join(' ')}`);
-        const r = await pi.exec(cmd, cmdArgs, { timeout: 600_000 });
-        return { ok: r.code === 0, out: `${r.stdout}${r.stderr}`.trim() };
-      }, (line: string) => log.push(line));
-      ctx.ui.setStatus('pi-light-setup', undefined);
-      ctx.ui.notify(`${log.join('\n')}\n${ok ? 'Setup finished. Run /reload to load new packages.' : 'Setup stopped at the failed step.'}`, ok ? 'info' : 'error');
-    },
   });
 }

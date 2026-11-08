@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RpcClient, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { RpcClient, createEventBus, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { queryReadOnly } from '../../lib/read-only-events.ts';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import piLight, { hasModelFlag, isHerdrSubagentChild } from './index.ts';
-import { ADVISORS, MAIN_MODEL, ControllerPolicy, handoffDraft, isOneShotInvocation, parseAdvisorArgs, READ_TOOLS } from './controller-policy.ts';
+import piLight, { hasModelFlag } from './index.ts';
+import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
+import { ADVISORS, MAIN_MODEL, ControllerPolicy, handoffDraft, parseAdvisorArgs, READ_TOOLS } from './controller-policy.ts';
 import { DEFAULT_CHAINS, VIRTUAL_CONTROLLER } from './model-fallback.ts';
 // package.json lists test files explicitly; run the fallback module's unit tests with this suite.
 import './model-fallback.test.ts';
@@ -156,9 +158,11 @@ function extensionHarness() {
   const statuses = new Map<string, string | undefined>();
   const selected: unknown[] = [];
   let virtualModel: Parameters<ExtensionAPI['registerVirtualModel']>[0] | undefined;
+  const bus = createEventBus();
   // These partial test doubles exercise registered real handlers, not a copied policy.
   // Assertions at the mock boundary intentionally omit unrelated Pi UI/session APIs.
   const pi = {
+    events: bus,
     on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(name, handler); return () => {}; },
     registerCommand(name: string, command: Parameters<ExtensionAPI['registerCommand']>[1]) { commands.set(name, command); },
     registerTool(tool: Parameters<ExtensionAPI['registerTool']>[0]) { tools.set(tool.name, tool); }, registerFlag() {}, registerEntryRenderer() {},
@@ -182,7 +186,7 @@ function extensionHarness() {
   } as unknown as ExtensionContext;
   piLight(pi);
   return {
-    ctx, notifications, statuses, selected, unavailable, virtualModel: () => virtualModel!,
+    ctx, bus, notifications, statuses, selected, unavailable, virtualModel: () => virtualModel!,
     renderers, tools, sentRecords, active: () => activeTools, sent: () => sent, confirmations: () => confirmations,
     async command(name: string, args = '') { await commands.get(name)!.handler(args, ctx as Parameters<Parameters<ExtensionAPI['registerCommand']>[1]['handler']>[1]); },
     async event(name: string, value: unknown) {
@@ -197,6 +201,13 @@ function extensionHarness() {
 }
 
 const status = (harness: ReturnType<typeof extensionHarness>) => harness.statuses.get('pi-light');
+
+test('feature extensions read direct advisor chat as read-only over the shared event bus', async () => {
+  const harness = extensionHarness();
+  assert.equal(queryReadOnly(harness.bus), false, 'controller mode is not read-only');
+  await harness.command('advisor', 'astra');
+  assert.equal(queryReadOnly(harness.bus), true, 'direct advisor chat is read-only');
+});
 const UNROUTED = 'controller | unrouted | no stage skill';
 const routeText = (result: unknown) => (result as { content: { text: string }[] }).content[0].text;
 

@@ -6,12 +6,6 @@ export const ADVISORS = {
 export const MAIN_MODEL = { provider: 'anthropic', model: 'claude-opus-5-5' } as const;
 export const READ_TOOLS = ['read', 'grep', 'find', 'ls'] as const;
 
-/** Do not replace models/tools in one-shot Pi jobs, including AgentKit children. */
-export function isOneShotInvocation(argv = process.argv.slice(2)): boolean {
-  const end = argv.indexOf('--');
-  const options = end < 0 ? argv : argv.slice(0, end);
-  return options.includes('-p') || options.includes('--print');
-}
 export type Advisor = keyof typeof ADVISORS;
 export type Mode = 'auto' | 'advice' | 'plan' | 'brainstorm' | 'work';
 export type TaskIntent = 'advice' | 'brainstorm' | 'plan' | 'implement';
