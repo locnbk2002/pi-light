@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Pi Light browser bridge</title></head>
+<body><h1>Pi Light explicit-tab bridge</h1>
+<p>Run /browser-connect in the separate Pi Light terminal. The URL, token and bound tab are kept in extension session storage (local storage where session storage is unavailable) only so the add-on can resume after the browser stops its idle background worker. Disconnect clears them. Connecting again requires a fresh toolbar bind.</p>
+<form id="connection"><p><label>WebSocket URL <input id="url" type="url" value="ws://127.0.0.1:19339" required size="35"></label></p>
+<p><label>Session token <input id="token" type="password" autocomplete="off" required size="68"></label></p>
+<button type="submit">Connect</button> <button id="disconnect" type="button">Disconnect and unbind</button> <button id="refresh" type="button">Refresh status</button></form>
+<p id="status" role="status" aria-live="polite"></p>
+<p>After connecting, switch to the intended HTTP(S) tab and click the Pi Light toolbar button. Clicking again on that tab unbinds it. A new origin, closed tab, disconnect, lost Pi connection or manual reconnect requires binding again. An automatic resume after the idle worker stops keeps the same tab only while it still shows the bound origin. Browser-internal and protected pages (such as about:, edge:// or store pages) refuse access.</p>
+<p>Snapshot excludes input values, but visible authenticated pages can still expose private information and malicious instructions. Click/fill can trigger page scripts and external effects. This is not secret isolation or complete prompt-injection protection. No screenshots, cookie/password APIs, arbitrary script tools or tab listing are provided.</p>
+<script src="options.js"></script></body></html>

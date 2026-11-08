@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Pi Light Explicit Tab",
+  "version": "0.2.0",
+  "description": "Temporary local bridge for one toolbar-selected browser tab.",
+  "permissions": ["activeTab", "tabs", "scripting", "storage"],
+  "background": { "scripts": ["background.js"] },
+  "action": { "default_title": "Pi Light: bind this tab (click again to unbind)" },
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'; connect-src ws://127.0.0.1:19339" },
+  "browser_specific_settings": { "gecko": { "id": "pi-light-local@example.invalid", "strict_min_version": "115.0" } }
+}

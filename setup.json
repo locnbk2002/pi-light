@@ -1,0 +1,22 @@
+{
+  "agentkit": {
+    "kit": "engineer",
+    "target": "pi",
+    "version": "3.0.0",
+    "skills": [
+      "ak-brainstorm", "ak-plan", "ak-cook", "ak-fix", "ak-debug", "ak-test", "ak-code-review",
+      "ak-scout", "ak-journal", "ak-docs", "ak-research", "ak-docs-seeker", "ak-git",
+      "ak-frontend-design", "ak-frontend-development", "ak-backend-development", "ak-web-frameworks",
+      "ak-web-testing", "ak-ui-styling", "ak-databases", "ak-security"
+    ]
+  },
+  "packages": [
+    "npm:pi-effort",
+    "git:github.com/elidickinson/pi-claude-bridge",
+    "git:github.com/modem-dev/pi-herdr-subagents@2489019ea678f0b7e3437727a0a5ca15d4cbe9c1"
+  ],
+  "herdr": {
+    "integration": "pi",
+    "plugin": { "id": "pi-herdr-subagents", "package": "git:github.com/modem-dev/pi-herdr-subagents", "dir": "herdr-plugin" }
+  }
+}
