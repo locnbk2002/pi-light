@@ -1,6 +1,6 @@
 {
   "name": "pi-light",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Opus-controlled Pi workflow: AgentKit stage routing, Astra/Fable advisors, model fallback, browser bridge, herdr subagent layout and one-command machine setup.",
   "keywords": [
     "pi-package"
