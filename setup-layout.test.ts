@@ -119,7 +119,7 @@ test('fresh machine: installs AgentKit, every package, herdr integration and plu
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: () => true,
     run: (cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: not installed (x)' : '', missing: false }) });
   const commands = plan.steps.filter((s: any) => s.cmd).map((s: any) => `${s.cmd} ${s.args.join(' ')}`);
-  assert.match(commands[0], /^ak kit install engineer --global --target pi --version 3\.0\.0 --skills ak-brainstorm,.*ak-security --yes$/);
+  assert.match(commands[0], /^ak kit install engineer --global --target pi --version 3\.1\.0-beta\.5 --skills ak-brainstorm,.*ak-security --yes$/);
   for (const source of MANIFEST.packages) assert.ok(commands.includes(`pi install ${source}`), source);
   assert.ok(commands.includes('pi install npm:pi-effort') && commands.includes('pi install git:github.com/elidickinson/pi-claude-bridge'), 'latest, unpinned');
   assert.ok(commands.includes('herdr integration install pi'));

@@ -2,7 +2,7 @@
   "agentkit": {
     "kit": "engineer",
     "target": "pi",
-    "version": "3.0.0",
+    "version": "3.1.0-beta.5",
     "skills": [
       "ak-brainstorm", "ak-plan", "ak-cook", "ak-fix", "ak-debug", "ak-test", "ak-code-review",
       "ak-scout", "ak-journal", "ak-docs", "ak-research", "ak-docs-seeker", "ak-git",

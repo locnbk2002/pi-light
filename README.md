@@ -16,7 +16,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/locnbk2002/pi-light/main/boo
 
 You need `pi`, `git` and `node`. For the full setup, also install the AgentKit CLI (`ak`, logged in) and herdr. The bootstrap installs this package and then runs `setup.mjs`. Setup shows its plan and asks before it changes anything. It installs:
 
-- the AgentKit `engineer` Pi adapter with the skill list in `setup.json`;
+- the AgentKit `engineer` Pi adapter (pinned version in `setup.json`; needs a matching `ak`, e.g. `ak self-update --beta --yes`) with the skill list in `setup.json`;
 - the latest `pi-effort` and `pi-claude-bridge`, and a pinned upstream `pi-herdr-subagents`;
 - herdr's Pi integration and the subagents plugin link;
 - loadable browser add-on folders in `~/.pi/agent/pi-light/browser/`.
