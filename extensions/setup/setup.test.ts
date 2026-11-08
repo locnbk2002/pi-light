@@ -3,7 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { agentkitStatus, applyPlan, buildBrowserAddons, MANIFEST, planSetup, sourceKey } from './setup.mjs';
+import { readdir, readFile, mkdtemp, rm } from 'node:fs/promises';
+import { agentkitStatus, applyPlan, BROWSER_ADDON_FILES, buildBrowserAddon, buildBrowserAddons, MANIFEST, planSetup, sourceKey } from './setup.mjs';
+
+// setup.mjs builds the add-on from the browser-bridge extension's source folder.
+const ADDON_SOURCE = new URL('../browser-bridge/browser-addon/', import.meta.url);
 
 test('sourceKey strips pins but keeps scoped npm names', () => {
   assert.equal(sourceKey('git:github.com/a/b@abc'), 'git:github.com/a/b');
@@ -88,4 +92,20 @@ test('setup notes how to load the add-on in each Chromium-family browser it find
   assert.match(notes(t => t === 'brave'), /Brave: brave:\/\/extensions > Developer mode > Load unpacked > .*chromium/);
   assert.doesNotMatch(notes(t => t === 'brave'), /Edge|Firefox/);
   assert.match(notes(t => t === 'firefox'), /No Chromium-family browser/);
+});
+
+test("setup copies exactly the browser-bridge add-on files", async () => {
+  assert.deepEqual((await readdir(ADDON_SOURCE)).sort(), [...BROWSER_ADDON_FILES].sort());
+});
+
+test("buildBrowserAddon writes a loadable unpacked directory", async t => {
+  const root = await mkdtemp(join(tmpdir(), "pi-light-addon-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const out = join(root, "chromium", "nested");
+  buildBrowserAddon(out);
+  assert.deepEqual((await readdir(out)).sort(), [...BROWSER_ADDON_FILES].sort());
+  for (const file of BROWSER_ADDON_FILES) assert.equal(await readFile(join(out, file), "utf8"), await readFile(new URL(file, ADDON_SOURCE), "utf8"));
+  buildBrowserAddon(out);
+  assert.throws(() => buildBrowserAddon(" "), /required/);
+  assert.throws(() => buildBrowserAddon(ADDON_SOURCE.pathname), /differ/);
 });

@@ -1,13 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFile, readdir } from "node:fs/promises";
 import vm from "node:vm";
 import { WebSocket } from "ws";
 import { BrowserBridge, registerBrowserTools } from "./browser-bridge.js";
-import { BROWSER_ADDON_FILES, buildBrowserAddon } from "../setup/setup.mjs";
 import { type ControlledTab, MAX_MESSAGE_BYTES, isMutation, validTabs, validateAction, validExtensionOrigin } from "./browser-policy.js";
 
 const EXT = `chrome-extension://${"abcdefghijklmnop".repeat(2)}`;
@@ -229,21 +226,7 @@ test("Chromium MV3 manifest: debugger without host access, fixed CSP, no Firefox
   assert.deepEqual(manifest.background, { service_worker: "background.js" });
   assert.deepEqual(manifest.options_ui, { page: "options.html", open_in_tab: true });
   assert.equal(manifest.content_security_policy.extension_pages, "script-src 'self'; object-src 'none'; connect-src ws://127.0.0.1:19339");
-  const files = await readdir(new URL("./browser-addon/", import.meta.url));
-  assert.deepEqual(files.sort(), [...BROWSER_ADDON_FILES].sort());
-  for (const file of BROWSER_ADDON_FILES) assert.doesNotMatch(await readFile(new URL(`./browser-addon/${file}`, import.meta.url), "utf8"), /firefox|moz-extension|globalThis\.browser/i, file);
-});
-
-test("buildBrowserAddon writes a loadable unpacked directory", async t => {
-  const root = await mkdtemp(join(tmpdir(), "pi-light-addon-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const out = join(root, "chromium", "nested");
-  buildBrowserAddon(out);
-  assert.deepEqual((await readdir(out)).sort(), [...BROWSER_ADDON_FILES].sort());
-  for (const file of BROWSER_ADDON_FILES) assert.equal(await readFile(join(out, file), "utf8"), await readFile(new URL(`./browser-addon/${file}`, import.meta.url), "utf8"));
-  buildBrowserAddon(out);
-  assert.throws(() => buildBrowserAddon(" "), /required/);
-  assert.throws(() => buildBrowserAddon(new URL("./browser-addon/", import.meta.url).pathname), /differ/);
+  for (const file of await readdir(new URL("./browser-addon/", import.meta.url))) assert.doesNotMatch(await readFile(new URL(`./browser-addon/${file}`, import.meta.url), "utf8"), /firefox|moz-extension|globalThis\.browser/i, file);
 });
 
 // ---------- Add-on harness: real background.js + cdp.js in a VM with a fake chrome API and fake page. ----------
