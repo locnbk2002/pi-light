@@ -92,6 +92,17 @@ class FakeRpcClient implements RpcTransport {
 }
 const request = () => ({ advisor: 'astra' as const, topic: 'unit-topic', prompt: 'Inspect this design', cwd: folder });
 
+test('advisor children load only the extension that provides an extension-backed model provider', () => {
+  const identity = { directory: folder, id: '12345678-1234-1234-1234-123456789abc' };
+  const lookup = (provider: string) => provider === 'claude-bridge' ? '/agent/git/github.com/elidickinson/pi-claude-bridge' : undefined;
+  const bridged = childOptions({ ...config, providerExtension: lookup }, 'claude-bridge/claude-fable-5-1', folder, identity);
+  assert.equal(bridged.provider, 'claude-bridge');
+  const at = bridged.args!.indexOf('-e');
+  assert.ok(at > bridged.args!.indexOf('--no-extensions'));
+  assert.equal(bridged.args![at + 1], '/agent/git/github.com/elidickinson/pi-claude-bridge');
+  assert.ok(!childOptions({ ...config, providerExtension: lookup }, 'openai/gpt-6-astra', folder, identity).args!.includes('-e'));
+});
+
 test('child startup isolates resources, uses native providers and explicit resumable sessions', () => {
   const identity = { directory: folder, id: '12345678-1234-1234-1234-123456789abc' };
   const options = childOptions(config, 'fable', folder, identity);

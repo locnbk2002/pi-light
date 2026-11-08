@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, loadModelChains, parseModelChains, planCandidates,
+import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, loadModelChains, parseModelChains, planCandidates, providerExtension,
   routeController } from './model-fallback.ts';
 
 const OPUS = 'anthropic/claude-opus-5-5';
@@ -119,4 +119,28 @@ test('virtual controller routing: sticky continuation, limit retry switches, non
   assert.deepEqual(route({ reason: 'user' }), { model: OPUS }, 'preferred model is retried after cooldown');
   assert.deepEqual(route({ reason: 'user' }, model => model === SOL), { model: SOL }, 'candidates without credentials are skipped');
   assert.throws(() => route({ reason: 'user' }, () => false), /No controller fallback model/);
+});
+
+test('a providers map renames every chain entry for a machine logged in under other provider names', () => {
+  const chains = parseModelChains({ providers: { anthropic: 'claude-bridge', 'openai-codex': 'openai' } });
+  assert.deepEqual(chains.controller, ['claude-bridge/claude-opus-5-5', 'openai/gpt-6.1-sol']);
+  assert.deepEqual(chains.astra, ['openai/gpt-6-astra', 'claude-bridge/claude-fable-5-1']);
+  assert.deepEqual(chains.fable, ['claude-bridge/claude-fable-5-1', 'openai/gpt-6-astra']);
+  assert.deepEqual(parseModelChains({ providers: { anthropic: 'claude-bridge' }, controller: ['anthropic/claude-opus-5-5'] }).controller,
+    ['claude-bridge/claude-opus-5-5'], 'explicit chains are renamed too');
+  for (const bad of [{ providers: [] }, { providers: { anthropic: 7 } }, { providers: { 'Bad Name': 'x' } }, { providers: { anthropic: 'pi-light' } },
+    { providers: { anthropic: 'openai-codex' }, controller: ['anthropic/x', 'openai-codex/x'] }]) {
+    assert.throws(() => parseModelChains(bad));
+  }
+});
+
+test('providerExtension finds the installed claude-bridge package only', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-agent-'));
+  try {
+    assert.equal(providerExtension('claude-bridge', dir), undefined, 'not installed');
+    const path = join(dir, 'git', 'github.com', 'elidickinson', 'pi-claude-bridge');
+    await import('node:fs/promises').then(fs => fs.mkdir(path, { recursive: true }));
+    assert.equal(providerExtension('claude-bridge', dir), path);
+    assert.equal(providerExtension('anthropic', dir), undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

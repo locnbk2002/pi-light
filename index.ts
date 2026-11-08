@@ -6,7 +6,7 @@ import { Text } from '@earendil-works/pi-tui';
 import { registerBrowserTools } from './browser-bridge.ts';
 import { registerHerdrLayout } from './herdr-layout.ts';
 import { agentDir, agentkitStatus, applyPlan, describePlan, planSetup } from './setup.mjs';
-import { ControllerPolicy, MAIN_MODEL, advisorName, handoffDraft, HANDOFF_REQUEST,
+import { ControllerPolicy, advisorName, handoffDraft, HANDOFF_REQUEST,
   isOneShotInvocation, nonempty, parseAdvisorArgs, type Advisor } from './controller-policy.ts';
 import { AdvisorSessions, providerErrorSummary, replyModelLabel, resolvePiCliPath, type AdvisorReply } from './rpc-session.ts';
 import { Cooldowns, isLimitOrCapacityError, loadModelChains, planCandidates, routeController, splitModel,
@@ -15,7 +15,7 @@ import { Cooldowns, isLimitOrCapacityError, loadModelChains, planCandidates, rou
 type ModelLike = { provider: string; id: string } | undefined;
 const modelRef = (model: ModelLike) => model ? `${model.provider}/${model.id}` : undefined;
 const isVirtualController = (model: ModelLike) => model?.provider === VIRTUAL_CONTROLLER.provider && model.id === VIRTUAL_CONTROLLER.id;
-const isNativeController = (model: ModelLike) => model?.provider === MAIN_MODEL.provider && model.id === MAIN_MODEL.model;
+const isModelRef = (model: ModelLike, ref: string) => !!model && `${model.provider}/${model.id}` === ref;
 
 const STAGE_SKILLS: Record<string, string> = {
   advice: 'ak-research/ak-debug as relevant', brainstorm: 'ak-brainstorm', plan: 'ak-plan', implement: 'ak-cook',
@@ -168,8 +168,11 @@ export default function piLight(pi: ExtensionAPI): void {
       nativeFallbackWarned = true;
       ctx.ui.notify('Controller fallback model is unavailable; using native Opus without provider-limit fallback.', 'warning');
     }
-    if (isNativeController(ctx.model)) return true;
-    const model = ctx.modelRegistry.find(MAIN_MODEL.provider, MAIN_MODEL.model);
+    // The preferred controller (first chain entry; provider renames applied) is used natively without fallback.
+    const preferred = models.chains.controller[0];
+    if (isModelRef(ctx.model, preferred)) return true;
+    const { provider, id } = splitModel(preferred);
+    const model = ctx.modelRegistry.find(provider, id);
     if (!model || !await pi.setModel(model)) {
       ctx.ui.notify('Opus controller is unavailable. No controller prompt will be sent.', 'error');
       return false;
@@ -410,7 +413,7 @@ export default function piLight(pi: ExtensionAPI): void {
     // A custom-message run (including an approved handoff) is not human authority.
     if (event.messageType === 'custom') policy.reset('plan');
     update(ctx);
-    if (policy.direct || !(isVirtualController(ctx.model) || isNativeController(ctx.model))) {
+    if (policy.direct || !(isVirtualController(ctx.model) || isModelRef(ctx.model, models.chains.controller[0]))) {
       ctx.abort();
       throw new Error('Controller run blocked: direct advisor chat or incorrect main model.');
     }

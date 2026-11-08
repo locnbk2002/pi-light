@@ -30,6 +30,16 @@ Load the browser add-on by hand:
 
 Then run `/browser-connect` in Pi and paste the URL and token into the add-on's options page.
 
+## Models
+
+The defaults are the controller `anthropic/claude-opus-5-5` with fallback `openai-codex/gpt-6.1-sol`, Astra `openai-codex/gpt-6-astra`, and Fable `anthropic/claude-fable-5-1`. If a machine is logged in under other provider names, rename them in `~/.pi/agent/pi-light-models.json`:
+
+```json
+{ "providers": { "anthropic": "claude-bridge", "openai-codex": "openai" } }
+```
+
+You can also replace whole lists with the `controller`, `astra` and `fable` keys. Advisors run without extensions, except the one that provides their model's provider (for example `pi-claude-bridge`).
+
 ## Develop
 
 ```sh

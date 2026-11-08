@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import { ADVISORS, MAIN_MODEL } from './controller-policy.ts';
@@ -40,6 +40,27 @@ export function isLimitOrCapacityError(stopReason: unknown, errorMessage: unknow
 }
 
 const MODEL_REF = /^[a-z0-9][a-z0-9._-]{0,63}\/[A-Za-z0-9][^\s]{0,199}$/;
+const PROVIDER = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** Rename the provider of a 'provider/model' reference (e.g. anthropic -> claude-bridge on a machine logged in elsewhere). */
+export function renameProvider(model: string, providers: Readonly<Record<string, string>>): string {
+  const { provider, id } = splitModel(model);
+  return provider in providers ? `${providers[provider]}/${id}` : model;
+}
+
+/**
+ * Extension-backed providers that advisor children (started with --no-extensions) must load explicitly.
+ * Paths are Pi's git package checkouts under the agent directory; setup installs these packages.
+ */
+const EXTENSION_PROVIDERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'claude-bridge': ['git', 'github.com', 'elidickinson', 'pi-claude-bridge'],
+});
+export function providerExtension(provider: string, agentDir = getAgentDir()): string | undefined {
+  const parts = EXTENSION_PROVIDERS[provider];
+  if (!parts) return undefined;
+  const path = join(agentDir, ...parts);
+  return existsSync(path) ? path : undefined;
+}
 const MAX_CHAIN = 8;
 
 /** Strictly validate an override object; missing roles keep their defaults. */
@@ -47,7 +68,18 @@ export function parseModelChains(raw: unknown): ModelChains {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('top level must be an object');
   const input = raw as Record<string, unknown>;
   for (const key of Object.keys(input)) {
-    if (!ROLES.includes(key as FallbackRole)) throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')})`);
+    if (key !== 'providers' && !ROLES.includes(key as FallbackRole)) throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')}, providers)`);
+  }
+  // Optional provider rename map, applied to every chain entry (defaults and overrides alike).
+  const providers: Record<string, string> = {};
+  if ('providers' in input) {
+    const map = input.providers;
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) throw new Error('providers must be an object of "from": "to" names');
+    for (const [from, to] of Object.entries(map as Record<string, unknown>)) {
+      if (!PROVIDER.test(from) || typeof to !== 'string' || !PROVIDER.test(to)) throw new Error('providers entries must map provider names to provider names');
+      if (to === VIRTUAL_CONTROLLER.provider) throw new Error('providers cannot rename to the virtual controller provider');
+      providers[from] = to;
+    }
   }
   const chains = { ...DEFAULT_CHAINS } as Record<FallbackRole, readonly string[]>;
   for (const role of ROLES) {
@@ -60,6 +92,11 @@ export function parseModelChains(raw: unknown): ModelChains {
     }
     if (new Set(list).size !== list.length) throw new Error(`${role} contains duplicate entries`);
     chains[role] = Object.freeze([...list as string[]]);
+  }
+  for (const role of ROLES) {
+    const renamed = chains[role].map(model => renameProvider(model, providers));
+    if (new Set(renamed).size !== renamed.length) throw new Error(`${role} contains duplicate entries after provider renames`);
+    chains[role] = Object.freeze(renamed);
   }
   return Object.freeze(chains);
 }

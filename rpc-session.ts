@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { RpcClient, type RpcClientOptions } from '@earendil-works/pi-coding-agent';
 import { ADVISORS, READ_TOOLS, advisorName, nonempty, type Advisor } from './controller-policy.ts';
-import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, planCandidates, splitModel, type ModelChains } from './model-fallback.ts';
+import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, planCandidates, providerExtension, splitModel, type ModelChains } from './model-fallback.ts';
 
 export function resolvePiCliPath(override = process.env.PI_LIGHT_CLI_PATH): string {
   if (override) {
@@ -52,6 +52,8 @@ interface SessionOptions {
   chains?: ModelChains;
   /** Shared per-run cooldowns (also used by the controller router). */
   cooldowns?: Cooldowns;
+  /** Extension path providing a model provider (e.g. claude-bridge); defaults to the installed package lookup. */
+  providerExtension?: (provider: string) => string | undefined;
 }
 export interface AskOptions {
   advisor: Advisor;
@@ -87,10 +89,12 @@ export function childOptions(options: SessionOptions, advisor: Advisor | string,
   if (!isAbsolute(session.directory) || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(session.id)) {
     throw new Error('Advisor session requires a private absolute directory and UUID.');
   }
+  // Extensions stay off in advisors; only an extension that provides the advisor's model provider is loaded.
+  const extension = (options.providerExtension ?? providerExtension)(model.provider);
   return {
     cliPath: options.cliPath, cwd, provider: model.provider, model: model.id,
     args: ['--no-approve', '--session-dir', session.directory, '--session-id', session.id,
-      '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes',
+      '--no-extensions', ...(extension ? ['-e', extension] : []), '--no-skills', '--no-prompt-templates', '--no-themes',
       '--no-context-files', '--no-mcp', '--tools', READ_TOOLS.join(','),
       '--system-prompt', 'You are a read-only specialist advisor. Give advice, not authorization. Do not modify files, run shell commands, delegate, or use MCP. Distinguish suggestions, pending questions, and evidence. Honor explicit user constraints.'],
   };
