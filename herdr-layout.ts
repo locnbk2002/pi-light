@@ -80,12 +80,15 @@ export class HerdrLayout {
     const moves = planMoves(layout, pane, beside, this.children.size, resolveMaxSplit(this.env));
     this.children.add(pane);
     for (const move of moves) {
-      // herdr requires the destination tab for a split move; it is the orchestrator's tab.
-      if (!('newTab' in move) && !tab) continue;
-      const args = 'newTab' in move ? ['pane', 'move', move.pane, '--new-tab', '--no-focus']
-        : ['pane', 'move', move.pane, '--tab', tab!, '--split', move.direction, '--target-pane', move.target, '--no-focus'];
       // A pane that exited meanwhile cannot move; keep arranging the rest.
-      await this.herdr(args).catch(() => {});
+      if ('newTab' in move) { await this.herdr(['pane', 'move', move.pane, '--new-tab', '--no-focus']).catch(() => {}); continue; }
+      if (!tab) continue;
+      // herdr ignores a split move inside the same tab ("same_tab"), so hop through a new tab; the pane id is kept and
+      // herdr closes the emptied tab. A split move also needs the destination tab: the orchestrator's.
+      try {
+        await this.herdr(['pane', 'move', move.pane, '--new-tab', '--no-focus']);
+        await this.herdr(['pane', 'move', move.pane, '--tab', tab, '--split', move.direction, '--target-pane', move.target, '--no-focus']);
+      } catch { /* cosmetic */ }
     }
   }
 }

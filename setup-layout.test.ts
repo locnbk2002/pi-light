@@ -38,6 +38,8 @@ function fakeHerdr(userPanes: string[] = []) {
     if (args[0] === 'pane' && args[1] === 'list') return { panes: [...all].map(pane_id => ({ pane_id, tab_id: mainTab.has(pane_id) ? 'w1:t1' : 'w1:t9' })) };
     if (args[0] === 'pane' && args[1] === 'layout') return { layout: { panes: [...mainTab].map((pane_id, i) => pane(pane_id, 43 - i * 10, i * 10)) } };
     if (args[0] === 'pane' && args[1] === 'move' && args.includes('--new-tab')) mainTab.delete(args[2]);
+    // Like herdr: a split move inside the same tab is a no-op; from another tab it lands in the target tab.
+    if (args[0] === 'pane' && args[1] === 'move' && args.includes('--split') && !mainTab.has(args[2])) mainTab.add(args[2]);
     return {};
   };
   const open = (id: string) => { all.add(id); mainTab.add(id); };
@@ -51,11 +53,13 @@ test('a parallel burst of four: three stack, then all four move to tabs; user pa
   ids.forEach(fake.open);
   await Promise.all(ids.map(id => layout.place(id)));
   const moves = fake.calls.filter(c => c[1] === 'move');
-  assert.deepEqual(moves[0].slice(0, 3), ['pane', 'move', 'w1:p3']);
-  assert.deepEqual(moves[0], ['pane', 'move', 'w1:p3', '--tab', 'w1:t1', '--split', 'down', '--target-pane', 'w1:p2', '--no-focus']);
-  assert.ok(moves[1].includes('down') && !moves[1].includes('w1:p9'), 'never stacks onto the user pane');
-  assert.deepEqual(moves.slice(2).map(m => m[2]).sort(), ids, 'all four end in tabs');
-  assert.ok(moves.slice(2).every(m => m.includes('--new-tab') && m.includes('--no-focus')));
+  // herdr ignores same-tab split moves, so each stack hops through a new tab first.
+  assert.deepEqual(moves[0], ['pane', 'move', 'w1:p3', '--new-tab', '--no-focus']);
+  assert.deepEqual(moves[1], ['pane', 'move', 'w1:p3', '--tab', 'w1:t1', '--split', 'down', '--target-pane', 'w1:p2', '--no-focus']);
+  assert.deepEqual(moves[2].slice(0, 4), ['pane', 'move', 'w1:p4', '--new-tab']);
+  assert.ok(moves[3].includes('--split') && !moves[3].includes('w1:p9'), 'never stacks onto the user pane');
+  assert.deepEqual(moves.slice(4).map(m => m[2]).sort(), ids, 'all four end in tabs');
+  assert.ok(moves.slice(4).every(m => m.includes('--new-tab') && m.includes('--no-focus')));
   assert.ok(!moves.some(m => m[2] === 'w1:p9' || m[2] === 'w1:p1'));
 });
 
@@ -66,7 +70,8 @@ test('closed subagent panes stop counting toward the split limit', async () => {
   fake.all.delete('w1:p2'); fake.all.delete('w1:p3');
   fake.open('w1:p5');
   await layout.place('w1:p5');
-  assert.ok(!fake.calls.some(c => c.includes('--new-tab')), 'two live panes: still splitting');
+  const last = fake.calls.filter(c => c[1] === 'move' && c[2] === 'w1:p5').at(-1)!;
+  assert.ok(last.includes('--split'), 'two live panes: still splitting');
 });
 
 test('a failing herdr call never rejects or blocks later placements', async () => {
