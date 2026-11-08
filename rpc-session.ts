@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,16 +8,25 @@ import { RpcClient, type RpcClientOptions } from '@earendil-works/pi-coding-agen
 import { ADVISORS, READ_TOOLS, advisorName, nonempty, type Advisor } from './controller-policy.ts';
 import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, planCandidates, providerExtension, splitModel, type ModelChains } from './model-fallback.ts';
 
-export function resolvePiCliPath(override = process.env.PI_LIGHT_CLI_PATH): string {
+export function resolvePiCliPath(override = process.env.PI_LIGHT_CLI_PATH, argv1 = process.argv[1] ?? '',
+  resolvePi = () => import.meta.resolve('@earendil-works/pi-coding-agent')): string {
   if (override) {
     if (!isAbsolute(override) || !existsSync(override)) throw new Error('Advisor CLI override must be an existing absolute path.');
     return override;
   }
-  // Native packages must work without launcher-exported environment variables.
-  const entry = fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent'));
-  const cli = join(dirname(entry), 'cli.js');
-  if (!existsSync(cli)) throw new Error('Advisor CLI could not be located in the installed Pi package.');
-  return cli;
+  // Native packages must work without launcher-exported environment variables. A git/npm-installed package
+  // has no resolvable copy of Pi (host packages are peers), so fall back to the CLI script running this process.
+  const candidates: Array<() => string> = [
+    () => join(dirname(fileURLToPath(resolvePi())), 'cli.js'),
+    () => realpathSync(argv1),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const cli = candidate();
+      if (/\.[cm]?js$/.test(cli) && existsSync(cli)) return cli;
+    } catch { /* try the next location */ }
+  }
+  throw new Error('Advisor CLI could not be located; set PI_LIGHT_CLI_PATH to Pi\'s cli.js.');
 }
 
 export interface AdvisorReply {

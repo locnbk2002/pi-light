@@ -25,6 +25,10 @@ test('native extension resolves its Pi CLI without a launcher or environment ove
   assert.ok((await stat(cli)).isFile());
   assert.equal(resolvePiCliPath(config.cliPath), config.cliPath);
   assert.throws(() => resolvePiCliPath('relative-cli.js'), /existing absolute/);
+  // A git/npm-installed package cannot resolve Pi itself: fall back to the CLI script running this process.
+  const unresolvable = () => { throw new Error("Cannot find module '@earendil-works/pi-coding-agent'"); };
+  assert.equal(resolvePiCliPath('', cli, unresolvable), cli);
+  assert.throws(() => resolvePiCliPath('', '/usr/bin/pi-shim', unresolvable), /PI_LIGHT_CLI_PATH/);
   assert.throws(() => resolvePiCliPath('/missing-pi-light-cli.js'), /existing absolute/);
 });
 
