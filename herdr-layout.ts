@@ -14,6 +14,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 export type SubagentLayout = 'column' | 'tab' | 'split';
 export interface LayoutPane { pane_id: string; rect: { height: number; width: number; x: number; y: number } }
 export type LayoutMove = { pane: string; newTab: true } | { pane: string; target: string; direction: 'down' };
+interface PaneInfo { pane_id: string; tab_id?: string }
 export type Herdr = (args: string[]) => Promise<any>;
 
 const SUBAGENT_TOOLS = new Set(['subagent', 'subagent_resume']);
@@ -67,8 +68,11 @@ export class HerdrLayout {
     if (this.children.has(pane)) return;
     const layout = resolveLayout(this.env);
     let beside: LayoutPane[] = [];
+    let tab: string | undefined;
     if (layout === 'column') {
-      const live = new Set<string>(((await this.herdr(['pane', 'list'])).panes ?? []).map((p: { pane_id: string }) => p.pane_id));
+      const listed: PaneInfo[] = (await this.herdr(['pane', 'list'])).panes ?? [];
+      const live = new Set(listed.map(p => p.pane_id));
+      tab = listed.find(p => p.pane_id === this.orchestrator)?.tab_id;
       for (const id of [...this.children]) if (!live.has(id)) this.children.delete(id);
       const panes: LayoutPane[] = (await this.herdr(['pane', 'layout', '--pane', this.orchestrator])).layout?.panes ?? [];
       beside = panes.filter(p => this.children.has(p.pane_id));
@@ -76,8 +80,10 @@ export class HerdrLayout {
     const moves = planMoves(layout, pane, beside, this.children.size, resolveMaxSplit(this.env));
     this.children.add(pane);
     for (const move of moves) {
+      // herdr requires the destination tab for a split move; it is the orchestrator's tab.
+      if (!('newTab' in move) && !tab) continue;
       const args = 'newTab' in move ? ['pane', 'move', move.pane, '--new-tab', '--no-focus']
-        : ['pane', 'move', move.pane, '--split', move.direction, '--target-pane', move.target, '--no-focus'];
+        : ['pane', 'move', move.pane, '--tab', tab!, '--split', move.direction, '--target-pane', move.target, '--no-focus'];
       // A pane that exited meanwhile cannot move; keep arranging the rest.
       await this.herdr(args).catch(() => {});
     }

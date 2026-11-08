@@ -35,7 +35,7 @@ function fakeHerdr(userPanes: string[] = []) {
   const calls: string[][] = [];
   const herdr = async (args: string[]) => {
     calls.push(args);
-    if (args[0] === 'pane' && args[1] === 'list') return { panes: [...all].map(pane_id => ({ pane_id })) };
+    if (args[0] === 'pane' && args[1] === 'list') return { panes: [...all].map(pane_id => ({ pane_id, tab_id: mainTab.has(pane_id) ? 'w1:t1' : 'w1:t9' })) };
     if (args[0] === 'pane' && args[1] === 'layout') return { layout: { panes: [...mainTab].map((pane_id, i) => pane(pane_id, 43 - i * 10, i * 10)) } };
     if (args[0] === 'pane' && args[1] === 'move' && args.includes('--new-tab')) mainTab.delete(args[2]);
     return {};
@@ -52,7 +52,7 @@ test('a parallel burst of four: three stack, then all four move to tabs; user pa
   await Promise.all(ids.map(id => layout.place(id)));
   const moves = fake.calls.filter(c => c[1] === 'move');
   assert.deepEqual(moves[0].slice(0, 3), ['pane', 'move', 'w1:p3']);
-  assert.ok(moves[0].includes('down') && moves[0].includes('w1:p2') && moves[0].includes('--no-focus'));
+  assert.deepEqual(moves[0], ['pane', 'move', 'w1:p3', '--tab', 'w1:t1', '--split', 'down', '--target-pane', 'w1:p2', '--no-focus']);
   assert.ok(moves[1].includes('down') && !moves[1].includes('w1:p9'), 'never stacks onto the user pane');
   assert.deepEqual(moves.slice(2).map(m => m[2]).sort(), ids, 'all four end in tabs');
   assert.ok(moves.slice(2).every(m => m.includes('--new-tab') && m.includes('--no-focus')));
