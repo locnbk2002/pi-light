@@ -1,11 +1,11 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { RpcClient, type RpcClientOptions } from '@earendil-works/pi-coding-agent';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AdvisorSessions, childOptions, providerErrorSummary, replyModelLabel, resolvePiCliPath, type RpcTransport } from './rpc-session.ts';
+import { AdvisorSessions, LoggedRpcClient, appendStderrLog, childOptions, providerErrorSummary, replyModelLabel, resolvePiCliPath, type RpcTransport } from './rpc-session.ts';
 import { Cooldowns, DEFAULT_CHAINS } from './model-fallback.ts';
 import { ADVISORS } from './controller-policy.ts';
 
@@ -30,6 +30,41 @@ test('native extension resolves its Pi CLI without a launcher or environment ove
   assert.equal(resolvePiCliPath('', cli, unresolvable), cli);
   assert.throws(() => resolvePiCliPath('', '/usr/bin/pi-shim', unresolvable), /PI_LIGHT_CLI_PATH/);
   assert.throws(() => resolvePiCliPath('/missing-pi-light-cli.js'), /existing absolute/);
+});
+
+test('advisor child stderr goes to the debug log, never the parent terminal', async () => {
+  const cliPath = join(folder, 'noisy-cli.mjs');
+  // Split one line and a multi-byte character across pipe writes, and end with an unterminated line.
+  await writeFile(cliPath, [
+    "const euro = Buffer.from('\u20ac');",
+    "process.stderr.write('Warning: No project ');",
+    "setTimeout(() => process.stderr.write(Buffer.concat([Buffer.from('session found; cost '), euro.subarray(0, 1)])), 20);",
+    "setTimeout(() => process.stderr.write(Buffer.concat([euro.subarray(1), Buffer.from('5\\ntail')])), 40);",
+    "setTimeout(() => process.exit(0), 80);",
+  ].join('\n'));
+  const log = join(folder, 'logs', 'advisor-stderr.log');
+  await mkdir(join(folder, 'logs'));
+  await writeFile(log, '', { mode: 0o644 });
+  const written: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    written.push(String(chunk));
+    return (original as (...args: unknown[]) => boolean)(chunk, ...rest);
+  }) as typeof process.stderr.write;
+  const client = new LoggedRpcClient({ cliPath }, lines => appendStderrLog(log, 'anthropic/claude-fable-5-1 abcd1234', lines));
+  try {
+    await client.start().catch(() => {}); // the fixture may exit before or after the 100 ms startup probe
+    await new Promise(resolve => setTimeout(resolve, 300));
+  } finally {
+    await client.stop();
+    process.stderr.write = original;
+  }
+  assert.equal(written.some(chunk => /No project|session found|tail/.test(chunk)), false);
+  assert.equal(client.getStderr(), 'Warning: No project session found; cost \u20ac5\ntail');
+  const logged = (await readFile(log, 'utf8')).split('\n').map(line => line.replace(/^\S+Z /, ''));
+  assert.deepEqual(logged, ['[anthropic/claude-fable-5-1 abcd1234] Warning: No project session found; cost \u20ac5',
+    '[anthropic/claude-fable-5-1 abcd1234] tail', '']);
+  assert.equal((await stat(log)).mode & 0o777, 0o600);
 });
 
 test('provider failures report a short redacted reason', () => {

@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, statSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import { rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
-import { RpcClient, type RpcClientOptions } from '@earendil-works/pi-coding-agent';
+import { RpcClient, getAgentDir, type RpcClientOptions } from '@earendil-works/pi-coding-agent';
 import { ADVISORS, READ_TOOLS, advisorName, nonempty, type Advisor } from './controller-policy.ts';
 import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, planCandidates, providerExtension, splitModel, type ModelChains } from './model-fallback.ts';
 
@@ -27,6 +29,59 @@ export function resolvePiCliPath(override = process.env.PI_LIGHT_CLI_PATH, argv1
     } catch { /* try the next location */ }
   }
   throw new Error('Advisor CLI could not be located; set PI_LIGHT_CLI_PATH to Pi\'s cli.js.');
+}
+
+/** Persistent, owner-only log of advisor child stderr (kept across runs for debugging). */
+export function defaultStderrLog(agentDir = getAgentDir()): string {
+  return join(agentDir, 'pi-light', 'advisor-stderr.log');
+}
+const STDERR_LOG_MAX = 1024 * 1024;
+
+/** Append complete stderr lines, prefixed with time and child identity; rotates once past 1 MiB. */
+export function appendStderrLog(path: string, label: string, lines: string[]): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    try { if (statSync(path).size > STDERR_LOG_MAX) renameSync(path, `${path}.1`); } catch { /* no log yet */ }
+    const stamp = new Date().toISOString();
+    appendFileSync(path, lines.map(line => `${stamp} [${label}] ${line}\n`).join(''), { mode: 0o600 });
+    // Stderr may hold provider diagnostics: keep the log owner-only even if it pre-existed looser.
+    chmodSync(path, 0o600);
+  } catch { /* debugging aid only; never break a consultation */ }
+}
+
+/**
+ * RpcClient that keeps child stderr off the parent terminal. Pi's RpcClient tees child stderr
+ * to process.stderr, which paints over the TUI (e.g. pi's "No project session found ... creating"
+ * warning for every new --session-id). start() attaches that tee synchronously before its first
+ * await, so swapping the listener right after calling super.start() is race-free.
+ */
+export class LoggedRpcClient extends RpcClient {
+  constructor(options: RpcClientOptions, private readonly log: (lines: string[]) => void) { super(options); }
+  override start(): Promise<void> {
+    const internals = this as unknown as { process: ChildProcess | null; stderr: string };
+    if (internals.process) return super.start(); // rejects "already started"; leave the live child untouched
+    const starting = super.start();
+    const stderr = (internals.process as ChildProcess | null)?.stderr; // set synchronously by super.start()
+    if (!stderr) {
+      // Pi internals changed: never orphan the child or fall back to teeing stderr onto the TUI.
+      starting.catch(() => {});
+      return this.stop().then(() => { throw new Error('Advisor transport cannot capture child stderr (Pi RpcClient internals changed).'); });
+    }
+    stderr.removeAllListeners('data');
+    // Pipe chunks split arbitrarily: decode UTF-8 statefully and log only whole lines.
+    const decoder = new StringDecoder('utf8');
+    let partial = '';
+    const take = (text: string, final: boolean) => {
+      internals.stderr += text;
+      const lines = (partial + text).split('\n');
+      partial = lines.pop()!;
+      if (final && partial) lines.push(partial);
+      if (lines.length) this.log(lines);
+    };
+    stderr.on('data', (data: Buffer) => take(decoder.write(data), false));
+    stderr.once('end', () => take(decoder.end(), true));
+    return starting;
+  }
 }
 
 export interface AdvisorReply {
@@ -63,6 +118,8 @@ interface SessionOptions {
   cooldowns?: Cooldowns;
   /** Extension path providing a model provider (e.g. claude-bridge); defaults to the installed package lookup. */
   providerExtension?: (provider: string) => string | undefined;
+  /** Where advisor child stderr is appended; defaults to defaultStderrLog(). */
+  stderrLog?: string;
 }
 export interface AskOptions {
   advisor: Advisor;
@@ -159,8 +216,15 @@ export class AdvisorSessions {
   private factory: TransportFactory;
   private chains: ModelChains;
   private cooldowns: Cooldowns;
-  constructor(options: SessionOptions, factory: TransportFactory = options => new RpcClient(options)) {
+  private stderrLog: string;
+  constructor(options: SessionOptions, factory?: TransportFactory) {
     this.options = options;
+    const log = this.stderrLog = options.stderrLog ?? defaultStderrLog();
+    factory ??= config => {
+      const at = config.args?.indexOf('--session-id') ?? -1;
+      const session = at >= 0 ? config.args![at + 1]?.slice(0, 8) : 'unknown';
+      return new LoggedRpcClient(config, lines => appendStderrLog(log, `${config.provider}/${config.model} ${session}`, lines));
+    };
     this.factory = factory;
     this.chains = options.chains ?? DEFAULT_CHAINS;
     this.cooldowns = options.cooldowns ?? new Cooldowns();
@@ -222,7 +286,8 @@ export class AdvisorSessions {
     } catch (error) {
       // Never surface RpcClient stderr: provider diagnostics can contain secrets.
       const safe = error instanceof Error && /^(Advisor|Set absolute|Topic|Choose)/.test(error.message)
-        && !error.message.includes('Stderr:') ? error.message : 'Advisor transport failed. Check local provider setup.';
+        && !error.message.includes('Stderr:') ? error.message
+        : `Advisor transport failed. Check local provider setup; child stderr is logged at ${this.stderrLog}.`;
       // Keep the session ID even on cancellation/provider failure. Pi resumes its
       // saved branch (including any interrupted user turn); never replay prompts.
       owned.restart = true;
