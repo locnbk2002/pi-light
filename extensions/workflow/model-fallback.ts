@@ -175,7 +175,8 @@ export function parseEffortSettings(raw: unknown): { effort: EffortSettings; err
     if (block.enabled === false) return { effort: DISABLED_EFFORT };
     for (const key of Object.keys(block)) if (!EFFORT_FIELDS.includes(key)) throw new Error(`unknown effort key "${key.slice(0, 40)}"`);
     if ('enabled' in block && block.enabled !== true) throw new Error('effort.enabled must be true or false');
-    const timeoutMs = block.timeoutMs ?? DEFAULT_EFFORT.timeoutMs;
+    // Default only an absent key: a supplied null or wrong type is invalid and disables judging.
+    const timeoutMs = 'timeoutMs' in block ? block.timeoutMs : DEFAULT_EFFORT.timeoutMs;
     if (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 500 || timeoutMs > 30_000) throw new Error('effort.timeoutMs must be an integer from 500 to 30000');
     const fallback = 'fallback' in block ? judgeLevel('fallback', block.fallback) : DEFAULT_EFFORT.fallback;
     const ceiling = 'ceiling' in block ? judgeLevel('ceiling', block.ceiling) : DEFAULT_EFFORT.ceiling;

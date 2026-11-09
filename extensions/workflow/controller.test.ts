@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RpcClient, createEventBus, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { queryReadOnly } from '../../lib/read-only-events.ts';
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -587,7 +587,11 @@ test('live controller selects native Opus and direct chat persists a displayed c
     assert.ok(direct && direct.role === 'custom');
     assert.equal(direct.display, true);
     assert.ok(JSON.stringify(direct.content).includes('DIRECT-READY'));
-    assert.deepEqual(direct.details, { advisor: 'fable', prompt: 'Reply only DIRECT-READY. Do not use tools.', actualModel: 'anthropic/claude-fable-5-1' });
+    // Direct chat is judged too: the details carry the judged and read-back effort.
+    const { effort, ...details } = direct.details as { effort?: { requested: string; effective?: string; source: string; ms: number } };
+    assert.deepEqual(details, { advisor: 'fable', prompt: 'Reply only DIRECT-READY. Do not use tools.', actualModel: 'anthropic/claude-fable-5-1' });
+    assert.ok(effort && ['low', 'medium', 'high', 'xhigh'].includes(effort.requested) && ['judge', 'fallback'].includes(effort.source));
+    assert.equal(effort.effective, effort.requested, 'fable supports every judged level');
   } finally {
     clearTimeout(timer);
     unsubscribe();
@@ -760,4 +764,69 @@ test('delegation guidance asks for a solutionSpace line when effort judging is o
   await harness.event('before_agent_start', event);
   assert.match(event.systemPromptOptions.sections.locbt_workflow, /solutionSpace: \.\.\./);
   assert.match(event.systemPromptOptions.sections.locbt_workflow, /small judge model uses it to pick the child's reasoning effort/);
+});
+
+test('subagent effort: precedence is decided from the arguments at tool_call, not the cached message_end view', async () => {
+  const harness = extensionHarness();
+  const calls = [
+    { name: 'a', task: 'solutionSpace: fix given', model: 'openai-codex/gpt-6.1-sol' },
+    { name: 'b', task: 'solutionSpace: fix given', model: 'openai-codex/gpt-6.1-sol' },
+    { name: 'c', task: 'solutionSpace: fix given' },
+  ] as Array<{ name: string; task: string; model?: string }>;
+  await harness.event('message_end', { message: { role: 'assistant', content: calls.map((input, i) => subagentCall(`m${i}`, { ...input })) } });
+  assert.equal(harness.judge.calls.length, 3);
+  // Another extension's earlier tool_call handler changed the arguments after message_end.
+  calls[0].model = 'openai-codex/gpt-6-astra:low';
+  calls[1].model = 'openai-codex/gpt-6-astra';
+  calls[2].task = 'solutionSpace: open cause, no reproduction';
+  for (const [i, input] of calls.entries()) await harness.event('tool_call', { toolName: 'subagent', toolCallId: `m${i}`, input });
+  assert.equal(calls[0].model, 'openai-codex/gpt-6-astra:low', 'a newer explicit level wins');
+  assert.equal(calls[1].model, 'openai-codex/gpt-6-astra:high', 'the newer base model keeps the cached judgment for the same task');
+  assert.equal(calls[2].model, 'pi-light/controller:high');
+  assert.equal(harness.judge.calls.length, 4, 'a changed task is judged again inline');
+});
+
+test('subagent effort with the judge off: no judge calls, but precedence repairs stay on (option 2)', async () => {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-effort-off-'));
+  try {
+    await mkdir(join(dir, 'agents'));
+    await writeFile(join(dir, 'pi-light-models.json'), JSON.stringify({ effort: { enabled: false } }));
+    await writeFile(join(dir, 'agents', 'thinker.md'), '---\nname: thinker\nthinking: high\n---\n');
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const harness = extensionHarness();
+    const plain = { name: 'p', task: 'anything' } as { name: string; task: string; model?: string };
+    await harness.event('message_end', { message: { role: 'assistant', content: [subagentCall('o1', { ...plain })] } });
+    await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'o1', input: plain });
+    assert.equal(plain.model, undefined, 'no judged suffix');
+    const thinker = { name: 't', task: 'anything', agent: 'thinker' } as { name: string; task: string; agent: string; model?: string };
+    await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'o2', input: thinker });
+    assert.equal(thinker.model, 'pi-light/controller', 'a thinking-only agent definition still gets a base so its level reaches the child');
+    assert.equal(harness.judge.calls.length, 0);
+    assert.equal(harness.notifications.some(text => text.startsWith('subagent')), false, 'no effort notices while the judge is off');
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('subagent effort: a batch of stalled judges falls back together at one configured deadline', async () => {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-effort-batch-'));
+  try {
+    await writeFile(join(dir, 'pi-light-models.json'), JSON.stringify({ effort: { timeoutMs: 500 } }));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const harness = extensionHarness();
+    harness.judge.reply = () => new Promise(() => {}); // providers that never answer and ignore aborts
+    const inputs = Array.from({ length: 5 }, (_, i) => ({ name: `s${i}`, task: `task ${i}` })) as Array<{ name: string; task: string; model?: string }>;
+    await harness.event('message_end', { message: { role: 'assistant', content: inputs.map((input, i) => subagentCall(`s${i}`, { ...input })) } });
+    const started = Date.now();
+    for (const [i, input] of inputs.entries()) await harness.event('tool_call', { toolName: 'subagent', toolCallId: `s${i}`, input });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 400 && elapsed < 1200, `one shared deadline for the batch, not five (${elapsed} ms)`);
+    assert.deepEqual(inputs.map(input => input.model), Array(5).fill('pi-light/controller:medium'));
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

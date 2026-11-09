@@ -173,7 +173,8 @@ test('effort settings: defaults, overrides and provider renames of the judge cha
 });
 
 test('invalid effort settings disable judging (fail closed); a valid enabled:false always wins', () => {
-  for (const bad of [{ effort: 'on' }, { effort: { enabled: 'yes' } }, { effort: { timeoutMs: '4000' } }, { effort: { timeoutMs: 100 } },
+  for (const bad of [{ effort: 'on' }, { effort: null }, { effort: { enabled: 'yes' } }, { effort: { enabled: null } }, { effort: { timeoutMs: '4000' } },
+    { effort: { timeoutMs: null } }, { effort: { fallback: null } }, { effort: { ceiling: null } }, { judge: null }, { effort: { timeoutMs: 100 } },
     { effort: { fallback: 'max' } }, { effort: { ceiling: 'low', fallback: 'high' } }, { effort: { extra: 1 } },
     { judge: [] }, { judge: ['no-slash'] }, { judge: ['pi-light/controller'] }, { providers: [] }]) {
     const parsed = parseEffortSettings(bad);

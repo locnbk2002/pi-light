@@ -60,11 +60,11 @@ test('agent definitions are read like upstream: project first, then the agent di
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('the upstream launch format this relies on is unchanged at the pinned commit', async () => {
+test('the upstream launch format this relies on is unchanged at the pinned commit', async t => {
   // pi-herdr-subagents src/launch.ts @ 2489019: `--model ${model}:${thinking}`, only when a model is set.
   const launch = join(process.env.HOME ?? '', '.pi/agent/git/github.com/modem-dev/pi-herdr-subagents/src/launch.ts');
   const source = await readFile(launch, 'utf8').catch(() => undefined);
-  if (source === undefined) return; // upstream not installed on this machine
+  if (source === undefined) { t.skip('pi-herdr-subagents is not installed on this machine'); return; }
   assert.match(source, /const effectiveModel = params\.model \?\? agentDefs\?\.model;/);
   assert.match(source, /const effectiveThinking = agentDefs\?\.thinking;/);
   assert.match(source, /if \(effectiveModel\) \{\s*piArgv\.push\("--model", effectiveThinking \? `\$\{effectiveModel\}:\$\{effectiveThinking\}` : effectiveModel\);/);

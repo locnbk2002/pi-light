@@ -438,38 +438,46 @@ export default function piLight(pi: ExtensionAPI): void {
     // Includes errors, cancellation and extension-originated input: never fall through to Opus.
     return { action: 'handled' };
   });
-  // Subagent effort: judge every `subagent` call of an assistant message concurrently as soon as the
-  // message ends (Pi preflights sibling tool calls one at a time), then apply each result in tool_call.
-  const pendingSubagentEffort = new Map<string, { plan: SubagentEffortPlan; judged?: Promise<JudgeResult> }>();
-  function planSubagent(input: Record<string, unknown>, ctx: ExtensionContext) {
+  // Subagent effort. Pi preflights sibling tool calls one at a time, so every `subagent` call of an
+  // assistant message is judged concurrently when the message ends. Only the judgment is cached, keyed
+  // by the text it read: precedence is decided again in tool_call from the call's current arguments,
+  // because earlier tool_call handlers may have changed them.
+  const pendingJudgments = new Map<string, { input: string; judged: Promise<JudgeResult> }>();
+  function subagentPlan(input: Record<string, unknown>): SubagentEffortPlan {
     const agent = typeof input.agent === 'string' && input.agent.trim() ? input.agent.trim() : undefined;
-    const plan = planSubagentEffort(input, agent ? readAgentDefaults(agent) : undefined);
-    const task = typeof input.task === 'string' ? input.task : '';
-    const judged = plan.action === 'judge' && models.effort.enabled
-      ? judgeEffort({ input: judgeInput(task), settings: models.effort, call: registryJudgeCall(ctx.modelRegistry),
-        cooldowns: judgeCooldowns, isAvailable: model => available(ctx, model), signal: ctx.signal, redact: providerErrorSummary })
-      : undefined;
-    judged?.catch(() => {}); // a cancelled judgment is handled where it is awaited
-    return { plan, judged };
+    return planSubagentEffort(input, agent ? readAgentDefaults(agent) : undefined);
   }
+  function startJudgment(input: string, ctx: ExtensionContext): Promise<JudgeResult> {
+    const judged = judgeEffort({ input, settings: models.effort, call: registryJudgeCall(ctx.modelRegistry),
+      cooldowns: judgeCooldowns, isAvailable: model => available(ctx, model), signal: ctx.signal, redact: providerErrorSummary });
+    judged.catch(() => {}); // a cancelled judgment is handled where it is awaited
+    return judged;
+  }
+  const taskOf = (input: Record<string, unknown>) => judgeInput(typeof input.task === 'string' ? input.task : '');
   pi.on('message_end', (event, ctx) => {
     const message = event.message;
-    if (message.role !== 'assistant' || policy.direct) return;
+    if (message.role !== 'assistant' || policy.direct || !models.effort.enabled) return;
     for (const block of message.content) {
-      if (block.type === 'toolCall' && block.name === 'subagent') pendingSubagentEffort.set(block.id, planSubagent(block.arguments, ctx));
+      if (block.type !== 'toolCall' || block.name !== 'subagent' || subagentPlan(block.arguments).action !== 'judge') continue;
+      const input = taskOf(block.arguments);
+      pendingJudgments.set(block.id, { input, judged: startJudgment(input, ctx) });
     }
   });
   async function applySubagentEffort(toolCallId: string, input: Record<string, unknown>, ctx: ExtensionContext): Promise<void> {
-    // Fallback when message_end did not run first: judge inline.
-    const { plan, judged } = pendingSubagentEffort.get(toolCallId) ?? planSubagent(input, ctx);
-    pendingSubagentEffort.delete(toolCallId);
+    const cached = pendingJudgments.get(toolCallId);
+    pendingJudgments.delete(toolCallId);
+    // Precedence repairs (explicit suffix, agent-definition thinking) apply even with the judge off.
+    const plan = subagentPlan(input);
     const name = typeof input.name === 'string' ? input.name.slice(0, 60) : 'subagent';
     if (plan.action === 'set-model') input.model = plan.model;
     if (plan.action !== 'judge') {
       if (models.effort.enabled) ctx.ui.notify(`subagent ${name}: effort from ${plan.source === 'explicit' ? 'the model suffix' : 'the agent definition'}`, 'info');
       return;
     }
-    if (!judged) return; // judging disabled: today's behavior
+    if (!models.effort.enabled) return;
+    // Reuse the pre-judgment only if the call still asks the judge the same thing; otherwise judge inline.
+    const task = taskOf(input);
+    const judged = cached?.input === task ? cached.judged : startJudgment(task, ctx);
     let result: JudgeResult;
     try { result = await judged; } catch { return; } // cancelled: the call is being aborted anyway
     input.model = `${plan.base}:${result.requested}`;
@@ -536,7 +544,7 @@ ${reviewPolicy(controllerModel ?? models.chains.controller[0], model => availabl
   });
   pi.on('agent_settled', (_event, ctx) => {
     fallbackContinuations = 0;
-    pendingSubagentEffort.clear();
+    pendingJudgments.clear();
     policy.reset();
     update(ctx);
   });

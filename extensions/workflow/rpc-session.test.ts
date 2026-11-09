@@ -92,6 +92,8 @@ class FakeRpcClient implements RpcTransport {
   maxLevel = 'max';
   /** A child that never answers set_thinking_level. */
   hangThinking = false;
+  /** A child that never answers the effort read-back (the get_state after set_thinking_level). */
+  hangReadback = false;
   constructor(readonly options?: RpcClientOptions) {}
   async setThinkingLevel(level: string): Promise<void> {
     this.calls.push(`thinking:${level}`);
@@ -114,6 +116,7 @@ class FakeRpcClient implements RpcTransport {
   }
   async getState(): Promise<unknown> {
     if (this.failState) throw new Error('process exited');
+    if (this.hangReadback && this.calls.some(call => call.startsWith('thinking:'))) return new Promise(() => {});
     return { thinkingLevel: this.thinkingLevel, model: this.options ? { provider: this.options.provider, id: this.options.model }
       : { provider: ADVISORS.astra.provider, id: ADVISORS.astra.model } };
   }
@@ -513,12 +516,12 @@ test('effort is reapplied on the fallback child and the clamped level is reporte
   } finally { await sessions.close(); }
 });
 
-test('a stalled set_thinking_level is released by cancellation, the candidate deadline and shutdown', async () => {
-  for (const how of ['cancel', 'deadline', 'shutdown'] as const) {
+test('a stalled set_thinking_level or read-back is released by cancellation, the candidate deadline and shutdown', async () => {
+  for (const stall of ['hangThinking', 'hangReadback'] as const) for (const how of ['cancel', 'deadline', 'shutdown'] as const) {
     const clients: FakeRpcClient[] = [];
     const factory = (options: RpcClientOptions) => {
       const client = new FakeRpcClient(options);
-      client.hangThinking = clients.length === 0;
+      client[stall] = clients.length === 0;
       clients.push(client);
       return client;
     };
