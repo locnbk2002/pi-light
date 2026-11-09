@@ -85,7 +85,20 @@ class FakeRpcClient implements RpcTransport {
   failState = false;
   failStop = false;
   behavior: 'success' | 'hang' | 'handled' | 'provider-error' | 'limit-error' | 'invalid-request' | 'exit' | 'invalid' | 'abort' | 'reject-after-settle' = 'success';
+  /** Ordered transport calls, for effort-before-prompt assertions. */
+  calls: string[] = [];
+  thinkingLevel = 'medium';
+  /** Highest level this child supports; Pi clamps above it. */
+  maxLevel = 'max';
+  /** A child that never answers set_thinking_level. */
+  hangThinking = false;
   constructor(readonly options?: RpcClientOptions) {}
+  async setThinkingLevel(level: string): Promise<void> {
+    this.calls.push(`thinking:${level}`);
+    if (this.hangThinking) return new Promise(() => {});
+    const order = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+    this.thinkingLevel = order.indexOf(level) > order.indexOf(this.maxLevel) ? this.maxLevel : level;
+  }
   onEvent(listener: (event: unknown) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -101,11 +114,12 @@ class FakeRpcClient implements RpcTransport {
   }
   async getState(): Promise<unknown> {
     if (this.failState) throw new Error('process exited');
-    return { model: this.options ? { provider: this.options.provider, id: this.options.model }
+    return { thinkingLevel: this.thinkingLevel, model: this.options ? { provider: this.options.provider, id: this.options.model }
       : { provider: ADVISORS.astra.provider, id: ADVISORS.astra.model } };
   }
   async prompt(message: string): Promise<string> {
     this.prompts.push(message);
+    this.calls.push('prompt');
     if (this.behavior === 'hang') return 'started';
     if (this.behavior === 'handled') return 'handled';
     if (this.behavior === 'exit') { this.failState = true; return 'started'; }
@@ -448,4 +462,81 @@ test('preferred model is retried after its cooldown on the same session', async 
     assert.equal(clients[1].stops, 1, 'fallback child is stopped before switching back');
     assert.deepEqual(clients[2].prompts, ['Later']);
   } finally { await sessions.close(); }
+});
+
+const judged = (requested: string, source: 'judge' | 'fallback' = 'judge') => ({ requested, source, ms: 800 });
+
+test('judged effort is applied before the prompt on new and reused sessions, and read back', async () => {
+  const { clients, factory } = failoverHarness({});
+  const sessions = new AdvisorSessions(config, factory);
+  try {
+    const first = await sessions.ask({ ...request(), effort: judged('high') });
+    assert.deepEqual(first.effort, { requested: 'high', effective: 'high', source: 'judge', ms: 800 });
+    assert.equal(replyModelLabel(first), `${ASTRA}, effort high (judge; 0.8s)`);
+    const second = await sessions.ask({ ...request(), prompt: 'Follow-up', effort: judged('low') });
+    assert.equal(second.effort!.effective, 'low');
+    assert.equal(clients.length, 1, 'the conversation is reused');
+    assert.deepEqual(clients[0].calls, ['thinking:high', 'prompt', 'thinking:low', 'prompt'], 'the level changes per message, always before the prompt');
+    // Judge failure: the fallback level is still applied and labelled as such.
+    const failed = await sessions.ask({ ...request(), prompt: 'Third', effort: { requested: 'medium', source: 'fallback', ms: 4000 } });
+    assert.equal(replyModelLabel(failed), `${ASTRA}, effort medium (fallback; 4.0s)`);
+  } finally { await sessions.close(); }
+});
+
+test('no judged effort (judging disabled) never touches the child thinking level', async () => {
+  const { clients, factory } = failoverHarness({});
+  const sessions = new AdvisorSessions(config, factory);
+  try {
+    const reply = await sessions.ask(request());
+    assert.equal(reply.effort, undefined);
+    assert.deepEqual(clients[0].calls, ['prompt']);
+    assert.equal(replyModelLabel(reply), ASTRA);
+  } finally { await sessions.close(); }
+});
+
+test('effort is reapplied on the fallback child and the clamped level is reported', async () => {
+  const clients: FakeRpcClient[] = [];
+  const factory = (options: RpcClientOptions) => {
+    const client = new FakeRpcClient(options);
+    if (options.model === 'gpt-6-astra') client.behavior = 'limit-error';
+    else client.maxLevel = 'high';
+    clients.push(client);
+    return client;
+  };
+  const sessions = new AdvisorSessions(config, factory);
+  try {
+    const reply = await sessions.ask({ ...request(), effort: judged('xhigh') });
+    assert.equal(reply.actualModel, FABLE);
+    assert.deepEqual(clients.map(client => client.calls), [['thinking:xhigh', 'prompt'], ['thinking:xhigh', 'prompt']]);
+    assert.deepEqual(reply.effort, { requested: 'xhigh', effective: 'high', source: 'judge', ms: 800 });
+    assert.equal(replyModelLabel(reply), `${FABLE}, effort high (judge xhigh, clamped; 0.8s), fallback from ${ASTRA}: 429 usage limit reached`);
+  } finally { await sessions.close(); }
+});
+
+test('a stalled set_thinking_level is released by cancellation, the candidate deadline and shutdown', async () => {
+  for (const how of ['cancel', 'deadline', 'shutdown'] as const) {
+    const clients: FakeRpcClient[] = [];
+    const factory = (options: RpcClientOptions) => {
+      const client = new FakeRpcClient(options);
+      client.hangThinking = clients.length === 0;
+      clients.push(client);
+      return client;
+    };
+    const sessions = new AdvisorSessions({ ...config, timeoutMs: how === 'deadline' ? 50 : 5000 }, factory);
+    const controller = new AbortController();
+    const pending = sessions.ask({ ...request(), effort: judged('high'), signal: controller.signal });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (how === 'cancel') controller.abort();
+    if (how === 'shutdown') void sessions.close();
+    await assert.rejects(pending, /cancelled or deadline exceeded|closed/, how);
+    assert.deepEqual(clients[0].prompts, [], `${how}: the prompt is never sent`);
+    assert.ok(clients[0].stops >= 1, `${how}: the stalled child is stopped`);
+    if (how !== 'shutdown') {
+      // The busy lock is released: the same conversation answers again, with the level reapplied on a new child.
+      const reply = await sessions.ask({ ...request(), prompt: 'Retry', effort: judged('low') });
+      assert.equal(reply.effort!.effective, 'low');
+      assert.deepEqual(clients.at(-1)!.calls, ['thinking:low', 'prompt']);
+    }
+    await sessions.close();
+  }
 });

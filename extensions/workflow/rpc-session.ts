@@ -7,6 +7,7 @@ import { rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { RpcClient, getAgentDir, type RpcClientOptions } from '@earendil-works/pi-coding-agent';
+type ThinkingLevel = Parameters<RpcClient['setThinkingLevel']>[0];
 import { ADVISORS, READ_TOOLS, advisorName, nonempty, type Advisor } from './controller-policy.ts';
 import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, planCandidates, providerExtension, splitModel, type ModelChains } from './model-fallback.ts';
 
@@ -84,17 +85,27 @@ export class LoggedRpcClient extends RpcClient {
   }
 }
 
+/** Judged reasoning effort for one consultation, and what the answering child actually ran at. */
+export interface AdvisorEffort {
+  requested: string;
+  /** Level read back from the child after setting it; Pi clamps to the model's capabilities. */
+  effective?: string;
+  source: 'judge' | 'fallback';
+  ms: number;
+}
 export interface AdvisorReply {
   text: string;
   actualModel: string;
   /** Preferred candidates that did not answer, each 'provider/model: redacted reason'. */
   fallbackFrom?: string[];
+  effort?: AdvisorEffort;
 }
 export interface RpcTransport {
   start(): Promise<void>;
   stop(): Promise<void>;
   prompt(message: string): Promise<string>;
   getState(): Promise<unknown>;
+  setThinkingLevel(level: ThinkingLevel): Promise<void>;
   onEvent(listener: (event: unknown) => void): () => void;
 }
 export type TransportFactory = (options: RpcClientOptions) => RpcTransport;
@@ -131,6 +142,8 @@ export interface AskOptions {
   onProgress?: (text: string) => void;
   /** Whether a candidate's provider has credentials in the parent registry; defaults to all available. */
   isAvailable?: (model: string) => boolean;
+  /** Judged effort, applied to every physical child before the prompt; omitted means leave the level alone. */
+  effort?: Omit<AdvisorEffort, 'effective'>;
 }
 
 /** A failed advisor model turn, with a classification but only a redacted reason. */
@@ -138,9 +151,17 @@ class AdvisorTurnError extends Error {
   constructor(message: string, readonly limit: boolean, readonly reason: string) { super(message); }
 }
 
-/** Display label: the responding model plus any fallback it replaced. */
-export function replyModelLabel(reply: Pick<AdvisorReply, 'actualModel' | 'fallbackFrom'>): string {
-  return reply.fallbackFrom?.length ? `${reply.actualModel}, fallback from ${reply.fallbackFrom.join('; ')}` : reply.actualModel;
+/** Effort label, e.g. 'effort high (judge xhigh, clamped; 0.8s)' or 'effort medium (fallback; 4.0s)'. */
+export function effortLabel(effort: AdvisorEffort): string {
+  const effective = effort.effective ?? effort.requested;
+  const clamped = effective !== effort.requested ? ` ${effort.requested}, clamped` : '';
+  return `effort ${effective} (${effort.source}${clamped}; ${(effort.ms / 1000).toFixed(1)}s)`;
+}
+
+/** Display label: the responding model, its effort, plus any fallback it replaced. */
+export function replyModelLabel(reply: Pick<AdvisorReply, 'actualModel' | 'fallbackFrom' | 'effort'>): string {
+  const model = reply.effort ? `${reply.actualModel}, ${effortLabel(reply.effort)}` : reply.actualModel;
+  return reply.fallbackFrom?.length ? `${model}, fallback from ${reply.fallbackFrom.join('; ')}` : model;
 }
 
 export function childOptions(options: SessionOptions, advisor: Advisor | string, cwd: string,
@@ -327,6 +348,14 @@ export class AdvisorSessions {
       if (selected?.provider !== wanted.provider || selected?.id !== wanted.id) {
         throw new Error('Advisor child did not select the requested model.');
       }
+      // Per-consultation effort, reapplied on every child (restart or fallback) and read back after
+      // Pi clamps it. Both waits are abortable so a stalled child releases the session on cancel.
+      let effort: AdvisorEffort | undefined;
+      if (request.effort) {
+        await untilAbort(owned.client.setThinkingLevel(request.effort.requested as ThinkingLevel), signal);
+        const level = record(await untilAbort(owned.client.getState(), signal))?.thinkingLevel;
+        effort = { ...request.effort, ...(typeof level === 'string' ? { effective: level } : {}) };
+      }
       const completion = new Promise<AdvisorReply>((resolve, reject) => {
         let text = '';
         let actualModel: string | undefined;
@@ -370,7 +399,7 @@ export class AdvisorSessions {
         if (disposition !== 'started') throw new Error('Advisor prompt did not start a model run.');
       }, () => { throw new Error('Advisor prompt was rejected or process exited.'); });
       const [reply] = await untilAbort(Promise.all([completion, acceptance]), signal);
-      return reply;
+      return effort ? { ...reply, effort } : reply;
     } finally {
       finished = true;
       clearTimeout(heartbeat);

@@ -51,9 +51,11 @@ test('herdr subagent panes keep their requested model and default to the control
     process.argv = [previous.argv[0], previous.argv[1], ...args];
     const registered: string[] = [];
     const selected: string[] = [];
+    const thinking: string[] = [];
     const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<void>> = {};
     const api = new Proxy({}, { get(_target, name) {
       if (name === 'registerVirtualModel') return (definition: { provider: string; id: string }) => { registered.push(`${definition.provider}/${definition.id}`); };
+      if (name === 'setThinkingLevel') return (level: string) => { thinking.push(level); };
       if (name === 'on') return (event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => { handlers[event] = handler; };
       if (name === 'setModel') return async (model: { provider: string; id: string }) => { selected.push(`${model.provider}/${model.id}`); return true; };
       throw new Error(`Herdr child must not access extension API ${String(name)}`);
@@ -61,15 +63,20 @@ test('herdr subagent panes keep their requested model and default to the control
     piLight(api as ExtensionAPI);
     const ctx = { model: current, ui: { notify() {} }, modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) } };
     await handlers.session_start?.({}, ctx);
-    return { registered, selected, events: Object.keys(handlers) };
+    return { registered, selected, thinking, events: Object.keys(handlers) };
   };
   try {
     process.env.PI_SUBAGENT_ID = 'ab12cd34';
     const virtual = `${VIRTUAL_CONTROLLER.provider}/${VIRTUAL_CONTROLLER.id}`;
     const unpinned = await run(['--session', 's.jsonl', '@task.md'], { provider: 'openai-codex', id: 'gpt-6.1-sol' });
-    assert.deepEqual(unpinned, { registered: [virtual], selected: [virtual], events: ['session_start'] });
+    assert.deepEqual(unpinned, { registered: [virtual], selected: [virtual], thinking: [], events: ['session_start'] });
     const pinned = await run(['--session', 's.jsonl', '--model', 'openai-codex/gpt-6-astra', '@task.md'], { provider: 'openai-codex', id: 'gpt-6-astra' });
-    assert.deepEqual(pinned, { registered: [virtual], selected: [], events: [] }, 'a requested model is never overridden');
+    assert.deepEqual(pinned, { registered: [virtual], selected: [], thinking: [], events: ['session_start'] }, 'a requested model is never overridden');
+    // Explicit level plus an appended agent-definition level: the explicit (inner) level wins.
+    const doubled = await run(['--session', 's.jsonl', '--model', 'openai-codex/gpt-6.1-sol:high:low'], { provider: 'openai-codex', id: 'gpt-6.1-sol' });
+    assert.deepEqual(doubled, { registered: [virtual], selected: [], thinking: ['high'], events: ['session_start'] });
+    const judged = await run(['--model', `${virtual}:xhigh`], { provider: VIRTUAL_CONTROLLER.provider, id: VIRTUAL_CONTROLLER.id });
+    assert.deepEqual(judged, { registered: [virtual], selected: [], thinking: [], events: ['session_start'] }, 'a single suffix is left to Pi');
   } finally {
     process.argv = previous.argv;
     if (previous.id === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = previous.id;
@@ -175,18 +182,25 @@ function extensionHarness() {
   } as unknown as ExtensionAPI;
   // Catalog stub: every model exists; `unavailable` simulates providers without credentials.
   const unavailable = new Set<string>();
+  // Fake judge provider: records each judge call and answers with `judge.reply`.
+  const judge = { calls: [] as string[], reply: (_model: string): Promise<unknown> => Promise.resolve({ content: [{ type: 'text', text: '{"level":"high"}' }], stopReason: 'stop' }) };
   const ctx = {
     mode: 'tui', hasUI: true, model: { provider: VIRTUAL_CONTROLLER.provider, id: VIRTUAL_CONTROLLER.id }, cwd: '/tmp', isIdle: () => true, hasPendingMessages: () => false,
     modelRegistry: {
       find: (provider: string, id: string) => ({ provider, id }),
       hasConfiguredAuth: (model: { provider: string; id: string }) => !unavailable.has(`${model.provider}/${model.id}`),
+      streamSimple: (model: { provider: string; id: string }) => {
+        const ref = `${model.provider}/${model.id}`;
+        judge.calls.push(ref);
+        return { result: () => judge.reply(ref) };
+      },
     },
     ui: { notify(text: string) { notifications.push(text); }, setStatus(key: string, text: string | undefined) { statuses.set(key, text); }, setWidget() {},
       async confirm() { confirmations++; return false; } },
   } as unknown as ExtensionContext;
   piLight(pi);
   return {
-    ctx, bus, notifications, statuses, selected, unavailable, virtualModel: () => virtualModel!,
+    ctx, bus, notifications, statuses, selected, unavailable, judge, virtualModel: () => virtualModel!,
     renderers, tools, sentRecords, active: () => activeTools, sent: () => sent, confirmations: () => confirmations,
     async command(name: string, args = '') { await commands.get(name)!.handler(args, ctx as Parameters<Parameters<ExtensionAPI['registerCommand']>[1]['handler']>[1]); },
     async event(name: string, value: unknown) {
@@ -678,4 +692,72 @@ test('advisor renderer shows the fallback model and what it replaced', () => {
     actualModel: SOL_REF, fallbackFrom: ['openai-codex/gpt-6-astra: 429 usage limit'] } } as Parameters<typeof renderer>[0],
   {} as Parameters<typeof renderer>[1], { fg: (_color: string, text: string) => text } as Parameters<typeof renderer>[2]);
   assert.ok(rendered!.render(200).join('\n').includes(`astra [${SOL_REF}, fallback from openai-codex/gpt-6-astra: 429 usage limit]`));
+});
+
+test('consult_advisor accepts a bounded solutionSpace for the effort judge and rejects oversized hints before any advisor runs', async () => {
+  const harness = extensionHarness();
+  const tool = harness.tools.get('consult_advisor')!;
+  const schema = tool.parameters as unknown as { properties: Record<string, { maxLength?: number }> };
+  assert.equal(schema.properties.solutionSpace.maxLength, 2000);
+  assert.match(tool.description, /judge model picks the advisor's reasoning effort/);
+  await assert.rejects(tool.execute('oversized', { advisor: 'astra', topic: 't', question: 'q', solutionSpace: 'x'.repeat(2001) },
+    undefined, undefined, harness.ctx as Parameters<typeof tool.execute>[4]), /solutionSpace must be a string of at most 2000/);
+});
+
+const subagentCall = (id: string, args: Record<string, unknown>) => ({ type: 'toolCall', id, name: 'subagent', arguments: args });
+
+test('subagent effort: every call in one message is judged concurrently, then applied as a model suffix', async () => {
+  const harness = extensionHarness();
+  let resolveSlow!: () => void;
+  const gate = new Promise<void>(resolve => { resolveSlow = resolve; });
+  harness.judge.reply = async () => { await gate; return { content: [{ type: 'text', text: '{"level":"xhigh"}' }], stopReason: 'stop' }; };
+  const inputs = Array.from({ length: 5 }, (_, i) => ({ name: `w${i}`, task: `solutionSpace: open cause ${i}\nDo the work.` }));
+  await harness.event('message_end', { message: { role: 'assistant', content: inputs.map((input, i) => subagentCall(`c${i}`, input)) } });
+  assert.equal(harness.judge.calls.length, 5, 'all judges start at message_end, before any tool_call preflight');
+  setTimeout(resolveSlow, 30);
+  const started = Date.now();
+  for (const [i, input] of inputs.entries()) await harness.event('tool_call', { toolName: 'subagent', toolCallId: `c${i}`, input });
+  assert.ok(Date.now() - started < 1000, 'the batch waits about one judgment, not five');
+  assert.deepEqual(inputs.map(input => (input as { model?: string }).model), Array(5).fill('pi-light/controller:xhigh'));
+  assert.equal(harness.judge.calls.length, 5, 'tool_call reuses the pre-judged results');
+  assert.ok(harness.notifications.some(text => /subagent w0: effort xhigh \(judge anthropic\/claude-haiku-5-5, /.test(text)));
+});
+
+test('subagent effort: explicit suffix and caller model are honored; judge failure falls back to medium', async () => {
+  const harness = extensionHarness();
+  const explicit = { name: 'r', task: 'review', model: 'openai-codex/gpt-6.1-sol:high' };
+  await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'x1', input: explicit });
+  assert.equal(explicit.model, 'openai-codex/gpt-6.1-sol:high', 'explicit level untouched');
+  assert.equal(harness.judge.calls.length, 0);
+  // No message_end first: the hook judges inline, keeping the caller's model as the base.
+  const pinned = { name: 'p', task: 'fix given', model: 'openai-codex/gpt-6.1-sol' };
+  await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'x2', input: pinned });
+  assert.equal(pinned.model, 'openai-codex/gpt-6.1-sol:high');
+  harness.judge.reply = () => Promise.reject(new Error('provider down'));
+  const failed = { name: 'f', task: 'anything' } as { name: string; task: string; model?: string };
+  await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'x3', input: failed });
+  assert.equal(failed.model, 'pi-light/controller:medium');
+  assert.ok(harness.notifications.some(text => /subagent f: effort medium \(fallback, /.test(text)));
+  const other = { path: 'x' };
+  await harness.event('tool_call', { toolName: 'read', toolCallId: 'x4', input: other });
+  assert.deepEqual(other, { path: 'x' }, 'other tools are untouched');
+});
+
+test('subagent effort: the direct-chat block still wins over effort judging', async () => {
+  const harness = extensionHarness();
+  await harness.command('advisor', 'astra');
+  const input = { name: 'n', task: 't' } as { name: string; task: string; model?: string };
+  const result = await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'd1', input }) as { block?: boolean };
+  assert.equal(result?.block, true);
+  assert.equal(input.model, undefined);
+  assert.equal(harness.judge.calls.length, 0);
+});
+
+test('delegation guidance asks for a solutionSpace line when effort judging is on', async () => {
+  const harness = extensionHarness();
+  await harness.event('input', { text: 'hello', source: 'interactive' });
+  const event = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: {} as Record<string, string> } };
+  await harness.event('before_agent_start', event);
+  assert.match(event.systemPromptOptions.sections.locbt_workflow, /solutionSpace: \.\.\./);
+  assert.match(event.systemPromptOptions.sections.locbt_workflow, /small judge model uses it to pick the child's reasoning effort/);
 });

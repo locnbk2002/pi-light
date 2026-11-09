@@ -83,63 +83,154 @@ export function providerExtension(provider: string, agentDir = getAgentDir()): s
   return existsSync(path) ? path : undefined;
 }
 const MAX_CHAIN = 8;
+/** Keys owned by the effort judge; parsed separately so they can never reset the chains above. */
+const EFFORT_KEYS = ['effort', 'judge'] as const;
 
-/** Strictly validate an override object; missing roles keep their defaults. */
-export function parseModelChains(raw: unknown): ModelChains {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('top level must be an object');
-  const input = raw as Record<string, unknown>;
-  for (const key of Object.keys(input)) {
-    if (key !== 'providers' && !ROLES.includes(key as FallbackRole)) throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')}, providers)`);
-  }
-  // Optional provider rename map, applied to every chain entry (defaults and overrides alike).
+function asObject(raw: unknown, what: string): Record<string, unknown> {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${what} must be an object`);
+  return raw as Record<string, unknown>;
+}
+
+/** Optional provider rename map, applied to every chain entry (defaults and overrides alike). */
+function parseProviders(input: Record<string, unknown>): Record<string, string> {
   const providers: Record<string, string> = {};
-  if ('providers' in input) {
-    const map = input.providers;
-    if (map === null || typeof map !== 'object' || Array.isArray(map)) throw new Error('providers must be an object of "from": "to" names');
-    for (const [from, to] of Object.entries(map as Record<string, unknown>)) {
-      if (!PROVIDER.test(from) || typeof to !== 'string' || !PROVIDER.test(to)) throw new Error('providers entries must map provider names to provider names');
-      if (to === VIRTUAL_CONTROLLER.provider) throw new Error('providers cannot rename to the virtual controller provider');
-      providers[from] = to;
+  if (!('providers' in input)) return providers;
+  const map = input.providers;
+  if (map === null || typeof map !== 'object' || Array.isArray(map)) throw new Error('providers must be an object of "from": "to" names');
+  for (const [from, to] of Object.entries(map as Record<string, unknown>)) {
+    if (!PROVIDER.test(from) || typeof to !== 'string' || !PROVIDER.test(to)) throw new Error('providers entries must map provider names to provider names');
+    if (to === VIRTUAL_CONTROLLER.provider) throw new Error('providers cannot rename to the virtual controller provider');
+    providers[from] = to;
+  }
+  return providers;
+}
+
+/** Validate one chain list; physical models only (the virtual controller cannot be a candidate). */
+function parseChain(role: string, list: unknown): readonly string[] {
+  if (!Array.isArray(list) || list.length < 1 || list.length > MAX_CHAIN) throw new Error(`${role} must be an array of 1-${MAX_CHAIN} entries`);
+  for (const item of list) {
+    if (typeof item !== 'string' || !MODEL_REF.test(item)) throw new Error(`${role} entries must be "provider/model" strings`);
+    if (splitModel(item).provider === VIRTUAL_CONTROLLER.provider) throw new Error(`${role} cannot route to a virtual model`);
+  }
+  if (new Set(list).size !== list.length) throw new Error(`${role} contains duplicate entries`);
+  return list as string[];
+}
+
+function renameChain(role: string, chain: readonly string[], providers: Readonly<Record<string, string>>): readonly string[] {
+  const renamed = chain.map(model => renameProvider(model, providers));
+  if (new Set(renamed).size !== renamed.length) throw new Error(`${role} contains duplicate entries after provider renames`);
+  return Object.freeze(renamed);
+}
+
+/** Strictly validate an override object; missing roles keep their defaults. Effort keys are ignored here. */
+export function parseModelChains(raw: unknown): ModelChains {
+  const input = asObject(raw, 'top level');
+  for (const key of Object.keys(input)) {
+    if (key !== 'providers' && !ROLES.includes(key as FallbackRole) && !(EFFORT_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')}, providers, ${EFFORT_KEYS.join(', ')})`);
     }
   }
+  const providers = parseProviders(input);
   const chains = { ...DEFAULT_CHAINS } as Record<FallbackRole, readonly string[]>;
-  for (const role of ROLES) {
-    if (!(role in input)) continue;
-    const list = input[role];
-    if (!Array.isArray(list) || list.length < 1 || list.length > MAX_CHAIN) throw new Error(`${role} must be an array of 1-${MAX_CHAIN} entries`);
-    for (const item of list) {
-      if (typeof item !== 'string' || !MODEL_REF.test(item)) throw new Error(`${role} entries must be "provider/model" strings`);
-      if (role === 'controller' && splitModel(item).provider === VIRTUAL_CONTROLLER.provider) throw new Error('controller cannot route to a virtual model');
-    }
-    if (new Set(list).size !== list.length) throw new Error(`${role} contains duplicate entries`);
-    chains[role] = Object.freeze([...list as string[]]);
-  }
-  for (const role of ROLES) {
-    const renamed = chains[role].map(model => renameProvider(model, providers));
-    if (new Set(renamed).size !== renamed.length) throw new Error(`${role} contains duplicate entries after provider renames`);
-    chains[role] = Object.freeze(renamed);
-  }
+  for (const role of ROLES) if (role in input) chains[role] = parseChain(role, input[role]);
+  for (const role of ROLES) chains[role] = renameChain(role, chains[role], providers);
   return Object.freeze(chains);
+}
+
+/** Reasoning levels the judge may choose, lowest first. `max` is never chosen automatically. */
+export const JUDGE_LEVELS = ['low', 'medium', 'high', 'xhigh'] as const;
+export type JudgeLevel = typeof JUDGE_LEVELS[number];
+export interface EffortSettings {
+  enabled: boolean;
+  /** Level used when the judge fails or runs out of time. */
+  fallback: JudgeLevel;
+  /** Highest level the judge may resolve. */
+  ceiling: JudgeLevel;
+  /** One total deadline for the whole judge chain. */
+  timeoutMs: number;
+  /** Ordered judge models, provider renames applied. */
+  judge: readonly string[];
+}
+// Spike 6 (2026-11-09): direct Anthropic haiku p95 2.7 s, gpt-5.6-luna p95 3.0 s.
+export const DEFAULT_EFFORT: EffortSettings = Object.freeze({
+  enabled: true, fallback: 'medium', ceiling: 'xhigh', timeoutMs: 4000,
+  judge: Object.freeze(['anthropic/claude-haiku-5-5', 'openai-codex/gpt-5.6-luna']),
+});
+const DISABLED_EFFORT: EffortSettings = Object.freeze({ ...DEFAULT_EFFORT, enabled: false });
+const EFFORT_FIELDS = ['enabled', 'fallback', 'ceiling', 'timeoutMs'];
+
+function judgeLevel(field: string, value: unknown): JudgeLevel {
+  if (typeof value !== 'string' || !(JUDGE_LEVELS as readonly string[]).includes(value)) throw new Error(`effort.${field} must be one of ${JUDGE_LEVELS.join(', ')}`);
+  return value as JudgeLevel;
+}
+
+/**
+ * Effort settings, isolated from the chains and failing closed: any invalid effort, judge or
+ * providers value disables judging (never re-enables it), and an explicit enabled:false always wins.
+ */
+export function parseEffortSettings(raw: unknown): { effort: EffortSettings; error?: string } {
+  try {
+    const input = asObject(raw, 'top level');
+    const block = 'effort' in input ? asObject(input.effort, 'effort') : {};
+    if (block.enabled === false) return { effort: DISABLED_EFFORT };
+    for (const key of Object.keys(block)) if (!EFFORT_FIELDS.includes(key)) throw new Error(`unknown effort key "${key.slice(0, 40)}"`);
+    if ('enabled' in block && block.enabled !== true) throw new Error('effort.enabled must be true or false');
+    const timeoutMs = block.timeoutMs ?? DEFAULT_EFFORT.timeoutMs;
+    if (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 500 || timeoutMs > 30_000) throw new Error('effort.timeoutMs must be an integer from 500 to 30000');
+    const fallback = 'fallback' in block ? judgeLevel('fallback', block.fallback) : DEFAULT_EFFORT.fallback;
+    const ceiling = 'ceiling' in block ? judgeLevel('ceiling', block.ceiling) : DEFAULT_EFFORT.ceiling;
+    if (JUDGE_LEVELS.indexOf(fallback) > JUDGE_LEVELS.indexOf(ceiling)) throw new Error('effort.fallback cannot exceed effort.ceiling');
+    const judge = renameChain('judge', 'judge' in input ? parseChain('judge', input.judge) : DEFAULT_EFFORT.judge, parseProviders(input));
+    return { effort: Object.freeze({ enabled: true, fallback, ceiling, timeoutMs, judge }) };
+  } catch (error) {
+    return { effort: DISABLED_EFFORT, error: error instanceof Error ? error.message : 'invalid' };
+  }
 }
 
 export function modelConfigPath(): string { return join(getAgentDir(), 'pi-light-models.json'); }
 
-/** Read the optional override. A missing file means defaults; anything invalid means defaults plus an error. */
-export function loadModelChains(path = modelConfigPath()): { chains: ModelChains; error?: string } {
+export interface ModelConfig {
+  chains: ModelChains;
+  /** Chain problem; the default chains are in use. */
+  error?: string;
+  effort: EffortSettings;
+  /** Effort problem; judging is disabled. Independent of `error`. */
+  effortError?: string;
+}
+
+/**
+ * Read the optional override. A missing file means defaults. Invalid chains mean default chains plus
+ * `error`; invalid effort settings (or an unreadable file) disable judging plus `effortError`.
+ * Messages carry the validation reason only, never file contents.
+ */
+export function loadModelChains(path = modelConfigPath()): ModelConfig {
+  const failed = (reason: string, chains: string, effort = reason): ModelConfig => ({
+    chains: DEFAULT_CHAINS, error: `Pi Light model override ${path} is ${chains}; using default fallback lists.`,
+    effort: DISABLED_EFFORT, effortError: `Pi Light model override ${path} is ${effort}; effort judging is disabled.`,
+  });
   let text: string;
   try { text = readFileSync(path, 'utf8'); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chains: DEFAULT_CHAINS };
-    return { chains: DEFAULT_CHAINS, error: `Pi Light model override ${path} is unreadable; using default fallback lists.` };
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT };
+    return failed('unreadable', 'unreadable');
   }
+  let raw: unknown;
   try {
     if (text.length > 64_000) throw new Error('file too large');
-    return { chains: parseModelChains(JSON.parse(text)) };
+    raw = JSON.parse(text);
   } catch (error) {
-    // Report the validation reason only; never echo file contents.
-    const reason = error instanceof SyntaxError ? 'invalid JSON' : error instanceof Error ? error.message : 'invalid';
-    return { chains: DEFAULT_CHAINS, error: `Pi Light model override ${path} is invalid (${reason}); using default fallback lists.` };
+    const reason = `invalid (${error instanceof SyntaxError ? 'invalid JSON' : error instanceof Error ? error.message : 'invalid'})`;
+    return failed(reason, reason);
   }
+  const config: ModelConfig = { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT };
+  try { config.chains = parseModelChains(raw); }
+  catch (error) {
+    config.error = `Pi Light model override ${path} is invalid (${error instanceof Error ? error.message : 'invalid'}); using default fallback lists.`;
+  }
+  const parsed = parseEffortSettings(raw);
+  config.effort = parsed.effort;
+  if (parsed.error) config.effortError = `Pi Light model override ${path} has invalid effort settings (${parsed.error}); effort judging is disabled.`;
+  return config;
 }
 
 /** In-memory, per-Pi-run cooldown after a limit error, keyed by 'provider/model'. */

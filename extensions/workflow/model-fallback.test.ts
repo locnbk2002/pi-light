@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Cooldowns, DEFAULT_CHAINS, isLimitOrCapacityError, loadModelChains, modelFamily, parseModelChains, planCandidates, providerExtension, reviewerModel,
-  routeController } from './model-fallback.ts';
+import { Cooldowns, DEFAULT_CHAINS, DEFAULT_EFFORT, isLimitOrCapacityError, loadModelChains, modelFamily, parseEffortSettings, parseModelChains, planCandidates,
+  providerExtension, reviewerModel, routeController } from './model-fallback.ts';
 
 const OPUS = 'anthropic/claude-opus-5-5';
 const SOL = 'openai-codex/gpt-6.1-sol';
@@ -53,19 +53,21 @@ test('override file: missing uses defaults silently; invalid notifies without ec
   const folder = await mkdtemp(join(tmpdir(), 'pi-light-models-'));
   try {
     const path = join(folder, 'pi-light-models.json');
-    assert.deepEqual(loadModelChains(path), { chains: DEFAULT_CHAINS });
+    assert.deepEqual(loadModelChains(path), { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT });
     await writeFile(path, '{"astra": ["secret-looking-value"');
     let loaded = loadModelChains(path);
     assert.equal(loaded.chains, DEFAULT_CHAINS);
     assert.match(loaded.error!, /invalid JSON/);
     assert.equal(loaded.error!.includes('secret-looking-value'), false);
+    assert.equal(loaded.effort.enabled, false, 'an unparsable file disables judging (fail closed)');
+    assert.match(loaded.effortError!, /effort judging is disabled/);
     await writeFile(path, JSON.stringify({ astra: ['secret-looking-value'] }));
     loaded = loadModelChains(path);
     assert.equal(loaded.chains, DEFAULT_CHAINS);
     assert.match(loaded.error!, /provider\/model/);
     assert.equal(loaded.error!.includes('secret-looking-value'), false);
     await writeFile(path, JSON.stringify({ fable: [SOL] }));
-    assert.deepEqual(loadModelChains(path), { chains: { ...DEFAULT_CHAINS, fable: [SOL] } });
+    assert.deepEqual(loadModelChains(path), { chains: { ...DEFAULT_CHAINS, fable: [SOL] }, effort: DEFAULT_EFFORT });
   } finally { await rm(folder, { recursive: true, force: true }); }
 });
 
@@ -158,4 +160,55 @@ test('cross-family reviewer: Opus work is reviewed by Sol, Sol work by Opus, ren
   assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5', m => modelFamily(m) === 'anthropic'), undefined);
   const renamed = parseModelChains({ providers: { anthropic: 'claude-bridge' } });
   assert.equal(reviewerModel(renamed, 'openai-codex/gpt-6.1-sol'), 'claude-bridge/claude-opus-5-5');
+});
+
+test('effort settings: defaults, overrides and provider renames of the judge chain', () => {
+  assert.deepEqual(DEFAULT_EFFORT, { enabled: true, fallback: 'medium', ceiling: 'xhigh', timeoutMs: 4000,
+    judge: ['anthropic/claude-haiku-5-5', 'openai-codex/gpt-5.6-luna'] });
+  assert.deepEqual(parseEffortSettings({}), { effort: DEFAULT_EFFORT });
+  assert.deepEqual(parseEffortSettings({ effort: { fallback: 'low', ceiling: 'high', timeoutMs: 3000 }, judge: [SOL] }).effort,
+    { enabled: true, fallback: 'low', ceiling: 'high', timeoutMs: 3000, judge: [SOL] });
+  assert.deepEqual(parseEffortSettings({ providers: { anthropic: 'claude-bridge' } }).effort.judge,
+    ['claude-bridge/claude-haiku-5-5', 'openai-codex/gpt-5.6-luna'], 'the judge is renamed like the other roles');
+});
+
+test('invalid effort settings disable judging (fail closed); a valid enabled:false always wins', () => {
+  for (const bad of [{ effort: 'on' }, { effort: { enabled: 'yes' } }, { effort: { timeoutMs: '4000' } }, { effort: { timeoutMs: 100 } },
+    { effort: { fallback: 'max' } }, { effort: { ceiling: 'low', fallback: 'high' } }, { effort: { extra: 1 } },
+    { judge: [] }, { judge: ['no-slash'] }, { judge: ['pi-light/controller'] }, { providers: [] }]) {
+    const parsed = parseEffortSettings(bad);
+    assert.equal(parsed.effort.enabled, false, JSON.stringify(bad));
+    assert.ok(parsed.error, JSON.stringify(bad));
+  }
+  assert.deepEqual(parseEffortSettings({ effort: { enabled: false, timeoutMs: '4000', unknown: true } }).effort.enabled, false);
+  assert.equal(parseEffortSettings({ effort: { enabled: false, timeoutMs: '4000' } }).error, undefined, 'explicit opt-out is not an error');
+});
+
+test('config isolation: invalid effort settings leave custom chains and renames untouched, and vice versa', async () => {
+  const folder = await mkdtemp(join(tmpdir(), 'pi-light-models-'));
+  try {
+    const path = join(folder, 'pi-light-models.json');
+    const custom = { providers: { anthropic: 'claude-bridge' }, controller: ['anthropic/claude-opus-5-5', SOL] };
+    await writeFile(path, JSON.stringify({ ...custom, effort: { timeoutMs: 'slow' } }));
+    let loaded = loadModelChains(path);
+    assert.deepEqual(loaded.chains.controller, ['claude-bridge/claude-opus-5-5', SOL], 'controller routing unchanged');
+    assert.equal(loaded.error, undefined);
+    assert.equal(loaded.effort.enabled, false);
+    assert.match(loaded.effortError!, /timeoutMs/);
+    assert.equal(loaded.effortError!.includes('slow'), false, 'no file contents echoed');
+    // A broken chain falls back to default chains without touching valid effort settings.
+    await writeFile(path, JSON.stringify({ astra: [], effort: { fallback: 'low' } }));
+    loaded = loadModelChains(path);
+    assert.equal(loaded.chains, DEFAULT_CHAINS);
+    assert.ok(loaded.error);
+    assert.deepEqual([loaded.effort.enabled, loaded.effort.fallback, loaded.effortError], [true, 'low', undefined]);
+  } finally { await rm(folder, { recursive: true, force: true }); }
+});
+
+test('the judge chain never feeds the reviewer, controller or advisor chains', () => {
+  const chains = parseModelChains({ judge: ['openai-codex/gpt-5.6-luna'] });
+  assert.deepEqual(chains, DEFAULT_CHAINS);
+  assert.equal('judge' in chains, false);
+  assert.equal(reviewerModel(chains, 'openai-codex/gpt-6.1-sol', m => m !== 'anthropic/claude-opus-5-5' && m !== 'anthropic/claude-fable-5-1'), undefined,
+    'no judge model is offered as a reviewer');
 });
