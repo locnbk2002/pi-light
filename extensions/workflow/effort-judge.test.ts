@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { boundJudgeInput, buildJudgePrompt, judgeEffort, judgeInput, JUDGE_INPUT_MAX, parseJudgeReply, type JudgeCall } from './effort-judge.ts';
+import { boundJudgeInput, buildJudgePrompt, judgeEffort, judgeInput, JUDGE_INPUT_MAX, parseJudgeReply, registryJudgeCall, type JudgeCall } from './effort-judge.ts';
 import { Cooldowns, DEFAULT_EFFORT, type EffortSettings } from './model-fallback.ts';
 
 const HAIKU = 'anthropic/claude-haiku-5-5';
@@ -107,4 +107,32 @@ test('every failure kind falls back to the configured level with a reason', asyn
     assert.deepEqual([result.requested, result.source], ['low', 'fallback'], reason);
     assert.match(result.reason!, new RegExp(reason), reason);
   }
+});
+
+test('the registry judge call asks for no reasoning and leaves room for the JSON reply', async () => {
+  const seen: Array<{ options: Record<string, unknown>; context: { systemPrompt?: string; messages: Array<{ content: unknown }> } }> = [];
+  const registry = {
+    find: (provider: string, id: string) => ({ provider, id }),
+    streamSimple: (_model: unknown, context: (typeof seen)[number]['context'], options: Record<string, unknown>) => {
+      seen.push({ options, context });
+      return { result: async () => ({ content: [{ type: 'thinking', thinking: 'x' }, { type: 'text', text: '{"level":"low"}' }], stopReason: 'stop' }) };
+    },
+  } as unknown as Parameters<typeof registryJudgeCall>[0];
+  const signal = new AbortController().signal;
+  const reply = await registryJudgeCall(registry)(HAIKU, buildJudgePrompt('fix given', 'xhigh'), signal);
+  assert.deepEqual(reply, { text: '{"level":"low"}', stopReason: 'stop', errorMessage: undefined }, 'only text blocks are read');
+  assert.equal('reasoning' in seen[0].options, false, 'any reasoning level makes haiku think and cut off its JSON');
+  assert.ok((seen[0].options.maxTokens as number) >= 128);
+  assert.equal(seen[0].options.signal, signal);
+  assert.match(seen[0].context.systemPrompt!, /Reply with JSON only/);
+  assert.equal(seen[0].context.messages[0].content, '<task>\nfix given\n</task>');
+  await assert.rejects(registryJudgeCall({ find: () => undefined } as unknown as Parameters<typeof registryJudgeCall>[0])(HAIKU,
+    buildJudgePrompt('x', 'xhigh'), signal), /not in the catalog/);
+});
+
+test('a reply cut off at the output cap is not a level, so the chain moves on', async () => {
+  const tried: string[] = [];
+  const call: JudgeCall = model => { tried.push(model); return Promise.resolve(model === HAIKU ? { text: '{"level":"', stopReason: 'length' } : { text: '{"level":"low"}', stopReason: 'stop' }); };
+  const result = await judgeEffort({ input: 'fix given', settings: settings(), call, cooldowns: new Cooldowns(), isAvailable: all });
+  assert.deepEqual([result.requested, result.judgeModel, tried], ['low', LUNA, [HAIKU, LUNA]]);
 });

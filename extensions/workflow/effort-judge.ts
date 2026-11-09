@@ -7,8 +7,8 @@ import { Cooldowns, isLimitOrCapacityError, JUDGE_LEVELS, planCandidates, splitM
 
 /** Hard bound on what the judge reads, in code points, after the source is chosen. */
 export const JUDGE_INPUT_MAX = 2000;
-/** The judge answers with one short JSON object. */
-export const JUDGE_MAX_TOKENS = 64;
+/** The judge answers with one short JSON object; the margin covers formatting, not thinking. */
+export const JUDGE_MAX_TOKENS = 128;
 
 export interface JudgePrompt { systemPrompt: string; user: string }
 /** One judge model turn. Resolves with the reply text or a provider failure; rejects on transport errors. */
@@ -156,7 +156,9 @@ export function registryJudgeCall(registry: ExtensionContext['modelRegistry']): 
     const message = await registry.streamSimple(model, {
       systemPrompt: prompt.systemPrompt,
       messages: [{ role: 'user', content: prompt.user, timestamp: Date.now() }],
-    }, { reasoning: 'minimal', maxTokens: JUDGE_MAX_TOKENS, signal }).result();
+    // No `reasoning` option: the judge must not think. Even 'minimal' makes claude-haiku-5-5 think, and on a
+    // short hint the thinking used up the output cap (stop=length, cut-off JSON) and took 3-4 s.
+    }, { maxTokens: JUDGE_MAX_TOKENS, signal }).result();
     const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('');
     return { text, stopReason: message.stopReason, errorMessage: message.errorMessage };
   };
