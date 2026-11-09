@@ -13,6 +13,7 @@ The package root is the workflow core. Each feature is its own extension under `
 
 - **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to an AgentKit skill. The agent only edits files when you ask for an implementation.
 - **Advisors.** Astra (`gpt-6-astra`) and Fable (`claude-fable-5-1`) give a second opinion through hidden Pi processes. `/advisor astra|fable` opens a direct chat, and `/back` hands the result back to Opus.
+- **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn and each advisor message, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol, and each advisor falls back to the other.
 - **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). The controller passes that model explicitly when it delegates a review subagent.
 - **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets Pi open and drive its own tabs in your signed-in browser, and use a tab you bind with the toolbar button. Every click, key press, navigation, script and tab open or close asks you first.
@@ -104,6 +105,36 @@ The defaults are the controller `anthropic/claude-opus-5-5` with fallback `opena
 ```
 
 You can also replace whole lists with the `controller`, `astra` and `fable` keys. Advisors run without extensions, except the one that provides their model's provider (for example `pi-claude-bridge`).
+
+## Effort judge
+
+Before a subagent is spawned or an advisor answers, a small judge model rates how open-ended the task is and picks the child's reasoning level. It judges whether the fix or design is given or which causes stay open, not how much work there is, and picks the lower level when torn.
+
+| Level | When |
+|---|---|
+| `low` | One obvious solution, mechanically applied |
+| `medium` | A few candidates in one area, or one small trap |
+| `high` | Several viable designs or candidate causes |
+| `xhigh` | Open cause of flaky, concurrent or stale behavior; easy to get subtly wrong |
+
+`max` is never chosen automatically. The main controller's level is never changed.
+
+- **What the judge reads.** For a subagent, the first `solutionSpace:` line of its task (the controller is told to write one), otherwise the task text. For an advisor, `consult_advisor`'s optional `solutionSpace`, otherwise the question; every `/consult` and direct `/advisor` message is judged too. Input is cut to 2,000 characters and treated as untrusted data.
+- **Subagents.** The level travels as a `model` suffix (`pi-light/controller:high`, or `<model>:high` when a model is given). Precedence: an explicit `:level` in `model`, then an agent definition's `thinking:`, then the judge. A notice shows each spawn's level and source.
+- **Advisors.** The level is set before every message and again after a fallback switch. The reply label shows the level actually used, e.g. `effort high (judge xhigh, clamped; 0.8s)`.
+- **Time and failure.** One 4 s deadline covers the whole judge chain, and all subagent calls in one message are judged at once. A timeout, provider error or unreadable reply falls back to `medium` and never blocks the spawn or the answer.
+- **Disclosure.** Each judged task or message (up to 2,000 characters) is sent to the judge provider: Anthropic for `claude-haiku-5-5`, or OpenAI Codex for the fallback `gpt-5.6-luna`. If `providers` renames `anthropic`, the judge is renamed too; `claude-bridge` was unusable as a judge in testing (not logged in, ignored aborts), so set `judge` explicitly on such a machine.
+
+Settings live in the same `~/.pi/agent/pi-light-models.json` (all optional; defaults shown):
+
+```json
+{
+  "judge": ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna"],
+  "effort": { "enabled": true, "fallback": "medium", "ceiling": "xhigh", "timeoutMs": 4000 }
+}
+```
+
+`"effort": { "enabled": false }` turns the judge off: no judge requests, no judged levels and no effort labels. The precedence repairs stay on, so an explicit `:level` still beats an agent definition's `thinking:`, and a definition with only `thinking:` still reaches the child. Invalid effort or judge settings, including `null` values, also turn the judge off (with a warning), and never change the controller or advisor lists.
 
 ## Develop
 
