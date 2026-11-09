@@ -29,7 +29,8 @@ You need `pi`, `git` and `node`. For the full setup, also install the AgentKit C
 - the AgentKit `engineer` Pi adapter (pinned version in `extensions/setup/setup.json`; needs a matching `ak`, e.g. `ak self-update --beta --yes`) with the skill list in `setup.json`;
 - the latest `pi-effort` and `pi-claude-bridge`, and a pinned upstream `pi-herdr-subagents`;
 - herdr's Pi integration and the subagents plugin link;
-- a loadable browser add-on folder in `~/.pi/agent/pi-light/browser/chromium/`.
+- a loadable browser add-on folder in `~/.pi/agent/pi-light/browser/chromium/`;
+- the latest `@gotgenes/pi-permission-system` and, if none exists yet, its rule file (see Permissions below).
 
 Setup is safe to rerun, either as `/pi-light setup` inside Pi or as `node extensions/setup/setup.mjs --dry-run`. It reports deliberate differences instead of reverting them. It never touches credentials or your default model.
 
@@ -83,6 +84,16 @@ How control works and what it costs:
 - Tabs Pi opened close when Pi disconnects, unless it opened them with `keep`. Pi never closes a tab it did not open.
 - A bound tab is released when it leaves its origin; bind it again to continue.
 - Page content, console output and evaluated values are untrusted and can contain private data or instructions. This is not secret isolation.
+
+## Permissions
+
+Pi runs every tool call without asking. Setup installs [`@gotgenes/pi-permission-system`](https://www.npmjs.com/package/@gotgenes/pi-permission-system) and writes `~/.pi/agent/extensions/pi-permission-system/config.json` from the rules in `extensions/setup/setup.json`. These are fixed rules, not a model judge:
+
+- Everything runs as before, except that `rm`, `curl`, `git push`, `git commit`, `ssh`, `scp`, `rsync` and `sftp` ask first. Reading `~/.ssh/id_*` private keys is denied.
+- Read-only remote commands run without asking on every host named in that machine's `~/.ssh/config`: `ssh <host> cat|head|tail|grep|find|stat|du ...`, `ssh <host> ls|df|ps...` and `ssh <host> uptime`. Write them unquoted. SSH hands its arguments to a remote shell, so anything that remote shell could act on asks: quotes, chain or redirect characters, `$`, a backslash, `[`, `sudo`, and `find -delete|-exec|-ok|-fprint|-fls`. A filename produced by a local `*` glob is the one known gap.
+- The extension's bash rules are last-match-wins, so the risky remote forms come last. Without an interactive prompt (`pi -p`, RPC), an ask is denied.
+
+Setup never overwrites an existing rule file; it reports when the file differs from the generated rules. After adding hosts to `~/.ssh/config`, delete the file and rerun setup. Pattern rules are an approval policy, not a sandbox.
 
 ## Models
 

@@ -3,9 +3,9 @@
 // Plain JS (no build step) so bootstrap.sh can run it with `node extensions/setup/setup.mjs` before Pi loads anything.
 // Never touches credentials (auth.json, AgentKit login, claude-bridge config) or the default model.
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PACKAGE_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -41,6 +41,36 @@ export function agentkitStatus(dir, skills = MANIFEST.agentkit.skills) {
   return { missingSkills, agentTool, installed: agentTool && missingSkills.length < skills.length };
 }
 
+/** Concrete host aliases from ssh_config text (`Host` lines; wildcard and negated patterns skipped). */
+export function sshHosts(text) {
+  const hosts = [];
+  for (const line of text.split('\n')) {
+    const m = /^\s*Host\s+(.+)$/i.exec(line);
+    if (!m) continue;
+    for (const h of m[1].trim().split(/\s+/)) if (!/[*?!]/.test(h) && !hosts.includes(h)) hosts.push(h);
+  }
+  return hosts;
+}
+
+/**
+ * pi-permission-system policy: the manifest base, then read-only `ssh <host> <cmd>` allows per named host,
+ * then risky remote forms. The extension's bash map is last-match-wins, so this order lets the risky forms
+ * override the read allows and the read allows override the `ssh *` ask.
+ */
+export function buildPermissionConfig(hosts, spec = MANIFEST.permissions) {
+  const config = structuredClone(spec.policy);
+  const bash = config.permission.bash;
+  for (const host of hosts) {
+    for (const cmd of spec.sshRead.withArgs) bash[`ssh ${host} ${cmd} *`] = 'allow';
+    for (const cmd of spec.sshRead.prefix) bash[`ssh ${host} ${cmd}*`] = 'allow';
+    for (const cmd of spec.sshRead.exact) bash[`ssh ${host} ${cmd}`] = 'allow';
+  }
+  for (const pattern of spec.sshAskLast) bash[pattern] = 'ask';
+  return config;
+}
+
+function readText(path) { try { return readFileSync(path, 'utf8'); } catch { return ''; } }
+
 function defaultRun(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: 'utf8' });
   return { ok: r.status === 0, out: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim(), missing: r.error?.code === 'ENOENT' };
@@ -62,7 +92,8 @@ function browsers(platform, has) {
  * Desired-vs-installed plan. Steps with `cmd` run; `note` lines are reports only.
  * Partial installs (something the user removed on purpose) are reported, not reverted.
  */
-export function planSetup({ env = process.env, platform = process.platform, has = defaultHas, run = defaultRun } = {}) {
+export function planSetup({ env = process.env, platform = process.platform, has = defaultHas, run = defaultRun,
+  sshConfig = readText(join(homedir(), '.ssh', 'config')) } = {}) {
   const dir = agentDir(env);
   const steps = []; const notes = [];
   for (const tool of ['pi', 'git']) if (!has(tool)) notes.push(`Missing required tool: ${tool}. Install it first.`);
@@ -82,6 +113,15 @@ export function planSetup({ env = process.env, platform = process.platform, has 
     const current = have.find(p => sourceKey(p) === sourceKey(source));
     if (!current) steps.push({ label: `Pi package ${source}`, cmd: 'pi', args: ['install', source] });
     else if (current !== source && source !== sourceKey(source)) notes.push(`${current} differs from pinned ${source} (left as is).`);
+  }
+
+  const permissionPath = join(dir, MANIFEST.permissions.configPath);
+  const permissionText = `${JSON.stringify(buildPermissionConfig(sshHosts(sshConfig)), null, 2)}\n`;
+  if (!existsSync(permissionPath)) {
+    steps.push({ label: `permission rules in ${permissionPath} (SSH reads allowed for ${sshHosts(sshConfig).length} hosts)`,
+      fn: () => { mkdirSync(dirname(permissionPath), { recursive: true }); writeFileSync(permissionPath, permissionText); } });
+  } else if (readText(permissionPath) !== permissionText) {
+    notes.push(`${permissionPath} differs from the generated rules (left as is; delete it and rerun setup to regenerate, e.g. after ~/.ssh/config changes).`);
   }
 
   if (has('herdr')) {

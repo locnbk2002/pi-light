@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { readdir, readFile, mkdtemp, rm } from 'node:fs/promises';
-import { agentkitStatus, applyPlan, BROWSER_ADDON_FILES, buildBrowserAddon, buildBrowserAddons, MANIFEST, planSetup, sourceKey } from './setup.mjs';
+import { agentkitStatus, applyPlan, BROWSER_ADDON_FILES, buildBrowserAddon, buildBrowserAddons, buildPermissionConfig, MANIFEST, planSetup, sourceKey, sshHosts } from './setup.mjs';
 
 // setup.mjs builds the add-on from the browser-bridge extension's source folder.
 const ADDON_SOURCE = new URL('../browser-bridge/browser-addon/', import.meta.url);
@@ -42,7 +42,7 @@ test('fresh machine: installs AgentKit, every package, herdr integration and plu
 
 test('configured machine: nothing to install; pin drift and removed skills are reported, not reverted', () => {
   const skills = MANIFEST.agentkit.skills.filter((s: string) => s !== 'ak-security');
-  const dir = agentHome(['npm:pi-effort', 'git:github.com/elidickinson/pi-claude-bridge@old', 'git:github.com/modem-dev/pi-herdr-subagents@other'], skills, true);
+  const dir = agentHome(['npm:pi-effort', 'git:github.com/elidickinson/pi-claude-bridge@old', 'git:github.com/modem-dev/pi-herdr-subagents@other', 'npm:@gotgenes/pi-permission-system'], skills, true);
   const plugin = join(dir, 'git/github.com/modem-dev/pi-herdr-subagents/herdr-plugin');
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => !t.startsWith('microsoft'),
     run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current (v9) (x)' : pluginLine(plugin), missing: false }) });
@@ -92,6 +92,40 @@ test('setup notes how to load the add-on in each Chromium-family browser it find
   assert.match(notes(t => t === 'brave'), /Brave: brave:\/\/extensions > Developer mode > Load unpacked > .*chromium/);
   assert.doesNotMatch(notes(t => t === 'brave'), /Edge|Firefox/);
   assert.match(notes(t => t === 'firefox'), /No Chromium-family browser/);
+});
+
+test('sshHosts lists concrete aliases and skips wildcard and negated patterns', () => {
+  const text = 'Host a b\n  HostName 1.2.3.4\nhost xsign-prod \nHost *\nHost !c *.lan\n  # Host commented\nHost a';
+  assert.deepEqual(sshHosts(text), ['a', 'b', 'xsign-prod']);
+});
+
+test('permission rules: ssh asks, named-host reads allowed, risky remote forms last so they win', () => {
+  const bash = buildPermissionConfig(['mini']).permission.bash;
+  const keys = Object.keys(bash);
+  assert.equal(bash['ssh *'], 'ask');
+  assert.equal(bash['ssh mini cat *'], 'allow');
+  assert.equal(bash['ssh mini ls*'], 'allow');
+  assert.equal(bash['ssh mini uptime'], 'allow');
+  assert.ok(!keys.some(k => k.includes(' git -C ')), 'no wildcard inside git read rules');
+  const lastAllow = keys.findLastIndex(k => bash[k] === 'allow');
+  for (const risky of MANIFEST.permissions.sshAskLast) assert.ok(keys.indexOf(risky) > lastAllow, risky);
+  assert.ok(keys.indexOf('ssh *') < keys.indexOf('ssh mini cat *'), 'catch-all before the host allows');
+  assert.equal(buildPermissionConfig([]).permission.bash['ssh *'], 'ask', 'no hosts still asks');
+});
+
+test('setup writes permission rules once; an edited file is reported, not overwritten', () => {
+  const dir = agentHome([]);
+  const opts = { env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux' as const, has: () => false, run: () => ({ ok: true, out: '', missing: false }), sshConfig: 'Host mini\n' };
+  const path = join(dir, MANIFEST.permissions.configPath);
+  const step = planSetup(opts).steps.find((s: any) => s.label.startsWith('permission rules'));
+  assert.ok(step && step.label.includes('1 hosts'));
+  step!.fn!();
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).permission.bash['ssh mini cat *'], 'allow');
+  assert.ok(!planSetup(opts).steps.some((s: any) => s.label.startsWith('permission rules')));
+  assert.ok(!planSetup(opts).notes.some((n: string) => n.includes('differs from the generated rules')));
+  writeFileSync(path, '{}');
+  assert.ok(planSetup(opts).notes.some((n: string) => n.includes('differs from the generated rules')));
+  assert.equal(readFileSync(path, 'utf8'), '{}');
 });
 
 test("setup copies exactly the browser-bridge add-on files", async () => {

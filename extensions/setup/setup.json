@@ -13,8 +13,33 @@
   "packages": [
     "npm:pi-effort",
     "git:github.com/elidickinson/pi-claude-bridge",
-    "git:github.com/modem-dev/pi-herdr-subagents@2489019ea678f0b7e3437727a0a5ca15d4cbe9c1"
+    "git:github.com/modem-dev/pi-herdr-subagents@2489019ea678f0b7e3437727a0a5ca15d4cbe9c1",
+    "npm:@gotgenes/pi-permission-system"
   ],
+  "permissions": {
+    "configPath": "extensions/pi-permission-system/config.json",
+    "policy": {
+      "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
+      "yoloMode": false,
+      "permission": {
+        "*": "allow",
+        "external_directory": "allow",
+        "path": { "*": "allow", "~/.ssh/id_*": "deny" },
+        "bash": {
+          "*": "allow", "rm *": "ask", "curl *": "ask", "git push*": "ask", "git commit*": "ask",
+          "ssh *": "ask", "scp *": "ask", "rsync *": "ask", "sftp *": "ask"
+        }
+      }
+    },
+    "sshRead": {
+      "withArgs": ["cat", "head", "tail", "grep", "find", "stat", "du"],
+      "prefix": ["ls", "df", "ps"],
+      "exact": ["uptime"]
+    },
+    "sshAskLast": ["ssh *;*", "ssh *&*", "ssh *|*", "ssh *>*", "ssh *<*", "ssh *`*", "ssh *$*", "ssh *\\*", "ssh *[*",
+      "ssh *'*", "ssh *\"*", "ssh * sudo *",
+      "ssh * find *-delete*", "ssh * find *-exec*", "ssh * find *-ok*", "ssh * find *-fprint*", "ssh * find *-fls*"]
+  },
   "herdr": {
     "integration": "pi",
     "plugin": { "id": "pi-herdr-subagents", "package": "git:github.com/modem-dev/pi-herdr-subagents", "dir": "herdr-plugin" }
