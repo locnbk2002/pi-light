@@ -13,7 +13,7 @@ The package root is the workflow core. Each feature is its own extension under `
 | `extensions/setup` | `/pi-light setup` and the missing-AgentKit warning |
 
 - **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to an AgentKit skill. The agent only edits files when you ask for an implementation.
-- **Advisors.** Astra (`gpt-6-astra`) and Fable (`claude-fable-5-1`) give a second opinion through hidden Pi processes. `/advisor astra|fable` opens a direct chat, and `/back` hands the result back to Opus.
+- **Advisors.** Astra (`gpt-6-astra`) and Fable (`claude-fable-5-2`) give a second opinion through hidden Pi processes. `/advisor astra|fable` opens a direct chat, and `/back` hands the result back to Opus.
 - **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn and each advisor message, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol, and each advisor falls back to the other.
 - **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). The controller passes that model explicitly when it delegates a review subagent.
@@ -101,7 +101,7 @@ Setup never overwrites an existing rule file; it reports when the file differs f
 
 ## Models
 
-The defaults are the controller `anthropic/claude-opus-5-5` with fallback `openai-codex/gpt-6.1-sol`, Astra `openai-codex/gpt-6-astra`, and Fable `anthropic/claude-fable-5-1`. If a machine is logged in under other provider names, rename them in `~/.pi/agent/pi-light-models.json`:
+The defaults are the controller `anthropic/claude-opus-5-5` with fallback `openai-codex/gpt-6.1-sol`, Astra `openai-codex/gpt-6-astra`, and Fable `anthropic/claude-fable-5-2`. If a machine is logged in under other provider names, rename them in `~/.pi/agent/pi-light-models.json`:
 
 ```json
 { "providers": { "anthropic": "claude-bridge", "openai-codex": "openai" } }

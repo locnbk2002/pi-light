@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 export const ADVISORS = {
   astra: { provider: 'openai-codex', model: 'gpt-6-astra' },
-  fable: { provider: 'anthropic', model: 'claude-fable-5-1' },
+  fable: { provider: 'anthropic', model: 'claude-fable-5-2' },
 } as const;
 export const MAIN_MODEL = { provider: 'anthropic', model: 'claude-opus-5-5' } as const;
 export const READ_TOOLS = ['read', 'grep', 'find', 'ls'] as const;

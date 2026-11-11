@@ -51,7 +51,7 @@ test('advisor child stderr goes to the debug log, never the parent terminal', as
     written.push(String(chunk));
     return (original as (...args: unknown[]) => boolean)(chunk, ...rest);
   }) as typeof process.stderr.write;
-  const client = new LoggedRpcClient({ cliPath }, lines => appendStderrLog(log, 'anthropic/claude-fable-5-1 abcd1234', lines));
+  const client = new LoggedRpcClient({ cliPath }, lines => appendStderrLog(log, 'anthropic/claude-fable-5-2 abcd1234', lines));
   try {
     await client.start().catch(() => {}); // the fixture may exit before or after the 100 ms startup probe
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -62,8 +62,8 @@ test('advisor child stderr goes to the debug log, never the parent terminal', as
   assert.equal(written.some(chunk => /No project|session found|tail/.test(chunk)), false);
   assert.equal(client.getStderr(), 'Warning: No project session found; cost \u20ac5\ntail');
   const logged = (await readFile(log, 'utf8')).split('\n').map(line => line.replace(/^\S+Z /, ''));
-  assert.deepEqual(logged, ['[anthropic/claude-fable-5-1 abcd1234] Warning: No project session found; cost \u20ac5',
-    '[anthropic/claude-fable-5-1 abcd1234] tail', '']);
+  assert.deepEqual(logged, ['[anthropic/claude-fable-5-2 abcd1234] Warning: No project session found; cost \u20ac5',
+    '[anthropic/claude-fable-5-2 abcd1234] tail', '']);
   assert.equal((await stat(log)).mode & 0o777, 0o600);
 });
 
@@ -151,7 +151,7 @@ const request = () => ({ advisor: 'astra' as const, topic: 'unit-topic', prompt:
 test('advisor children load only the extension that provides an extension-backed model provider', () => {
   const identity = { directory: folder, id: '12345678-1234-1234-1234-123456789abc' };
   const lookup = (provider: string) => provider === 'claude-bridge' ? '/agent/git/github.com/elidickinson/pi-claude-bridge' : undefined;
-  const bridged = childOptions({ ...config, providerExtension: lookup }, 'claude-bridge/claude-fable-5-1', folder, identity);
+  const bridged = childOptions({ ...config, providerExtension: lookup }, 'claude-bridge/claude-fable-5-2', folder, identity);
   assert.equal(bridged.provider, 'claude-bridge');
   const at = bridged.args!.indexOf('-e');
   assert.ok(at > bridged.args!.indexOf('--no-extensions'));
@@ -162,7 +162,7 @@ test('advisor children load only the extension that provides an extension-backed
 test('child startup isolates resources, uses native providers and explicit resumable sessions', () => {
   const identity = { directory: folder, id: '12345678-1234-1234-1234-123456789abc' };
   const options = childOptions(config, 'fable', folder, identity);
-  assert.equal(options.model, 'claude-fable-5-1');
+  assert.equal(options.model, 'claude-fable-5-2');
   assert.equal(options.provider, 'anthropic');
   for (const flag of ['--no-approve', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--no-mcp']) assert.ok(options.args!.includes(flag));
   assert.equal(options.args!.includes('-e'), false);
@@ -391,7 +391,7 @@ test('limit error fails over to the next candidate on the same session, resendin
     assert.deepEqual(reply.fallbackFrom, [`${ASTRA}: 429 usage limit reached`]);
     assert.equal(replyModelLabel(reply), `${FABLE}, fallback from ${ASTRA}: 429 usage limit reached`);
     assert.equal(clients.length, 2);
-    assert.deepEqual(clients.map(client => client.options!.model), ['gpt-6-astra', 'claude-fable-5-1']);
+    assert.deepEqual(clients.map(client => client.options!.model), ['gpt-6-astra', 'claude-fable-5-2']);
     assert.deepEqual(sessionOf(clients[1]), sessionOf(clients[0]), 'fallback child resumes the same session id and directory');
     assert.deepEqual(clients.map(client => client.prompts), [['Inspect this design'], ['Inspect this design']]);
     assert.equal(clients[0].stops, 1);

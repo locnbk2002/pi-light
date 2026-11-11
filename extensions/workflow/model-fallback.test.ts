@@ -9,7 +9,7 @@ import { Cooldowns, DEFAULT_CHAINS, DEFAULT_EFFORT, isLimitOrCapacityError, load
 const OPUS = 'anthropic/claude-opus-5-5';
 const SOL = 'openai-codex/gpt-6.1-sol';
 const ASTRA = 'openai-codex/gpt-6-astra';
-const FABLE = 'anthropic/claude-fable-5-1';
+const FABLE = 'anthropic/claude-fable-5-2';
 const redact = (value: unknown) => String(value).split('\n')[0].slice(0, 80);
 const all = (_model: string) => true;
 
@@ -126,8 +126,8 @@ test('virtual controller routing: sticky continuation, limit retry switches, non
 test('a providers map renames every chain entry for a machine logged in under other provider names', () => {
   const chains = parseModelChains({ providers: { anthropic: 'claude-bridge', 'openai-codex': 'openai' } });
   assert.deepEqual(chains.controller, ['claude-bridge/claude-opus-5-5', 'openai/gpt-6.1-sol']);
-  assert.deepEqual(chains.astra, ['openai/gpt-6-astra', 'claude-bridge/claude-fable-5-1']);
-  assert.deepEqual(chains.fable, ['claude-bridge/claude-fable-5-1', 'openai/gpt-6-astra']);
+  assert.deepEqual(chains.astra, ['openai/gpt-6-astra', 'claude-bridge/claude-fable-5-2']);
+  assert.deepEqual(chains.fable, ['claude-bridge/claude-fable-5-2', 'openai/gpt-6-astra']);
   assert.deepEqual(parseModelChains({ providers: { anthropic: 'claude-bridge' }, controller: ['anthropic/claude-opus-5-5'] }).controller,
     ['claude-bridge/claude-opus-5-5'], 'explicit chains are renamed too');
   for (const bad of [{ providers: [] }, { providers: { anthropic: 7 } }, { providers: { 'Bad Name': 'x' } }, { providers: { anthropic: 'pi-light' } },
@@ -210,6 +210,6 @@ test('the judge chain never feeds the reviewer, controller or advisor chains', (
   const chains = parseModelChains({ judge: ['openai-codex/gpt-5.6-luna'] });
   assert.deepEqual(chains, DEFAULT_CHAINS);
   assert.equal('judge' in chains, false);
-  assert.equal(reviewerModel(chains, 'openai-codex/gpt-6.1-sol', m => m !== 'anthropic/claude-opus-5-5' && m !== 'anthropic/claude-fable-5-1'), undefined,
+  assert.equal(reviewerModel(chains, 'openai-codex/gpt-6.1-sol', m => m !== 'anthropic/claude-opus-5-5' && m !== 'anthropic/claude-fable-5-2'), undefined,
     'no judge model is offered as a reviewer');
 });

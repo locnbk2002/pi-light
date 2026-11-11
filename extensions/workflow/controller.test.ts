@@ -42,7 +42,7 @@ test('herdr subagent panes keep their requested model and default to the control
   assert.equal(isHerdrSubagentChild({ PI_SUBAGENT_ID: '' }), false);
   assert.equal(isHerdrSubagentChild({ HERDR_ENV: '1' }), false, 'the orchestrator pane itself is not a child');
   assert.equal(hasModelFlag(['--session', 's.jsonl', '--model', 'openai-codex/gpt-6-astra:high']), true);
-  assert.equal(hasModelFlag(['--model=anthropic/claude-fable-5-1']), true);
+  assert.equal(hasModelFlag(['--model=anthropic/claude-fable-5-2']), true);
   assert.equal(hasModelFlag(['--session', 's.jsonl', '@task.md']), false);
   assert.equal(hasModelFlag(['--', '--model', 'x/y']), false);
 
@@ -85,7 +85,7 @@ test('herdr subagent panes keep their requested model and default to the control
 
 test('controller and Fable use native Anthropic; Astra remains native Codex', () => {
   assert.deepEqual(MAIN_MODEL, { provider: 'anthropic', model: 'claude-opus-5-5' });
-  assert.deepEqual(ADVISORS.fable, { provider: 'anthropic', model: 'claude-fable-5-1' });
+  assert.deepEqual(ADVISORS.fable, { provider: 'anthropic', model: 'claude-fable-5-2' });
   assert.deepEqual(ADVISORS.astra, { provider: 'openai-codex', model: 'gpt-6-astra' });
 });
 
@@ -127,7 +127,7 @@ test('cancelled handoff retains mode, session identity, quotes and edited draft'
   assert.equal(policy.completeHandoff(false), false);
   assert.equal(policy.direct, chat);
   assert.equal(chat.draft, 'Edited draft with my decisions');
-  const draft = handoffDraft(chat, 'Advisor suggestions (NOT user decisions)\nTry B.\nPending questions\nNone.\nEvidence\nUnverified.', 'anthropic/claude-fable-5-1');
+  const draft = handoffDraft(chat, 'Advisor suggestions (NOT user decisions)\nTry B.\nPending questions\nNone.\nEvidence\nUnverified.', 'anthropic/claude-fable-5-2');
   assert.ok(draft.includes(JSON.stringify(quote)));
   assert.ok(draft.includes('NOT user decisions'));
   assert.ok(draft.includes('Pending questions'));
@@ -472,10 +472,10 @@ test('direct messages have a live renderer and are excluded from controller cont
   const renderer = harness.renderers.get('pi-light-advisor');
   assert.ok(renderer, 'live messages must use registerMessageRenderer, not only a session entry renderer');
   // Partial theme/render options only exercise this renderer, not Pi internals.
-  const rendered = renderer({ ...direct, details: { advisor: 'fable', prompt: 'My question', actualModel: 'anthropic/claude-fable-5-1' } } as Parameters<typeof renderer>[0],
+  const rendered = renderer({ ...direct, details: { advisor: 'fable', prompt: 'My question', actualModel: 'anthropic/claude-fable-5-2' } } as Parameters<typeof renderer>[0],
     {} as Parameters<typeof renderer>[1], { fg: (_color: string, text: string) => text } as Parameters<typeof renderer>[2]);
   const lines = rendered!.render(120).join('\n');
-  for (const text of ['fable [anthropic/claude-fable-5-1]', 'You: My question', 'Private advisor reply']) assert.ok(lines.includes(text));
+  for (const text of ['fable [anthropic/claude-fable-5-2]', 'You: My question', 'Private advisor reply']) assert.ok(lines.includes(text));
 });
 
 test('live automatic routing uses actual Opus: explicit fix writes, advice and plan do not', {
@@ -589,7 +589,7 @@ test('live controller selects native Opus and direct chat persists a displayed c
     assert.ok(JSON.stringify(direct.content).includes('DIRECT-READY'));
     // Direct chat is judged too: the details carry the judged and read-back effort.
     const { effort, ...details } = direct.details as { effort?: { requested: string; effective?: string; source: string; ms: number } };
-    assert.deepEqual(details, { advisor: 'fable', prompt: 'Reply only DIRECT-READY. Do not use tools.', actualModel: 'anthropic/claude-fable-5-1' });
+    assert.deepEqual(details, { advisor: 'fable', prompt: 'Reply only DIRECT-READY. Do not use tools.', actualModel: 'anthropic/claude-fable-5-2' });
     assert.ok(effort && ['low', 'medium', 'high', 'xhigh'].includes(effort.requested) && ['judge', 'fallback'].includes(effort.source));
     assert.equal(effort.effective, effort.requested, 'fable supports every judged level');
   } finally {
