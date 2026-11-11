@@ -129,7 +129,7 @@ Before a subagent is spawned or an advisor answers, a small judge model rates ho
 - **What the judge reads.** For a subagent, the first `solutionSpace:` line of its task (the controller is told to write one), otherwise the task text. For an advisor, `consult_advisor`'s optional `solutionSpace`, otherwise the question; every `/consult` and direct `/advisor` message is judged too. Input is cut to 2,000 characters and treated as untrusted data.
 - **Subagents.** The level travels as a `model` suffix (`pi-light/controller:high`, or `<model>:high` when a model is given). Precedence: an explicit `:level` in `model`, then an agent definition's `thinking:`, then the judge. A notice shows each spawn's level and source.
 - **Advisors.** The level is set before every message and again after a fallback switch. The reply label shows the level actually used, e.g. `effort high (judge xhigh, clamped; 0.8s)`.
-- **Time and failure.** One 4 s deadline covers the whole judge chain, and all subagent calls in one message are judged at once. A timeout, provider error or unreadable reply falls back to `medium` and never blocks the spawn or the answer.
+- **Time and failure.** One 8 s deadline covers the whole judge chain. Each judge except the last gets an even share of the time left (4 s for Haiku by default), so a slow first judge still leaves the next one a turn. All subagent calls in one message are judged at once. A timeout, provider error or unreadable reply falls back to `medium` and never blocks the spawn or the answer; the advisor label and subagent notice then name the reason, e.g. `effort medium (fallback: anthropic/claude-haiku-5-5: no answer within 4.0s; …)`.
 - **Disclosure.** Each judged task or message (up to 2,000 characters) is sent to the judge provider: Anthropic for `claude-haiku-5-5`, or OpenAI Codex for the fallback `gpt-5.6-luna`. If `providers` renames `anthropic`, the judge is renamed too; `claude-bridge` was unusable as a judge in testing (not logged in, ignored aborts), so set `judge` explicitly on such a machine.
 
 Settings live in the same `~/.pi/agent/pi-light-models.json` (all optional; defaults shown):
@@ -137,7 +137,7 @@ Settings live in the same `~/.pi/agent/pi-light-models.json` (all optional; defa
 ```json
 {
   "judge": ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna"],
-  "effort": { "enabled": true, "fallback": "medium", "ceiling": "xhigh", "timeoutMs": 4000 }
+  "effort": { "enabled": true, "fallback": "medium", "ceiling": "xhigh", "timeoutMs": 8000 }
 }
 ```
 

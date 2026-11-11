@@ -109,9 +109,11 @@ export interface JudgeOptions {
 }
 
 /**
- * Walk the judge chain inside one total deadline. Limit/capacity errors cool the model; any failure
- * (provider error, transport error, unparsable reply) moves to the next candidate with the time left.
- * Running out of time or candidates yields the fallback level. Caller cancellation rejects.
+ * Walk the judge chain inside one total deadline. Each candidate except the last gets an even share of the
+ * time left, so a slow first judge cannot starve the rest; the last runs until the deadline. Limit/capacity
+ * errors cool the model; any failure (provider error, transport error, unparsable reply, slice timeout)
+ * moves to the next candidate. Running out of time or candidates yields the fallback level with a reason.
+ * Caller cancellation rejects.
  */
 export async function judgeEffort(options: JudgeOptions): Promise<JudgeResult> {
   const { settings, cooldowns } = options;
@@ -123,12 +125,17 @@ export async function judgeEffort(options: JudgeOptions): Promise<JudgeResult> {
   if (options.signal?.aborted) throw new Error('Effort judgment cancelled.');
   const prompt = buildJudgePrompt(boundJudgeInput(options.input), settings.ceiling);
   const deadline = AbortSignal.timeout(settings.timeoutMs);
+  const deadlineAt = Date.now() + settings.timeoutMs;
   const reasons: string[] = [];
-  for (const model of planCandidates(settings.judge, cooldowns, options.isAvailable).order) {
+  const order = planCandidates(settings.judge, cooldowns, options.isAvailable).order;
+  for (const [index, model] of order.entries()) {
     if (deadline.aborted) break;
     // Each attempt gets its own controller so an abandoned call is also told to stop.
     const attempt = new AbortController();
-    const stop = AbortSignal.any([deadline, attempt.signal, ...(options.signal ? [options.signal] : [])]);
+    const left = order.length - index;
+    const sliceMs = Math.max(1, Math.floor((deadlineAt - Date.now()) / left));
+    const slice = left > 1 ? AbortSignal.timeout(sliceMs) : undefined;
+    const stop = AbortSignal.any([deadline, attempt.signal, ...(slice ? [slice] : []), ...(options.signal ? [options.signal] : [])]);
     try {
       const reply = await raceAbort(options.call(model, prompt, stop), stop);
       if (reply.stopReason === 'error' || reply.stopReason === 'aborted') {
@@ -140,7 +147,10 @@ export async function judgeEffort(options: JudgeOptions): Promise<JudgeResult> {
       return result({ requested: parseJudgeReply(reply.text, settings.ceiling), source: 'judge', judgeModel: model });
     } catch (error) {
       if (options.signal?.aborted) throw new Error('Effort judgment cancelled.');
-      reasons.push(`${model}: ${deadline.aborted ? 'deadline exceeded' : redact(error instanceof Error ? error.message : error)}`);
+      const why = deadline.aborted ? 'deadline exceeded'
+        : slice?.aborted ? `no answer within ${(sliceMs / 1000).toFixed(1)}s`
+        : redact(error instanceof Error ? error.message : error);
+      reasons.push(`${model}: ${why}`);
     } finally { attempt.abort(); }
   }
   if (deadline.aborted && !reasons.some(reason => reason.endsWith('deadline exceeded'))) reasons.push('deadline exceeded');

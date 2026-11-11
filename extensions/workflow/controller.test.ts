@@ -741,7 +741,7 @@ test('subagent effort: explicit suffix and caller model are honored; judge failu
   const failed = { name: 'f', task: 'anything' } as { name: string; task: string; model?: string };
   await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'x3', input: failed });
   assert.equal(failed.model, 'pi-light/controller:medium');
-  assert.ok(harness.notifications.some(text => /subagent f: effort medium \(fallback, /.test(text)));
+  assert.ok(harness.notifications.some(text => /subagent f: effort medium \(fallback: .*provider down.*, /.test(text)));
   const other = { path: 'x' };
   await harness.event('tool_call', { toolName: 'read', toolCallId: 'x4', input: other });
   assert.deepEqual(other, { path: 'x' }, 'other tools are untouched');

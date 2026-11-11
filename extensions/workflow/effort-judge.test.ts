@@ -84,6 +84,30 @@ test('a provider that ignores the abort signal still yields the fallback level a
   assert.ok(elapsed >= 140 && elapsed < 1000, `fell back at the deadline (${elapsed} ms), one deadline for the whole chain`);
 });
 
+test('a slow first judge gets only its share of the deadline, so the next judge still answers', async () => {
+  const tried: string[] = [];
+  let haikuAborted = false;
+  const cooldowns = new Cooldowns();
+  const started = Date.now();
+  // An abort-aware provider: the slice timeout must reach the call, not only the race.
+  const call: JudgeCall = (model, _prompt, signal) => {
+    tried.push(model);
+    if (model !== HAIKU) return reply('{"level":"low"}');
+    return new Promise((_resolve, reject) => signal.addEventListener('abort', () => { haikuAborted = true; reject(new Error('aborted')); }, { once: true }));
+  };
+  const result = await judgeEffort({ input: 'x', settings: settings({ timeoutMs: 600 }), call, cooldowns, isAvailable: all });
+  const elapsed = Date.now() - started;
+  assert.deepEqual(tried, [HAIKU, LUNA]);
+  assert.deepEqual([result.requested, result.source, result.judgeModel], ['low', 'judge', LUNA], 'luna answered before the deadline');
+  assert.ok(haikuAborted, 'the slow judge is told to stop');
+  assert.equal(cooldowns.get(HAIKU), undefined, 'a slow answer is not a limit error, so no cooldown');
+  assert.ok(elapsed >= 280, `haiku kept about half the deadline (${elapsed} ms)`);
+  // When every judge is slow, each failure is named so the fallback can be diagnosed.
+  const slow = await judgeEffort({ input: 'x', settings: settings({ timeoutMs: 300 }), call: never, cooldowns: new Cooldowns(), isAvailable: all });
+  assert.equal(slow.source, 'fallback');
+  assert.match(slow.reason!, new RegExp(`${HAIKU}: no answer within 0\\.1s; ${LUNA}: deadline exceeded`));
+});
+
 test('caller cancellation rejects and is not counted as a provider failure', async () => {
   const cooldowns = new Cooldowns();
   const controller = new AbortController();

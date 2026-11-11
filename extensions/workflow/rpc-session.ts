@@ -92,6 +92,8 @@ export interface AdvisorEffort {
   effective?: string;
   source: 'judge' | 'fallback';
   ms: number;
+  /** Why the fallback level was used (redacted, one reason per failed judge). */
+  reason?: string;
 }
 export interface AdvisorReply {
   text: string;
@@ -151,11 +153,15 @@ class AdvisorTurnError extends Error {
   constructor(message: string, readonly limit: boolean, readonly reason: string) { super(message); }
 }
 
-/** Effort label, e.g. 'effort high (judge xhigh, clamped; 0.8s)' or 'effort medium (fallback; 4.0s)'. */
+/**
+ * Effort label, e.g. 'effort high (judge xhigh, clamped; 0.8s)' or
+ * 'effort medium (fallback: anthropic/claude-haiku-5-5: deadline exceeded; 8.0s)'.
+ */
 export function effortLabel(effort: AdvisorEffort): string {
   const effective = effort.effective ?? effort.requested;
   const clamped = effective !== effort.requested ? ` ${effort.requested}, clamped` : '';
-  return `effort ${effective} (${effort.source}${clamped}; ${(effort.ms / 1000).toFixed(1)}s)`;
+  const why = effort.source === 'fallback' && effort.reason ? `: ${effort.reason}` : '';
+  return `effort ${effective} (${effort.source}${clamped}${why}; ${(effort.ms / 1000).toFixed(1)}s)`;
 }
 
 /** Display label: the responding model, its effort, plus any fallback it replaced. */

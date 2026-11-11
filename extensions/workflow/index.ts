@@ -195,7 +195,7 @@ export default function piLight(pi: ExtensionAPI): void {
     if (input === false || !models.effort.enabled) return undefined;
     const judged = await judgeEffort({ input, settings: models.effort, call: registryJudgeCall(ctx.modelRegistry),
       cooldowns: judgeCooldowns, isAvailable: model => available(ctx, model), signal, redact: providerErrorSummary });
-    return { requested: judged.requested, source: judged.source, ms: judged.ms };
+    return { requested: judged.requested, source: judged.source, ms: judged.ms, ...(judged.reason ? { reason: judged.reason } : {}) };
   }
   interface AskExtras {
     signal?: AbortSignal;
@@ -481,7 +481,8 @@ export default function piLight(pi: ExtensionAPI): void {
     let result: JudgeResult;
     try { result = await judged; } catch { return; } // cancelled: the call is being aborted anyway
     input.model = `${plan.base}:${result.requested}`;
-    ctx.ui.notify(`subagent ${name}: effort ${result.requested} (${result.source}${result.judgeModel ? ` ${result.judgeModel}` : ''}, ${(result.ms / 1000).toFixed(1)}s)`,
+    const detail = result.judgeModel ? ` ${result.judgeModel}` : result.reason ? `: ${result.reason}` : '';
+    ctx.ui.notify(`subagent ${name}: effort ${result.requested} (${result.source}${detail}, ${(result.ms / 1000).toFixed(1)}s)`,
       result.source === 'fallback' ? 'warning' : 'info');
   }
   pi.on('tool_call', async (event, ctx) => {

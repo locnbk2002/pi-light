@@ -483,6 +483,10 @@ test('judged effort is applied before the prompt on new and reused sessions, and
     // Judge failure: the fallback level is still applied and labelled as such.
     const failed = await sessions.ask({ ...request(), prompt: 'Third', effort: { requested: 'medium', source: 'fallback', ms: 4000 } });
     assert.equal(replyModelLabel(failed), `${ASTRA}, effort medium (fallback; 4.0s)`);
+    // The judge's fallback reason is shown so a timeout can be diagnosed.
+    const explained = await sessions.ask({ ...request(), prompt: 'Fourth',
+      effort: { requested: 'medium', source: 'fallback', ms: 8000, reason: 'anthropic/claude-haiku-5-5: deadline exceeded' } });
+    assert.equal(replyModelLabel(explained), `${ASTRA}, effort medium (fallback: anthropic/claude-haiku-5-5: deadline exceeded; 8.0s)`);
   } finally { await sessions.close(); }
 });
 

@@ -163,7 +163,7 @@ test('cross-family reviewer: Opus work is reviewed by Sol, Sol work by Opus, ren
 });
 
 test('effort settings: defaults, overrides and provider renames of the judge chain', () => {
-  assert.deepEqual(DEFAULT_EFFORT, { enabled: true, fallback: 'medium', ceiling: 'xhigh', timeoutMs: 4000,
+  assert.deepEqual(DEFAULT_EFFORT, { enabled: true, fallback: 'medium', ceiling: 'xhigh', timeoutMs: 8000,
     judge: ['anthropic/claude-haiku-5-5', 'openai-codex/gpt-5.6-luna'] });
   assert.deepEqual(parseEffortSettings({}), { effort: DEFAULT_EFFORT });
   assert.deepEqual(parseEffortSettings({ effort: { fallback: 'low', ceiling: 'high', timeoutMs: 3000 }, judge: [SOL] }).effort,

@@ -153,7 +153,7 @@ export interface EffortSettings {
 }
 // Spike 6 (2026-11-09): direct Anthropic haiku p95 2.7 s, gpt-5.6-luna p95 3.0 s.
 export const DEFAULT_EFFORT: EffortSettings = Object.freeze({
-  enabled: true, fallback: 'medium', ceiling: 'xhigh', timeoutMs: 4000,
+  enabled: true, fallback: 'medium', ceiling: 'xhigh', timeoutMs: 8000,
   judge: Object.freeze(['anthropic/claude-haiku-5-5', 'openai-codex/gpt-5.6-luna']),
 });
 const DISABLED_EFFORT: EffortSettings = Object.freeze({ ...DEFAULT_EFFORT, enabled: false });
