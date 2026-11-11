@@ -9,6 +9,7 @@ The package root is the workflow core. Each feature is its own extension under `
 | `extensions/workflow` | Stage routing, advisors, model fallback, cross-family review, the `locbt-router` skill policy |
 | `extensions/browser-bridge` | The `browser` tool, `/browser-connect`, `/browser-status` and the Chromium add-on |
 | `extensions/herdr-layout` | herdr subagent pane layout |
+| `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
 | `extensions/setup` | `/pi-light setup` and the missing-AgentKit warning |
 
 - **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to an AgentKit skill. The agent only edits files when you ask for an implementation.
@@ -93,6 +94,8 @@ Pi runs every tool call without asking. Setup installs [`@gotgenes/pi-permission
 - Everything runs as before, except that `rm`, `curl`, `git push`, `git commit`, `ssh`, `scp`, `rsync` and `sftp` ask first. Reading `~/.ssh/id_*` private keys is denied.
 - Read-only remote commands run without asking on every host named in that machine's `~/.ssh/config`: `ssh <host> cat|head|tail|grep|find|stat|du ...`, `ssh <host> ls|df|ps...` and `ssh <host> uptime`. Write them unquoted. SSH hands its arguments to a remote shell, so anything that remote shell could act on asks: quotes, chain or redirect characters, `$`, a backslash, `[`, `sudo`, and `find -delete|-exec|-ok|-fprint|-fls`. A filename produced by a local `*` glob is the one known gap.
 - The extension's bash rules are last-match-wins, so the risky remote forms come last. Without an interactive prompt (`pi -p`, RPC), an ask is denied.
+
+While a permission prompt waits for you, the `herdr-permission-bridge` extension marks the pane `blocked` in herdr (also in subagent panes), so herdr shows it as waiting and `herdr agent wait --until blocked` returns. It relays the extension's `permissions:ui_prompt` and `permissions:decision` events to herdr's own Pi integration and needs that integration installed.
 
 Setup never overwrites an existing rule file; it reports when the file differs from the generated rules. After adding hosts to `~/.ssh/config`, delete the file and rerun setup. Pattern rules are an approval policy, not a sandbox.
 

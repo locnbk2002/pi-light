@@ -2,7 +2,7 @@
   "name": "pi-light",
   "version": "0.5.0",
   "private": true,
-  "description": "Opus-controlled Pi workflow (AgentKit stage routing, Astra/Fable advisors, model fallback) plus separately loadable browser bridge, herdr subagent layout and machine setup extensions.",
+  "description": "Opus-controlled Pi workflow (AgentKit stage routing, Astra/Fable advisors, model fallback) plus separately loadable browser bridge, herdr subagent layout, herdr permission status and machine setup extensions.",
   "keywords": [
     "pi-package"
   ],
@@ -22,7 +22,7 @@
     "changelogPath": ""
   },
   "scripts": {
-    "test": "tsx --test extensions/workflow/effort-judge.test.ts extensions/workflow/subagent-effort.test.ts extensions/workflow/model-fallback.test.ts extensions/workflow/controller.test.ts extensions/workflow/rpc-session.test.ts extensions/browser-bridge/browser.test.ts extensions/herdr-layout/herdr-layout.test.ts extensions/setup/setup.test.ts lib/read-only-events.test.ts",
+    "test": "tsx --test extensions/workflow/effort-judge.test.ts extensions/workflow/subagent-effort.test.ts extensions/workflow/model-fallback.test.ts extensions/workflow/controller.test.ts extensions/workflow/rpc-session.test.ts extensions/browser-bridge/browser.test.ts extensions/herdr-layout/herdr-layout.test.ts extensions/herdr-permission-bridge/permission-bridge.test.ts extensions/setup/setup.test.ts lib/read-only-events.test.ts",
     "typecheck": "tsc --noEmit",
     "test:live": "PI_LIGHT_LIVE_CLI=\"$PWD/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\" tsx --test extensions/workflow/controller.test.ts extensions/workflow/rpc-session.test.ts",
     "smoke": "pnpm run test:live",
