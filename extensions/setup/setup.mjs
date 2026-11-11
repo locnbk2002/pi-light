@@ -53,13 +53,22 @@ export function sshHosts(text) {
 }
 
 /**
- * pi-permission-system policy: the manifest base, then read-only `ssh <host> <cmd>` allows per named host,
- * then risky remote forms. The extension's bash map is last-match-wins, so this order lets the risky forms
- * override the read allows and the read allows override the `ssh *` ask.
+ * pi-permission-system policy: the manifest base with `curlSafeHosts` allows spliced in right after the
+ * `curl *` ask (so the later curl guard asks still win), then read-only `ssh <host> <cmd>` allows per named
+ * host, then risky remote forms. The extension's bash map is last-match-wins, so this order lets the risky
+ * forms override the read allows and the read allows override the `ssh *` ask.
  */
 export function buildPermissionConfig(hosts, spec = MANIFEST.permissions) {
   const config = structuredClone(spec.policy);
-  const bash = config.permission.bash;
+  const bash = {};
+  for (const [pattern, action] of Object.entries(config.permission.bash)) {
+    bash[pattern] = action;
+    if (pattern !== 'curl *') continue;
+    for (const site of spec.curlSafeHosts ?? []) {
+      for (const suffix of ['', ':*', '/*']) bash[`curl *://${site}${suffix}`] = 'allow';
+    }
+  }
+  config.permission.bash = bash;
   for (const host of hosts) {
     for (const cmd of spec.sshRead.withArgs) bash[`ssh ${host} ${cmd} *`] = 'allow';
     for (const cmd of spec.sshRead.prefix) bash[`ssh ${host} ${cmd}*`] = 'allow';

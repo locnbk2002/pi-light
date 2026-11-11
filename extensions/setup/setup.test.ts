@@ -113,6 +113,19 @@ test('permission rules: ssh asks, named-host reads allowed, risky remote forms l
   assert.equal(buildPermissionConfig([]).permission.bash['ssh *'], 'ask', 'no hosts still asks');
 });
 
+test('permission rules: curl safe hosts sit between the curl ask and the later curl guards', () => {
+  const bash = buildPermissionConfig([], { ...MANIFEST.permissions, curlSafeHosts: ['localhost', 'example.org'] }).permission.bash;
+  const keys = Object.keys(bash);
+  for (const k of ['curl *://localhost', 'curl *://localhost:*', 'curl *://example.org/*']) {
+    assert.equal(bash[k], 'allow', k);
+    assert.ok(keys.indexOf(k) > keys.indexOf('curl *'), `${k} after the curl ask`);
+    assert.ok(keys.indexOf(k) < keys.indexOf('curl *://*@*'), `${k} before the userinfo guard`);
+  }
+  assert.ok(!keys.some(k => k.startsWith('curl *://example.org*') && !/(:\*|\/\*)$/.test(k) && k !== 'curl *://example.org'), 'no open-ended host prefix');
+  assert.equal(bash['git commit*'], undefined, 'commits do not ask');
+  assert.equal(bash['rm *'], 'allow');
+});
+
 test('setup writes permission rules once; an edited file is reported, not overwritten', () => {
   const dir = agentHome([]);
   const opts = { env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux' as const, has: () => false, run: () => ({ ok: true, out: '', missing: false }), sshConfig: 'Host mini\n' };
