@@ -85,6 +85,8 @@ export function providerExtension(provider: string, agentDir = getAgentDir()): s
 const MAX_CHAIN = 8;
 /** Keys owned by the effort judge; parsed separately so they can never reset the chains above. */
 const EFFORT_KEYS = ['effort', 'judge'] as const;
+/** Key owned by Claude account rotation; parsed separately, off unless explicitly enabled. */
+const ACCOUNTS_KEY = 'claudeAccounts';
 
 function asObject(raw: unknown, what: string): Record<string, unknown> {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${what} must be an object`);
@@ -126,8 +128,8 @@ function renameChain(role: string, chain: readonly string[], providers: Readonly
 export function parseModelChains(raw: unknown): ModelChains {
   const input = asObject(raw, 'top level');
   for (const key of Object.keys(input)) {
-    if (key !== 'providers' && !ROLES.includes(key as FallbackRole) && !(EFFORT_KEYS as readonly string[]).includes(key)) {
-      throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')}, providers, ${EFFORT_KEYS.join(', ')})`);
+    if (key !== 'providers' && key !== ACCOUNTS_KEY && !ROLES.includes(key as FallbackRole) && !(EFFORT_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')}, providers, ${EFFORT_KEYS.join(', ')}, ${ACCOUNTS_KEY})`);
     }
   }
   const providers = parseProviders(input);
@@ -188,6 +190,23 @@ export function parseEffortSettings(raw: unknown): { effort: EffortSettings; err
   }
 }
 
+export interface ClaudeAccountSettings { enabled: boolean }
+const ACCOUNTS_OFF: ClaudeAccountSettings = Object.freeze({ enabled: false });
+
+/** Claude account rotation settings; anything but `{ "enabled": true }` keeps rotation off. */
+export function parseClaudeAccountSettings(raw: unknown): { claudeAccounts: ClaudeAccountSettings; error?: string } {
+  try {
+    const input = asObject(raw, 'top level');
+    if (!(ACCOUNTS_KEY in input)) return { claudeAccounts: ACCOUNTS_OFF };
+    const block = asObject(input[ACCOUNTS_KEY], ACCOUNTS_KEY);
+    for (const key of Object.keys(block)) if (key !== 'enabled') throw new Error(`unknown ${ACCOUNTS_KEY} key "${key.slice(0, 40)}"`);
+    if (typeof block.enabled !== 'boolean') throw new Error(`${ACCOUNTS_KEY}.enabled must be true or false`);
+    return { claudeAccounts: Object.freeze({ enabled: block.enabled }) };
+  } catch (error) {
+    return { claudeAccounts: ACCOUNTS_OFF, error: error instanceof Error ? error.message : 'invalid' };
+  }
+}
+
 export function modelConfigPath(): string { return join(getAgentDir(), 'pi-light-models.json'); }
 
 export interface ModelConfig {
@@ -197,6 +216,9 @@ export interface ModelConfig {
   effort: EffortSettings;
   /** Effort problem; judging is disabled. Independent of `error`. */
   effortError?: string;
+  claudeAccounts: ClaudeAccountSettings;
+  /** Claude account settings problem; rotation is off. */
+  claudeAccountsError?: string;
 }
 
 /**
@@ -208,11 +230,12 @@ export function loadModelChains(path = modelConfigPath()): ModelConfig {
   const failed = (reason: string, chains: string, effort = reason): ModelConfig => ({
     chains: DEFAULT_CHAINS, error: `Pi Light model override ${path} is ${chains}; using default fallback lists.`,
     effort: DISABLED_EFFORT, effortError: `Pi Light model override ${path} is ${effort}; effort judging is disabled.`,
+    claudeAccounts: ACCOUNTS_OFF,
   });
   let text: string;
   try { text = readFileSync(path, 'utf8'); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT };
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT, claudeAccounts: ACCOUNTS_OFF };
     return failed('unreadable', 'unreadable');
   }
   let raw: unknown;
@@ -223,7 +246,7 @@ export function loadModelChains(path = modelConfigPath()): ModelConfig {
     const reason = `invalid (${error instanceof SyntaxError ? 'invalid JSON' : error instanceof Error ? error.message : 'invalid'})`;
     return failed(reason, reason);
   }
-  const config: ModelConfig = { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT };
+  const config: ModelConfig = { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT, claudeAccounts: ACCOUNTS_OFF };
   try { config.chains = parseModelChains(raw); }
   catch (error) {
     config.error = `Pi Light model override ${path} is invalid (${error instanceof Error ? error.message : 'invalid'}); using default fallback lists.`;
@@ -231,6 +254,9 @@ export function loadModelChains(path = modelConfigPath()): ModelConfig {
   const parsed = parseEffortSettings(raw);
   config.effort = parsed.effort;
   if (parsed.error) config.effortError = `Pi Light model override ${path} has invalid effort settings (${parsed.error}); effort judging is disabled.`;
+  const accounts = parseClaudeAccountSettings(raw);
+  config.claudeAccounts = accounts.claudeAccounts;
+  if (accounts.error) config.claudeAccountsError = `Pi Light model override ${path} has invalid claudeAccounts settings (${accounts.error}); Claude account rotation is off.`;
   return config;
 }
 

@@ -53,7 +53,7 @@ test('override file: missing uses defaults silently; invalid notifies without ec
   const folder = await mkdtemp(join(tmpdir(), 'pi-light-models-'));
   try {
     const path = join(folder, 'pi-light-models.json');
-    assert.deepEqual(loadModelChains(path), { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT });
+    assert.deepEqual(loadModelChains(path), { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT, claudeAccounts: { enabled: false } });
     await writeFile(path, '{"astra": ["secret-looking-value"');
     let loaded = loadModelChains(path);
     assert.equal(loaded.chains, DEFAULT_CHAINS);
@@ -67,7 +67,14 @@ test('override file: missing uses defaults silently; invalid notifies without ec
     assert.match(loaded.error!, /provider\/model/);
     assert.equal(loaded.error!.includes('secret-looking-value'), false);
     await writeFile(path, JSON.stringify({ fable: [SOL] }));
-    assert.deepEqual(loadModelChains(path), { chains: { ...DEFAULT_CHAINS, fable: [SOL] }, effort: DEFAULT_EFFORT });
+    assert.deepEqual(loadModelChains(path), { chains: { ...DEFAULT_CHAINS, fable: [SOL] }, effort: DEFAULT_EFFORT, claudeAccounts: { enabled: false } });
+    await writeFile(path, JSON.stringify({ claudeAccounts: { enabled: true } }));
+    assert.deepEqual(loadModelChains(path).claudeAccounts, { enabled: true });
+    await writeFile(path, JSON.stringify({ claudeAccounts: { enabled: 1 } }));
+    loaded = loadModelChains(path);
+    assert.equal(loaded.claudeAccounts.enabled, false);
+    assert.match(loaded.claudeAccountsError!, /Claude account rotation is off/);
+    assert.equal(loaded.error, undefined, 'a bad claudeAccounts block leaves the chains alone');
   } finally { await rm(folder, { recursive: true, force: true }); }
 });
 

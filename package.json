@@ -22,11 +22,12 @@
     "changelogPath": ""
   },
   "scripts": {
-    "test": "tsx --test extensions/workflow/effort-judge.test.ts extensions/workflow/subagent-effort.test.ts extensions/workflow/model-fallback.test.ts extensions/workflow/controller.test.ts extensions/workflow/rpc-session.test.ts extensions/browser-bridge/browser.test.ts extensions/herdr-layout/herdr-layout.test.ts extensions/herdr-permission-bridge/permission-bridge.test.ts extensions/setup/setup.test.ts lib/read-only-events.test.ts",
+    "test": "tsx --test extensions/workflow/claude-accounts.test.ts extensions/workflow/claude-account-routing.test.ts extensions/workflow/effort-judge.test.ts extensions/workflow/subagent-effort.test.ts extensions/workflow/model-fallback.test.ts extensions/workflow/controller.test.ts extensions/workflow/rpc-session.test.ts extensions/browser-bridge/browser.test.ts extensions/herdr-layout/herdr-layout.test.ts extensions/herdr-permission-bridge/permission-bridge.test.ts extensions/setup/setup.test.ts lib/read-only-events.test.ts",
     "typecheck": "tsc --noEmit",
     "test:live": "PI_LIGHT_LIVE_CLI=\"$PWD/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\" tsx --test extensions/workflow/controller.test.ts extensions/workflow/rpc-session.test.ts",
     "smoke": "pnpm run test:live",
-    "setup": "node extensions/setup/setup.mjs"
+    "setup": "node extensions/setup/setup.mjs",
+    "claude-accounts": "tsx extensions/workflow/claude-accounts-cli.ts"
   },
   "dependencies": {
     "ws": "8.22.1"

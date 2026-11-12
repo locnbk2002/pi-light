@@ -23,17 +23,20 @@ test('native package leaves one-shot Pi and AgentKit child jobs untouched', () =
   assert.equal(isOneShotInvocation(['--', '--print']), false);
 });
 
-test('one-shot extension factory registers only the virtual controller model', () => {
+test('one-shot extension factory registers only the virtual controller model and its failover', () => {
   const previous = process.argv;
   try {
     process.argv = [previous[0], previous[1], '--mode', 'json', '-p', '--no-session'];
     const registered: { provider: string; id: string }[] = [];
+    const events: string[] = [];
     const untouched = new Proxy({}, { get(_target, name) {
       if (name === 'registerVirtualModel') return (definition: { provider: string; id: string }) => { registered.push(definition); };
+      if (name === 'on') return (event: string) => { events.push(event); };
       throw new Error(`One-shot Pi must not access extension API ${String(name)}`);
     } });
     assert.doesNotThrow(() => piLight(untouched as ExtensionAPI));
     assert.deepEqual(registered.map(({ provider, id }) => ({ provider, id })), [{ provider: VIRTUAL_CONTROLLER.provider, id: VIRTUAL_CONTROLLER.id }]);
+    assert.deepEqual(events, ['agent_before_settle', 'agent_settled'], 'only the shared settle-time failover');
   } finally { process.argv = previous; }
 });
 
@@ -69,14 +72,15 @@ test('herdr subagent panes keep their requested model and default to the control
     process.env.PI_SUBAGENT_ID = 'ab12cd34';
     const virtual = `${VIRTUAL_CONTROLLER.provider}/${VIRTUAL_CONTROLLER.id}`;
     const unpinned = await run(['--session', 's.jsonl', '@task.md'], { provider: 'openai-codex', id: 'gpt-6.1-sol' });
-    assert.deepEqual(unpinned, { registered: [virtual], selected: [virtual], thinking: [], events: ['session_start'] });
+    const events = ['agent_before_settle', 'agent_settled', 'session_start'];
+    assert.deepEqual(unpinned, { registered: [virtual], selected: [virtual], thinking: [], events });
     const pinned = await run(['--session', 's.jsonl', '--model', 'openai-codex/gpt-6-astra', '@task.md'], { provider: 'openai-codex', id: 'gpt-6-astra' });
-    assert.deepEqual(pinned, { registered: [virtual], selected: [], thinking: [], events: ['session_start'] }, 'a requested model is never overridden');
+    assert.deepEqual(pinned, { registered: [virtual], selected: [], thinking: [], events }, 'a requested model is never overridden');
     // Explicit level plus an appended agent-definition level: the explicit (inner) level wins.
     const doubled = await run(['--session', 's.jsonl', '--model', 'openai-codex/gpt-6.1-sol:high:low'], { provider: 'openai-codex', id: 'gpt-6.1-sol' });
-    assert.deepEqual(doubled, { registered: [virtual], selected: [], thinking: ['high'], events: ['session_start'] });
+    assert.deepEqual(doubled, { registered: [virtual], selected: [], thinking: ['high'], events });
     const judged = await run(['--model', `${virtual}:xhigh`], { provider: VIRTUAL_CONTROLLER.provider, id: VIRTUAL_CONTROLLER.id });
-    assert.deepEqual(judged, { registered: [virtual], selected: [], thinking: [], events: ['session_start'] }, 'a single suffix is left to Pi');
+    assert.deepEqual(judged, { registered: [virtual], selected: [], thinking: [], events }, 'a single suffix is left to Pi');
   } finally {
     process.argv = previous.argv;
     if (previous.id === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = previous.id;

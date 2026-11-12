@@ -143,6 +143,33 @@ Settings live in the same `~/.pi/agent/pi-light-models.json` (all optional; defa
 
 `"effort": { "enabled": false }` turns the judge off: no judge requests, no judged levels and no effort labels. The precedence repairs stay on, so an explicit `:level` still beats an agent definition's `thinking:`, and a definition with only `thinking:` still reaches the child. Invalid effort or judge settings, including `null` values, also turn the judge off (with a warning), and never change the controller or advisor lists.
 
+## Claude account rotation
+
+With `claude-bridge` as the controller's Claude provider, pi-light can spread work over several Claude subscription accounts. It chooses an account for each Pi session and gives Claude Code that account's token with each request (`CLAUDE_CODE_OAUTH_TOKEN`). The macOS Keychain login is never read or changed, so the `claude` CLI and other sessions keep their own account. Rotation is off by default.
+
+1. **Create a token for each account.** Sign the browser in to the account, run `claude setup-token`, and copy the token. It is valid for about a year, has no refresh token, and can only run models.
+2. **Store it** from the pi-light checkout:
+   ```sh
+   npm run claude-accounts -- add personal --check   # paste the token, then Enter on an empty line
+   npm run claude-accounts -- list                   # names, organizations, fingerprints; no tokens
+   ```
+   Tokens go to `~/.pi/agent/pi-light/claude-accounts/<name>.json` (mode 0600). `--check` runs one tiny Haiku turn and prints the account's usage and weekly reset, so you can confirm which account the token belongs to. Pasting a token wrapped across terminal lines is fine.
+3. **Turn it on** in `~/.pi/agent/pi-light-models.json` and restart Pi:
+   ```json
+   { "claudeAccounts": { "enabled": true } }
+   ```
+
+How an account is chosen:
+
+- **Per session, at turn boundaries.** A session keeps its account until that account is blocked, rejected, or inside its 10% reserve (90% of the 5-hour or weekly window). It never changes account in the middle of a turn, except to fail over.
+- **Ranking.** Accounts outside the reserve, preferring a 5-hour window under 85%, then measured usage, then the account whose weekly quota must be spent fastest before its reset (remaining share ÷ hours to reset), then lower 5-hour use. An account a session moved away from must drop below 85% (5-hour) and 88% (weekly) before that session returns to it.
+- **Usage** comes from the rate-limit report Claude Code sends with each turn, recorded on the account whose token ran that turn. The usage API is not available to setup tokens. State is shared by every Pi process in `claude-accounts/state/`, one small file per record (each usage report, each block, each rejected login, each version of a session's pin). Files are written atomically, so no lock is needed: a concurrent writer cannot lose a record, the newest report of each usage window wins, and clean-up only deletes records a newer one replaces or that expired (blocks a day after they end, idle sessions' pins after 30 days). Rejected logins are kept. A session's pin is written only at a new prompt, retry or failover, so two Pi processes on one session never overwrite each other mid-turn. An account whose newest usage cannot be read is treated as being in its reserve, and `status` says so. A `claude-accounts/state.json` left by an early development build is ignored and can be deleted.
+- **Failover.** A usage limit blocks the account until its window resets (plus a minute; 30 minutes when no reset is known). A rejected login marks that token as failed until it is replaced; it is never treated as a quota block. If the failed attempt showed no text and called no tool, the same request continues on the next account; otherwise it is not replayed and your next prompt uses the next account. The same rule applies when Pi retries a failed request by itself: a retry that would repeat visible output on another account or model is stopped instead. The model fallback (Sol) starts only when every account is blocked, rejected or in reserve; while rotation is on, Claude never runs on the bridge's own login, so with no usable account and no non-Claude model the controller stops with a message. Herdr subagent panes and `-p` runs fail over the same way.
+- **Switching** starts a fresh Claude Code session rebuilt from Pi's history, so context carries over and no tool runs twice. The first turn on the new account has no prompt cache.
+- **Status.** The footer shows `claude: <account>`; `/claude-accounts` lists usage, blocks and this session's account, and `/claude-accounts reload` re-reads the account files.
+
+Without stored accounts, or with rotation off, the bridge uses its own login as before.
+
 ## Develop
 
 ```sh
