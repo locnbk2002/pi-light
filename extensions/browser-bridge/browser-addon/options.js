@@ -5,16 +5,17 @@ async function message(payload) {
   try {
     const response = await api.runtime.sendMessage(payload);
     if (!response || response.error || typeof response.status !== "string") throw new Error("Operation rejected");
-    statusElement.textContent = response.status;
-  } catch { statusElement.textContent = "Connection operation failed. Check local Pi, URL and session token; then retry."; }
+    statusElement.textContent = `${response.paired ? "Paired" : "Not paired"}, ${response.enabled ? "enabled" : "disabled"}. ${response.status}`;
+  } catch { statusElement.textContent = "Operation failed; reload the add-on and retry."; }
 }
-document.getElementById("connection").addEventListener("submit", event => {
+document.getElementById("pairing").addEventListener("submit", event => {
   event.preventDefault();
-  const tokenElement = document.getElementById("token");
-  const token = tokenElement.value;
-  tokenElement.value = "";
-  void message({ type: "connect", url: document.getElementById("url").value.trim(), token });
+  const secretElement = document.getElementById("secret");
+  const secret = secretElement.value.trim();
+  secretElement.value = "";
+  void message({ type: "pair", secret });
 });
-document.getElementById("disconnect").addEventListener("click", () => { void message({ type: "disconnect" }); });
+document.getElementById("enable").addEventListener("click", () => { void message({ type: "enable" }); });
+document.getElementById("disable").addEventListener("click", () => { void message({ type: "disable" }); });
 document.getElementById("refresh").addEventListener("click", () => { void message({ type: "status" }); });
 void message({ type: "status" });

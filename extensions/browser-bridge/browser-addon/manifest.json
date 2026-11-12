@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Pi Light Browser",
-  "version": "0.3.0",
-  "description": "Local bridge that lets Pi control tabs it opens and the tab you bind from the toolbar.",
+  "version": "0.4.0",
+  "description": "Local bridge that lets every running Pi session control tabs it opens and the tab you bind from the toolbar.",
   "minimum_chrome_version": "125",
-  "permissions": ["debugger", "tabs", "tabGroups", "storage"],
+  "permissions": ["debugger", "tabs", "tabGroups", "storage", "alarms"],
   "background": { "service_worker": "background.js" },
-  "action": { "default_title": "Pi Light: bind this tab (click again to unbind)" },
+  "action": { "default_title": "Pi Light: bind this tab for all Pi sessions (click again to unbind)" },
   "options_ui": { "page": "options.html", "open_in_tab": true },
   "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'; connect-src ws://127.0.0.1:19339" }
 }

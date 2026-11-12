@@ -1,11 +1,17 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import { WebSocket } from "ws";
-import { BrowserBridge, registerBrowserTools } from "./browser-bridge.js";
+import { webcrypto } from "node:crypto";
+import { WebSocket, WebSocketServer } from "ws";
+import { BrowserBridge, type BrowserBridgeOptions, registerBrowserTools } from "./browser-bridge.js";
 import { type ControlledTab, MAX_MESSAGE_BYTES, isMutation, validTabs, validateAction, validExtensionOrigin } from "./browser-policy.js";
+import { ensurePairingSecret, pairingProof, startRelay } from "./browser-relay.mjs";
 
 const EXT = `chrome-extension://${"abcdefghijklmnop".repeat(2)}`;
 const origin = "https://example.com";
@@ -16,24 +22,264 @@ const until = async (check: () => unknown, what: string) => {
   for (let n = 0; n < 200; n++) { if (check()) return; await delay(5); }
   assert.fail(`Timed out waiting for ${what}`);
 };
-
-/** Authenticated raw client that announces `tabs`. */
-async function client(bridge: BrowserBridge, tabs: ControlledTab[] = [bound], token = bridge.connectionInfo().token) {
-  const ws = new WebSocket(bridge.connectionInfo().url, { origin: EXT });
-  await once(ws, "open");
-  const reply = once(ws, "message");
-  ws.send(JSON.stringify({ type: "auth", token }));
-  await reply;
-  ws.send(JSON.stringify({ type: "tabs", tabs }));
-  await until(() => bridge.tabs.length === tabs.length, "tab announcement");
-  return ws;
-}
 // Values created inside the add-on VM have foreign prototypes; compare their JSON form.
 const plain = (value: unknown) => JSON.parse(JSON.stringify(value));
-const nextRequest = async (ws: WebSocket) => JSON.parse((await once(ws, "message"))[0].toString());
+const nextMessage = async (ws: WebSocket) => JSON.parse((await once(ws, "message"))[0].toString());
 
-test("startup cancellation, repeated shutdown and overlapping restart settle deterministically", { timeout: 3000 }, async t => {
-  const bridge = new BrowserBridge(19341);
+type Relay = Awaited<ReturnType<typeof startRelay>>;
+// Pairing secret of the newest test relay; loaded add-ons are paired with it unless told otherwise.
+let currentPairing = "";
+/** A relay on `port` with a private pairing file, plus a factory for Pi sessions joined to it. */
+async function relayFor(t: TestContext, port: number, relayOptions: { idleMs?: number; heartbeatMs?: number } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "pi-light-relay-"));
+  const secretPath = join(dir, "secret");
+  const relay: Relay = await startRelay({ port, secretPath, ...relayOptions });
+  const pairing = (await readFile(secretPath, "utf8")).trim();
+  currentPairing = pairing;
+  const bridges: BrowserBridge[] = [];
+  const session = async (options: BrowserBridgeOptions = {}) => {
+    const bridge = new BrowserBridge({ port, secretPath, timeoutMs: 2000, connectTimeoutMs: 1000, reconnectMs: 20, launch: () => {}, ...options });
+    bridges.push(bridge);
+    await bridge.start();
+    return bridge;
+  };
+  t.after(async () => {
+    disposeAddons();
+    for (const bridge of bridges) await bridge.close();
+    await relay.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  return { relay, secretPath, pairing, session, dir };
+}
+/** One Pi session joined to a fresh relay on the add-on test port. */
+async function joined(t: TestContext, port = 19347) { return (await relayFor(t, port)).session(); }
+
+/** Opens a socket and runs the pairing handshake as `label`; resolves with the relay's reply and collected messages. */
+async function handshake(url: string, options: object, pairing: string, label: "ext" | "pi", session = "") {
+  const ws = new WebSocket(url, options);
+  const received: any[] = [];
+  ws.on("message", raw => received.push(JSON.parse(raw.toString())));
+  ws.on("error", () => {});
+  const closed = new Promise(resolve => ws.on("close", resolve));
+  await until(() => received.length > 0 || ws.readyState === WebSocket.CLOSED, "challenge");
+  const challenge = received.shift();
+  const nonce = "9".repeat(32);
+  if (challenge?.type === "challenge") ws.send(JSON.stringify({ type: "auth", nonce, ...(label === "pi" ? { session } : {}), proof: pairingProof(pairing, label, challenge.nonce, nonce, session) }));
+  await Promise.race([until(() => received.length > 0, "handshake reply").catch(() => {}), closed]);
+  const reply = received[0];
+  const proven = Boolean(challenge && reply?.type === "ready" && reply.proof === pairingProof(pairing, "relay", label, challenge.nonce, nonce, session));
+  return { ws, received, reply, proven, closed, challenge };
+}
+
+/** Raw stand-in for the add-on on /ext. Collects relay messages; `tabs(session, list)` announces tabs for one session. */
+async function fakeExtension(port: number, pairing = currentPairing) {
+  const { ws, received, proven } = await handshake(`ws://127.0.0.1:${port}/ext`, { origin: EXT }, pairing, "ext");
+  assert.ok(proven, "relay proved the pairing secret");
+  return {
+    ws, received,
+    send: (message: object) => ws.send(JSON.stringify(message)),
+    tabs: (session: string, tabs: ControlledTab[]) => ws.send(JSON.stringify({ type: "tabs", session, tabs })),
+    nextRequest: async () => { await until(() => received.some(m => m.type === "request"), "request"); return received.splice(received.findIndex(m => m.type === "request"), 1)[0]; }
+  };
+}
+
+test("relay admits Pi sessions and the add-on only after a pairing proof, and proves itself in return", { timeout: 8000 }, async t => {
+  const { secretPath, pairing, session } = await relayFor(t, 19340);
+  assert.equal((await stat(secretPath)).mode & 0o777, 0o600, "pairing file is user-only");
+  assert.match(pairing, /^[a-f0-9]{64}$/);
+  // The pairing secret is long-lived: neither a competing relay nor a restart replaces it.
+  await assert.rejects(startRelay({ port: 19340, secretPath }));
+  assert.equal((await readFile(secretPath, "utf8")).trim(), pairing);
+
+  const wrong = "0".repeat(64);
+  const sessionId = "c".repeat(32);
+  const refused = async (path: string, options: object, secret: string, label: "ext" | "pi", id = "") => {
+    const attempt = await handshake(`ws://127.0.0.1:19340${path}`, options, secret, label, id);
+    await attempt.closed;
+    // Nothing but the challenge (or nothing at all) reaches an unproven client.
+    assert.deepEqual(attempt.received.filter(m => m.type !== "challenge"), [], `${path} ${JSON.stringify(options)}`);
+    assert.equal(attempt.proven, false);
+  };
+  await refused("/pi", {}, wrong, "pi", sessionId);
+  await refused("/pi", {}, pairing, "pi", "not-a-session");
+  await refused("/pi", {}, pairing, "ext");
+  // An unrelated extension (valid origin, no secret) can neither become the browser nor see session ids.
+  await refused("/ext", { origin: `chrome-extension://${"p".repeat(32)}` }, wrong, "ext");
+  // A Pi proof is not accepted as an add-on proof.
+  await refused("/ext", { origin: EXT }, pairing, "pi", sessionId);
+  // Web pages always send an Origin: they can reach neither endpoint.
+  for (const foreign of ["https://evil.test", EXT]) await refused("/pi", { origin: foreign }, pairing, "pi", sessionId);
+  for (const foreign of [undefined, "https://evil.test", "moz-extension://test-extension"]) await refused("/ext", foreign ? { origin: foreign } : {}, pairing, "ext");
+  await refused("/other", { origin: EXT }, pairing, "ext");
+
+  const first = await session();
+  // The same session id cannot join twice.
+  await refused("/pi", {}, pairing, "pi", first.session);
+  const ext = await fakeExtension(19340);
+  assert.deepEqual(ext.received[0].sessions, [first.session]);
+  await until(() => first.connected, "browser connected");
+  // A second paired add-on (another profile) waits until the first leaves.
+  const other = await handshake("ws://127.0.0.1:19340/ext", { origin: EXT }, pairing, "ext");
+  await other.closed;
+  assert.equal(other.proven, false);
+  assert.equal(first.connected, true);
+});
+
+test("neither Pi nor the add-on trusts a program on the port that cannot prove the pairing secret", { timeout: 8000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-light-relay-"));
+  const secretPath = join(dir, "secret");
+  const pairing = ensurePairingSecret(secretPath);
+  // An impostor relay: answers every challenge-response with a ready lacking a valid proof, and records everything.
+  const seen: string[] = [];
+  const impostor = new WebSocketServer({ host: "127.0.0.1", port: 19346 });
+  impostor.on("connection", socket => {
+    socket.send(JSON.stringify({ type: "challenge", nonce: "1".repeat(32) }));
+    socket.on("message", raw => { seen.push(raw.toString()); socket.send(JSON.stringify({ type: "ready", proof: "2".repeat(64), browser: true, sessions: [] })); });
+  });
+  t.after(async () => { await new Promise(resolve => impostor.close(resolve)); await rm(dir, { recursive: true, force: true }); });
+  const bridge = new BrowserBridge({ port: 19346, secretPath, connectTimeoutMs: 400, launch: () => {} });
+  await assert.rejects(bridge.start(), /relay unavailable/);
+  await bridge.close();
+  assert.ok(seen.length > 0);
+  for (const message of seen) {
+    assert.doesNotMatch(message, new RegExp(pairing), "the secret is never sent");
+    assert.equal(JSON.parse(message).type, "auth", "nothing but the proof reaches the impostor");
+  }
+  const addon = await loadAddon({ pairing, url: "ws://127.0.0.1:19346/ext" });
+  await until(() => /could not prove the pairing secret/.test(vm.runInContext("status", addon.context)), "add-on refuses impostor");
+  assert.equal(vm.runInContext("ready", addon.context), false);
+  addon.dispose();
+  for (const message of seen) assert.doesNotMatch(message, new RegExp(pairing));
+  // Unpaired add-ons do not connect at all.
+  const unpaired = await loadAddon({ pairing: null });
+  await delay(30);
+  assert.equal(vm.runInContext("socket", unpaired.context), null);
+  assert.match(vm.runInContext("status", unpaired.context), /Not paired/);
+});
+
+test("several Pi sessions share one add-on: routing, per-session tabs, session end and browser loss", { timeout: 5000 }, async t => {
+  const { session, pairing } = await relayFor(t, 19341);
+  const a = await session();
+  const ext = await fakeExtension(19341);
+  const b = await session();
+  assert.notEqual(a.session, b.session);
+  await until(() => ext.received.some(m => m.type === "session" && m.session === b.session && m.open === true), "session open notice");
+  await until(() => a.connected && b.connected, "both connected");
+  ext.tabs(a.session, [bound, owned]);
+  ext.tabs(b.session, [bound]);
+  await until(() => a.tabs.length === 2 && b.tabs.length === 1, "per-session tabs");
+  assert.deepEqual(b.tabs, [bound]);
+
+  // Requests carry the session the relay assigned; results reach only that session.
+  const fromA = a.request({ action: "snapshot", tab: "main" }, owned);
+  const fromB = b.request({ action: "tabs" });
+  const first = await ext.nextRequest();
+  const second = await ext.nextRequest();
+  const requests = new Map([[first.session, first], [second.session, second]]);
+  assert.deepEqual([...requests.keys()].sort(), [a.session, b.session].sort());
+  ext.send({ type: "result", id: requests.get(b.session).id, session: a.session, ok: true, result: { stolen: true } });
+  ext.send({ type: "result", id: requests.get(b.session).id, session: b.session, ok: true, result: { tabs: [] } });
+  ext.send({ type: "result", id: requests.get(a.session).id, session: a.session, generation: owned.generation, ok: true, result: { text: "a" } });
+  assert.deepEqual(await fromB, { tabs: [] });
+  assert.deepEqual(await fromA, { text: "a" });
+
+  // A session cannot speak for another: the relay overwrites any session it sends.
+  const rawSession = "d".repeat(32);
+  const { ws: raw, reply, proven } = await handshake("ws://127.0.0.1:19341/pi", {}, pairing, "pi", rawSession);
+  assert.ok(proven);
+  assert.equal(reply.browser, true);
+  raw.send(JSON.stringify({ type: "request", id: "e".repeat(32), session: a.session, action: "tabs" }));
+  assert.equal((await ext.nextRequest()).session, rawSession);
+
+  // One session leaving is announced to the add-on; the other keeps working.
+  await a.close();
+  await until(() => ext.received.some(m => m.type === "session" && m.session === a.session && m.open === false), "session close notice");
+  assert.equal(b.connected, true);
+  raw.close();
+
+  // Losing the browser invalidates pending work and tabs in every session.
+  const pending = b.request({ action: "snapshot" }, bound);
+  await ext.nextRequest();
+  ext.ws.close();
+  await assert.rejects(pending, /disconnected/);
+  await until(() => !b.connected, "browser loss");
+  assert.deepEqual(b.tabs, []);
+});
+
+test("bridge protocol: generations, tabless actions, bounds, timeout, cancellation and shutdown", { timeout: 8000 }, async t => {
+  const { session } = await relayFor(t, 19342);
+  const bridge = await session({ timeoutMs: 150 });
+  let ext = await fakeExtension(19342);
+  ext.tabs(bridge.session, [bound, owned]);
+  await until(() => bridge.tabs.length === 2, "tabs");
+  assert.equal(bridge.resolveTab()?.name, "bound");
+  assert.equal(bridge.resolveTab("main")?.kind, "owned");
+  assert.equal(bridge.resolveTab("nope"), undefined);
+  const result = bridge.request({ action: "snapshot", tab: "main" }, owned);
+  let request = await ext.nextRequest();
+  assert.equal(request.action, "snapshot");
+  assert.equal(request.tab, "main");
+  assert.equal(request.generation, owned.generation);
+  assert.equal(request.session, bridge.session);
+  assert.equal("token" in request, false);
+  // A result carrying another generation is ignored.
+  ext.send({ type: "result", id: request.id, session: bridge.session, generation: bound.generation, ok: true, result: { text: "wrong" } });
+  ext.send({ type: "result", id: request.id, session: bridge.session, generation: owned.generation, ok: true, result: { text: "hello" } });
+  assert.deepEqual(await result, { text: "hello" });
+  // Tabless actions carry no generation.
+  const opened = bridge.request({ action: "open", url: `${origin}/x`, name: "second" });
+  request = await ext.nextRequest();
+  assert.equal("generation" in request, false);
+  ext.send({ type: "result", id: request.id, session: bridge.session, ok: false, error: "Tab name in use or invalid" });
+  await assert.rejects(opened, /Browser action failed: Tab name in use or invalid/);
+  // A pending request on a tab that vanishes is rejected.
+  const pending = bridge.request({ action: "click", selector: "button" }, bound);
+  const rejected = assert.rejects(pending, /tab changed/);
+  await ext.nextRequest();
+  ext.tabs(bridge.session, [{ ...bound, generation: "generation-3" }, owned]);
+  await rejected;
+  await assert.rejects(bridge.request({ action: "snapshot" }, bound), /changed or absent/);
+  await assert.rejects(bridge.request({ action: "navigate", url: "https://other.test/" }, bridge.resolveTab("bound")), /origin/);
+  // Large frames are only admitted as a pending screenshot result.
+  const big = (id: string, generation?: string) => JSON.stringify({ type: "result", id, session: bridge.session, ...(generation ? { generation } : {}), ok: true, result: { data: "A".repeat(MAX_MESSAGE_BYTES) } });
+  const shot = bridge.request({ action: "screenshot", tab: "main" }, owned);
+  request = await ext.nextRequest();
+  ext.ws.send(big(request.id, owned.generation));
+  assert.equal(((await shot) as { data: string }).data.length, MAX_MESSAGE_BYTES);
+  // An unsolicited large frame ends the session's relay connection; the bridge rejoins under the same id.
+  ext.ws.send(big("0".repeat(32)));
+  await until(() => bridge.tabs.length === 0, "oversized frame drops tabs");
+  await until(() => ext.received.some(m => m.type === "session" && m.open === true && m.session === bridge.session), "rejoined");
+  await until(() => bridge.connected, "reconnected");
+  ext.tabs(bridge.session, [bound]);
+  await until(() => bridge.tabs.length === 1, "tabs again");
+  // Timeout and cancellation leave the relay (ending the session in the add-on) and rejoin.
+  const opens = () => ext.received.filter(m => m.type === "session" && m.open === true).length;
+  const rejoin = async (before: number, what: string) => {
+    await until(() => opens() > before && bridge.connected, what);
+    ext.tabs(bridge.session, [bound]);
+    await until(() => bridge.tabs.length === 1, `tabs ${what}`);
+  };
+  let before = opens();
+  await assert.rejects(bridge.request({ action: "snapshot" }, bound), /timed out/);
+  await ext.nextRequest();
+  await rejoin(before, "after timeout");
+  const aborter = new AbortController();
+  before = opens();
+  const cancelled = assert.rejects(bridge.request({ action: "snapshot" }, bound, aborter.signal), /cancelled/);
+  await ext.nextRequest(); aborter.abort(); await cancelled;
+  await rejoin(before, "after cancel");
+  const shutdown = assert.rejects(bridge.request({ action: "snapshot" }, bound), /shutdown/);
+  await ext.nextRequest(); await bridge.close(); await shutdown;
+  await delay(60);
+  assert.equal(bridge.connected, false, "a closed bridge does not rejoin");
+  await bridge.close();
+  ext.ws.close();
+});
+
+test("startup cancellation, repeated shutdown and overlapping restart settle deterministically", { timeout: 5000 }, async t => {
+  const { secretPath } = await relayFor(t, 19343);
+  const bridge = new BrowserBridge({ port: 19343, secretPath, connectTimeoutMs: 1000, launch: () => {} });
   t.after(() => bridge.close());
   const started = bridge.start();
   assert.equal(bridge.start(), started);
@@ -47,12 +293,11 @@ test("startup cancellation, repeated shutdown and overlapping restart settle det
   assert.equal(bridge.start(), restarted);
   await Promise.all([closing, repeated, restarted]);
   await bridge.start();
-  let ws = await client(bridge);
-  const disconnected = once(ws, "close");
+  const ext = await fakeExtension(19343);
+  await until(() => bridge.connected, "connected");
   await bridge.close();
-  await disconnected;
-  assert.deepEqual(bridge.tabs, []);
   await bridge.close();
+  await until(() => ext.received.some(m => m.type === "session" && m.open === false), "left relay");
   // A queued restart is itself cancellable before the previous close finishes.
   await bridge.start();
   const stopping = bridge.close();
@@ -61,24 +306,61 @@ test("startup cancellation, repeated shutdown and overlapping restart settle det
   const stoppingAgain = bridge.close();
   await Promise.all([stopping, stoppingAgain, queuedCancelled]);
   await bridge.start();
-  ws = await client(bridge);
-  const incoming = nextRequest(ws);
+  await until(() => bridge.connected, "connected again");
+  ext.tabs(bridge.session, [bound]);
+  await until(() => bridge.tabs.length === 1, "tabs");
   const result = bridge.request({ action: "snapshot" }, bound);
-  const request = await incoming;
-  ws.send(JSON.stringify({ type: "result", id: request.id, generation: bound.generation, ok: true, result: { text: "restarted" } }));
+  const request = await ext.nextRequest();
+  ext.send({ type: "result", id: request.id, session: bridge.session, generation: bound.generation, ok: true, result: { text: "restarted" } });
   assert.deepEqual(await result, { text: "restarted" });
+  ext.ws.close();
 });
 
-test("failed listen can close repeatedly and restart after the port is released", { timeout: 3000 }, async t => {
-  const blocker = new BrowserBridge(19343);
-  const bridge = new BrowserBridge(19343);
-  t.after(async () => { await bridge.close(); await blocker.close(); });
-  await blocker.start();
-  await assert.rejects(bridge.start(), /unavailable/);
-  await Promise.all([bridge.close(), bridge.close(), blocker.close()]);
+test("start launches the relay when none runs, reports an unavailable port, and rejoins a restarted relay", { timeout: 8000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-light-relay-"));
+  const secretPath = join(dir, "secret");
+  let relay: Relay | undefined;
+  let launches = 0;
+  const launch = () => { launches++; void startRelay({ port: 19344, secretPath }).then(r => { relay = r; }); };
+  const bridge = new BrowserBridge({ port: 19344, secretPath, connectTimeoutMs: 2000, reconnectMs: 20, launch });
+  const second = new BrowserBridge({ port: 19344, secretPath, connectTimeoutMs: 2000, launch });
+  t.after(async () => { await bridge.close(); await second.close(); await relay?.close(); await rm(dir, { recursive: true, force: true }); });
   await bridge.start();
-  await client(bridge);
-  assert.deepEqual(bridge.tabs, [bound]);
+  assert.equal(launches, 1);
+  await second.start();
+  assert.equal(launches, 1, "a running relay is joined, not launched again");
+  const firstRelay = relay!;
+  await firstRelay.close();
+  relay = undefined;
+  // Both sessions rejoin a new relay under their own session ids (one of them launches it).
+  await until(() => relay !== undefined, "relay relaunched");
+  const joinedRelay = (b: BrowserBridge) => b.status !== "Browser relay not joined";
+  await until(() => joinedRelay(bridge) && joinedRelay(second), "both sessions rejoined");
+  assert.equal(launches, 2);
+  await relay!.close();
+  relay = undefined;
+  await bridge.close(); await second.close();
+  const stuck = new BrowserBridge({ port: 19344, secretPath, connectTimeoutMs: 300, launch: () => {} });
+  await assert.rejects(stuck.start(), /relay unavailable; check port 19344/);
+  await stuck.close();
+});
+
+test("the relay CLI creates the pairing secret, serves sessions and exits once idle", { timeout: 8000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-light-relay-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const secretPath = join(dir, "nested", "secret");
+  const script = fileURLToPath(new URL("./browser-relay.mjs", import.meta.url));
+  const child = spawn(process.execPath, [script, "--port", "19348", "--secret", secretPath, "--idle-ms", "300"], { stdio: "ignore" });
+  const exited = once(child, "exit");
+  const bridge = new BrowserBridge({ port: 19348, secretPath, connectTimeoutMs: 3000, launch: () => {} });
+  await bridge.start();
+  assert.equal((await stat(secretPath)).mode & 0o777, 0o600);
+  // Joined sessions keep it alive past the idle timeout.
+  await delay(500);
+  assert.equal(child.exitCode, null);
+  await bridge.close();
+  const [code] = await exited;
+  assert.equal(code, 0);
 });
 
 test("browser policy restricts actions, fields, keys, URLs and origins", () => {
@@ -106,113 +388,15 @@ test("browser policy restricts actions, fields, keys, URLs and origins", () => {
   for (const tabs of [[{ ...owned, name: "bound" }], [{ ...bound, name: "main" }], [owned, owned], [{ ...owned, origin: "https://example.com/path" }], [{ ...owned, kind: "other" }], "x"]) assert.throws(() => validTabs(tabs));
 });
 
-test("real loopback protocol: auth, origin, tab announcements, generations, timeout, bounds and shutdown", async t => {
-  const bridge = new BrowserBridge(19340, 100);
-  t.after(async () => { await bridge.close(); });
-  await bridge.start();
-  const conflict = new BrowserBridge(19340);
-  await assert.rejects(conflict.start(), /unavailable/);
-  await conflict.close();
-  const bad = new WebSocket(bridge.connectionInfo().url, { origin: EXT });
-  await once(bad, "open");
-  const closed = once(bad, "close");
-  let messages = 0;
-  bad.on("message", () => messages++);
-  bad.send(JSON.stringify({ type: "auth", token: "incorrect" }));
-  await closed;
-  assert.equal(messages, 0);
-  const unauthenticated = new WebSocket(bridge.connectionInfo().url, { origin: EXT });
-  await once(unauthenticated, "open");
-  const unauthorizedClose = once(unauthenticated, "close");
-  unauthenticated.on("message", () => messages++);
-  unauthenticated.send(JSON.stringify({ type: "tabs", tabs: [bound] }));
-  await unauthorizedClose;
-  assert.equal(messages, 0);
-  assert.deepEqual(bridge.tabs, []);
-  for (const foreign of ["https://evil.test", "moz-extension://test-extension"]) {
-    const page = new WebSocket(bridge.connectionInfo().url, { origin: foreign });
-    await once(page, "error");
-  }
-  let ws = await client(bridge, [bound, owned]);
-  assert.equal(bridge.resolveTab()?.name, "bound");
-  assert.equal(bridge.resolveTab("main")?.kind, "owned");
-  assert.equal(bridge.resolveTab("nope"), undefined);
-  let incoming = nextRequest(ws);
-  const result = bridge.request({ action: "snapshot", tab: "main" }, owned);
-  let request = await incoming;
-  assert.equal(request.action, "snapshot");
-  assert.equal(request.tab, "main");
-  assert.equal(request.generation, owned.generation);
-  assert.equal("token" in request, false);
-  // A result carrying another generation is ignored.
-  ws.send(JSON.stringify({ type: "result", id: request.id, generation: bound.generation, ok: true, result: { text: "wrong" } }));
-  ws.send(JSON.stringify({ type: "result", id: request.id, generation: owned.generation, ok: true, result: { text: "hello" } }));
-  assert.deepEqual(await result, { text: "hello" });
-  // Tabless actions carry no generation.
-  incoming = nextRequest(ws);
-  const opened = bridge.request({ action: "open", url: `${origin}/x`, name: "second" });
-  request = await incoming;
-  assert.equal("generation" in request, false);
-  ws.send(JSON.stringify({ type: "result", id: request.id, ok: false, error: "Tab name in use or invalid" }));
-  await assert.rejects(opened, /Browser action failed: Tab name in use or invalid/);
-  // A pending request on a tab that vanishes is rejected; requests on other tabs are not affected.
-  incoming = nextRequest(ws);
-  const pending = bridge.request({ action: "click", selector: "button" }, bound);
-  const rejected = assert.rejects(pending, /tab changed/);
-  await incoming;
-  ws.send(JSON.stringify({ type: "tabs", tabs: [{ ...bound, generation: "generation-3" }, owned] }));
-  await rejected;
-  await assert.rejects(bridge.request({ action: "snapshot" }, bound), /changed or absent/);
-  await assert.rejects(bridge.request({ action: "navigate", url: "https://other.test/" }, bridge.resolveTab("bound")), /origin/);
-  // Large frames are only admitted as a pending screenshot result.
-  const oversized = JSON.stringify({ type: "result", id: "0".repeat(32), ok: true, result: { data: "A".repeat(MAX_MESSAGE_BYTES) } });
-  incoming = nextRequest(ws);
-  const shot = bridge.request({ action: "screenshot", tab: "main" }, owned);
-  request = await incoming;
-  ws.send(oversized.replace("0".repeat(32), request.id).replace('"ok"', `"generation":"${owned.generation}","ok"`));
-  assert.equal(((await shot) as { data: string }).data.length, MAX_MESSAGE_BYTES);
-  const oversizedClose = once(ws, "close");
-  ws.send(oversized);
-  await oversizedClose;
-  assert.deepEqual(bridge.tabs, []);
-  ws = await client(bridge);
-  incoming = nextRequest(ws);
-  const disconnected = assert.rejects(bridge.request({ action: "snapshot" }, bound), /disconnected/);
-  await incoming;
-  ws.close(); await disconnected;
-  ws = await client(bridge);
-  await assert.rejects(bridge.request({ action: "snapshot" }, bound), /timed out/);
-  await delay(10);
-  ws = await client(bridge);
-  incoming = nextRequest(ws);
-  const aborter = new AbortController();
-  const cancelled = assert.rejects(bridge.request({ action: "snapshot" }, bound, aborter.signal), /cancelled/);
-  await incoming; aborter.abort(); await cancelled;
-  await delay(10);
-  ws = await client(bridge);
-  incoming = nextRequest(ws);
-  const shutdown = assert.rejects(bridge.request({ action: "snapshot" }, bound), /shutdown/);
-  await incoming; await bridge.close(); await shutdown;
-  await bridge.close();
-});
-
-test("bridge sends heartbeats only to authenticated clients", { timeout: 3000 }, async t => {
-  const bridge = new BrowserBridge(19345, 1000, 20);
-  t.after(() => bridge.close());
-  assert.throws(() => new BrowserBridge(19346, 1000, 0), /heartbeat/);
-  await bridge.start();
-  const ws = new WebSocket(bridge.connectionInfo().url, { origin: EXT });
-  await once(ws, "open");
-  const received: Array<{ type: string }> = [];
-  ws.on("message", raw => received.push(JSON.parse(raw.toString())));
-  await delay(80);
-  assert.equal(received.length, 0, "unauthenticated client received data");
-  ws.send(JSON.stringify({ type: "auth", token: bridge.connectionInfo().token }));
-  await until(() => received.filter(m => m.type === "heartbeat").length >= 2, "heartbeats");
-  assert.equal(received[0].type, "ready");
-  assert.ok(received.slice(1).every(m => m.type === "heartbeat"));
-  ws.send(JSON.stringify({ type: "tabs", tabs: [bound] }));
+test("relay heartbeats reach only the add-on", { timeout: 3000 }, async t => {
+  const { session } = await relayFor(t, 19345, { heartbeatMs: 20 });
+  const bridge = await session();
+  const ext = await fakeExtension(19345);
+  await until(() => ext.received.filter(m => m.type === "heartbeat").length >= 2, "heartbeats");
+  assert.equal(ext.received[0].type, "ready");
+  ext.tabs(bridge.session, [bound]);
   await until(() => bridge.tabs.length === 1, "tabs");
+  ext.ws.close();
 });
 
 const readManifest = async () => JSON.parse(await readFile(new URL("./browser-addon/manifest.json", import.meta.url), "utf8"));
@@ -220,7 +404,7 @@ const readManifest = async () => JSON.parse(await readFile(new URL("./browser-ad
 test("Chromium MV3 manifest: debugger without host access, fixed CSP, no Firefox leftovers", async () => {
   const manifest = await readManifest();
   assert.equal(manifest.manifest_version, 3);
-  assert.deepEqual(manifest.permissions, ["debugger", "tabs", "tabGroups", "storage"]);
+  assert.deepEqual(manifest.permissions, ["debugger", "tabs", "tabGroups", "storage", "alarms"]);
   for (const key of ["host_permissions", "optional_host_permissions", "optional_permissions", "content_scripts", "browser_specific_settings", "externally_connectable", "web_accessible_resources"]) assert.equal(key in manifest, false, key);
   assert.doesNotMatch(JSON.stringify(manifest), /<all_urls>|:\/\/\*/);
   assert.deepEqual(manifest.background, { service_worker: "background.js" });
@@ -274,12 +458,16 @@ function fakePage(pageOrigin = origin) {
   return page;
 }
 
-async function loadAddon(options: { token: string; tabs?: Array<{ id: number; url: string; title?: string }>; stored?: Record<string, unknown>; page?: any; attachFails?: boolean; gate?: { group?: () => Promise<void>; attach?: (tabId: number) => Promise<void>; remove?: () => Promise<void> } }) {
+const addons: Array<{ dispose: () => void }> = [];
+function disposeAddons() { for (const addon of addons.splice(0)) addon.dispose(); }
+
+async function loadAddon(options: { enabled?: boolean; pairing?: string | null; url?: string; tabs?: Array<{ id: number; url: string; title?: string }>; stored?: Record<string, unknown>; page?: any; attachFails?: boolean; gate?: { group?: () => Promise<void>; attach?: (tabId: number) => Promise<void>; remove?: () => Promise<void> } } = {}) {
   const [background, cdpSource] = await Promise.all(["background.js", "cdp.js"].map(f => readFile(new URL(`./browser-addon/${f}`, import.meta.url), "utf8")));
   const listeners: Record<string, Array<(...args: any[]) => void>> = {};
   const event = (name: string) => ({ addListener: (f: (...args: any[]) => void) => { (listeners[name] ??= []).push(f); } });
   const fire = (name: string, ...args: unknown[]) => { for (const f of listeners[name] ?? []) f(...args); };
-  const stored: Record<string, unknown> = { intent: { url: "ws://127.0.0.1:19347", token: options.token }, ...options.stored };
+  const stored: Record<string, unknown> = { ...options.stored };
+  const local: Record<string, unknown> = { enabled: options.enabled ?? true, pairing: options.pairing === undefined ? currentPairing : options.pairing };
   const tabs = new Map((options.tabs ?? []).map(t => [t.id, { title: "", ...t }]));
   const page = options.page ?? fakePage();
   const calls: Array<{ tabId: number; method: string; params: any }> = [];
@@ -298,7 +486,11 @@ async function loadAddon(options: { token: string; tabs?: Array<{ id: number; ur
       get: async (keys: string[]) => Object.fromEntries(keys.filter(k => k in stored).map(k => [k, stored[k]])),
       set: async (values: Record<string, unknown>) => { Object.assign(stored, values); },
       remove: async (keys: string | string[]) => { for (const k of [keys].flat()) delete stored[k]; }
+    }, local: {
+      get: async (defaults: Record<string, unknown>) => ({ ...defaults, ...local }),
+      set: async (values: Record<string, unknown>) => { Object.assign(local, values); }
     } },
+    alarms: { create: () => {}, onAlarm: event("alarm") },
     tabs: {
       onRemoved: event("removed"), onUpdated: event("updated"), onReplaced: event("replaced"),
       get: async (id: number) => { const tab = tabs.get(id); if (!tab) throw new Error("No tab"); return tab; },
@@ -330,21 +522,24 @@ async function loadAddon(options: { token: string; tabs?: Array<{ id: number; ur
   // Every connection the add-on makes uses its extension origin, like a real browser.
   class ExtensionSocket extends WebSocket { constructor(url: string) { super(url, { origin: EXT }); } }
   const context: any = vm.createContext({
-    Date, URL, TextEncoder, WebSocket: ExtensionSocket, chrome, setTimeout, Promise, JSON,
-    crypto: { randomUUID: (() => { let n = 0; return () => `gen-${++n}`; })() },
+    // Unref'd timers: an add-on retrying a stopped relay never keeps the test process alive.
+    Date, URL, TextEncoder, WebSocket: ExtensionSocket, chrome, Promise, JSON,
+    setTimeout: (f: () => void, ms: number) => setTimeout(f, ms).unref(), clearTimeout,
+    crypto: { randomUUID: (() => { let n = 0; return () => `gen-${++n}`; })(), subtle: webcrypto.subtle, getRandomValues: (array: Uint8Array) => webcrypto.getRandomValues(array) },
+    Uint8Array, parseInt,
     console: { log: (...a: unknown[]) => logs.push(a), error: (...a: unknown[]) => logs.push(a), warn: (...a: unknown[]) => logs.push(a) },
     importScripts: (file: string) => { assert.equal(file, "cdp.js"); vm.runInContext(cdpSource, context); }
   });
-  // The live Pi may own the production port; the test bridge listens on 19347.
-  vm.runInContext(background.replace('"ws://127.0.0.1:19339"', '"ws://127.0.0.1:19347"'), context);
-  return { context, chrome, fire, stored, tabs, page, calls, attached, removed, logs };
+  // The live Pi may own the production port; the test relay listens on 19347.
+  vm.runInContext(background.replace('"ws://127.0.0.1:19339/ext"', JSON.stringify(options.url ?? "ws://127.0.0.1:19347/ext")), context);
+  const addon = { context, chrome, fire, stored, local, tabs, page, calls, attached, removed, logs, dispose: () => vm.runInContext("enabled = false; clearTimeout(reconnectTimer); if (socket) socket.close()", context) };
+  addons.push(addon);
+  return addon;
 }
 
 test("add-on end to end over the real bridge: open, read, real input, evaluate, screenshot, logs and close", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token });
+  const bridge = await joined(t);
+  const addon = await loadAddon();
   await until(() => bridge.connected, "add-on connection");
   assert.deepEqual(bridge.tabs, []);
 
@@ -436,10 +631,8 @@ test("add-on end to end over the real bridge: open, read, real input, evaluate, 
 });
 
 test("add-on binds, origin-locks and never closes user tabs; disconnect closes only unkept Pi tabs", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token, tabs: [{ id: 7, url: `${origin}/inbox` }, { id: 8, url: "chrome://settings" }] });
+  const bridge = await joined(t);
+  const addon = await loadAddon({ tabs: [{ id: 7, url: `${origin}/inbox` }, { id: 8, url: "chrome://settings" }] });
   await until(() => bridge.connected, "add-on connection");
   addon.fire("click", { id: 8, url: "chrome://settings" });
   await delay(20);
@@ -450,15 +643,17 @@ test("add-on binds, origin-locks and never closes user tabs; disconnect closes o
   assert.deepEqual({ ...userTab, generation: "" }, { name: "bound", kind: "bound", origin, generation: "" });
   await assert.rejects(bridge.request({ action: "close" }, userTab), /opened by Pi/);
   // The add-on refuses even if a request bypasses the bridge policy.
-  const raw = vm.runInContext("(m) => run(m, socket)", addon.context);
-  await assert.rejects(raw({ id: "a".repeat(32), deadline: Date.now() + 1000, action: "close", tab: "bound", generation: userTab.generation }), /opened by Pi/);
-  await assert.rejects(raw({ id: "b".repeat(32), deadline: Date.now() + 1000, action: "navigate", url: "https://other.test/", tab: "bound", generation: userTab.generation }), /stay on its origin/);
-  await assert.rejects(raw({ id: "c".repeat(32), deadline: Date.now() + 1000, action: "snapshot", tab: "bound", generation: "stale" }), /Tab changed/);
+  const raw = vm.runInContext("(m) => run({ ...m, incarnation: live.get(m.session) }, socket)", addon.context);
+  const session = bridge.session;
+  await assert.rejects(raw({ id: "a".repeat(32), session, deadline: Date.now() + 1000, action: "close", tab: "bound", generation: userTab.generation }), /opened by Pi/);
+  await assert.rejects(raw({ id: "b".repeat(32), session, deadline: Date.now() + 1000, action: "navigate", url: "https://other.test/", tab: "bound", generation: userTab.generation }), /stay on its origin/);
+  await assert.rejects(raw({ id: "c".repeat(32), session, deadline: Date.now() + 1000, action: "snapshot", tab: "bound", generation: "stale" }), /Tab changed/);
+  await assert.rejects(raw({ id: "d".repeat(32), session: "e".repeat(32), deadline: Date.now() + 1000, action: "snapshot", tab: "bound", generation: userTab.generation }), /not joined/);
 
   await bridge.request({ action: "open", url: `${origin}/a` });
   await bridge.request({ action: "open", url: `${origin}/b`, name: "kept", keep: true });
   assert.deepEqual(bridge.tabs.map(t => t.name).sort(), ["bound", "kept", "main"]);
-  assert.deepEqual(plain(addon.stored.owned), [{ name: "main", tabId: 100, keep: false }, { name: "kept", tabId: 101, keep: true }]);
+  assert.deepEqual(plain(addon.stored.owned), [{ name: "main", session, tabId: 100, keep: false }, { name: "kept", session, tabId: 101, keep: true }]);
 
   // A bound tab that changes origin is released.
   addon.fire("updated", 7, { url: "https://other.test/" });
@@ -473,36 +668,37 @@ test("add-on binds, origin-locks and never closes user tabs; disconnect closes o
   await until(() => addon.removed.length > 0, "cleanup on disconnect");
   assert.deepEqual(addon.removed, [100], "only the unkept Pi tab closes");
   assert.equal(addon.tabs.has(7), true);
-  assert.equal(addon.stored.owned, undefined);
-  assert.equal(JSON.stringify(addon.logs).includes(bridge.connectionInfo().token), false, "token must never be logged");
+  assert.deepEqual(plain(addon.stored.owned), []);
+  assert.deepEqual(addon.logs, [], "the add-on never logs");
 });
 
-test("add-on re-adopts remembered tabs after a worker restart and forgets a rejected token", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
+test("add-on re-adopts remembered tabs of live sessions after a worker restart and closes those of ended sessions", { timeout: 8000 }, async t => {
+  const bridge = await joined(t);
+  const s = bridge.session;
+  const ended = "f".repeat(32);
   const addon = await loadAddon({
-    token: bridge.connectionInfo().token,
-    tabs: [{ id: 7, url: `${origin}/inbox` }, { id: 100, url: "https://app.test/" }, { id: 101, url: "chrome://newtab" }],
-    stored: { binding: { tabId: 7, origin }, owned: [{ name: "main", tabId: 100, keep: false }, { name: "gone", tabId: 999, keep: false }, { name: "internal", tabId: 101, keep: false }, { name: "bound", tabId: 5 }] }
+    tabs: [{ id: 7, url: `${origin}/inbox` }, { id: 100, url: "https://app.test/" }, { id: 101, url: "chrome://newtab" }, { id: 102, url: `${origin}/old` }, { id: 103, url: `${origin}/old-kept` }],
+    stored: { binding: { tabId: 7, origin }, owned: [
+      { name: "main", session: s, tabId: 100, keep: false }, { name: "gone", session: s, tabId: 999, keep: false }, { name: "internal", session: s, tabId: 101, keep: false },
+      { name: "bound", session: s, tabId: 5 }, { name: "nosession", tabId: 104, keep: false },
+      { name: "main", session: ended, tabId: 102, keep: false }, { name: "kept", session: ended, tabId: 103, keep: true }
+    ] }
   });
   await until(() => bridge.tabs.length === 2, "re-adopted tabs");
   assert.deepEqual(bridge.tabs.map(t => [t.name, t.kind, t.origin]).sort(), [["bound", "bound", origin], ["main", "owned", "https://app.test"]]);
-  await bridge.close();
+  await until(() => addon.removed.includes(102), "ended session's tab closed");
+  assert.equal(addon.tabs.has(103), true, "an ended session's kept tab stays open");
+  assert.equal(addon.attached.has(102) || addon.attached.has(103), false);
 
-  const fresh = new BrowserBridge(19347, 2000);
-  t.after(() => fresh.close());
-  await fresh.start();
-  const stale = await loadAddon({ token: "ab".repeat(32) });
-  await until(() => stale.stored.intent === undefined, "stale token forgotten");
-  assert.equal(fresh.connected, false);
+  // Disabled in options: the add-on never connects.
+  const disabled = await loadAddon({ enabled: false });
+  await delay(50);
+  assert.equal(vm.runInContext("socket", disabled.context), null);
 });
 
 test("add-on fails closed when the debugger cannot attach", { timeout: 5000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token, attachFails: true });
+  const bridge = await joined(t);
+  const addon = await loadAddon({ attachFails: true });
   await until(() => bridge.connected, "add-on connection");
   await assert.rejects(bridge.request({ action: "open", url: `${origin}/` }), /Cannot debug this tab/);
   assert.deepEqual(addon.removed, [100], "the unusable tab is closed");
@@ -524,7 +720,7 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
   const pi = { registerCommand: () => {}, registerTool: (tool: any) => tools.push(tool), on: () => {} };
   const requests: Array<{ action: string }> = [];
   const fake = ({
-    start: async () => {}, connected: true, tabs: [bound, owned],
+    start: async () => {}, waitForBrowser: async () => true, connected: true, tabs: [bound, owned],
     resolveTab: (name?: string) => (!name || name === "bound" ? { ...bound } : name === "main" ? { ...owned } : undefined),
     request: async (action: { action: string }) => { requests.push(action); return action.action === "screenshot" ? { data: "QUJD", width: 2, height: 1 } : { ok: 1 }; }
   });
@@ -582,10 +778,8 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
 });
 
 test("a request right after close is not refused as busy", { timeout: 5000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token, gate: { remove: () => delay(300).then(() => {}) } });
+  const bridge = await joined(t);
+  const addon = await loadAddon({ gate: { remove: () => delay(300).then(() => {}) } });
   await until(() => bridge.connected, "add-on connection");
   await bridge.request({ action: "open", url: `${origin}/` });
   assert.deepEqual(await bridge.request({ action: "close" }, bridge.resolveTab("main")), { closed: "main" });
@@ -595,10 +789,8 @@ test("a request right after close is not refused as busy", { timeout: 5000 }, as
 });
 
 test("actual add-on snapshots fit the full UTF-8 response envelope over WebSocket", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token });
+  const bridge = await joined(t);
+  const addon = await loadAddon();
   await until(() => bridge.connected, "add-on connection");
   await bridge.request({ action: "open", url: `${origin}/page` });
   const main = bridge.resolveTab()!;
@@ -627,10 +819,8 @@ test("actual add-on snapshots fit the full UTF-8 response envelope over WebSocke
 });
 
 test("accessibility snapshots never include text typed into fields or editable regions (Chromium AX shapes)", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token });
+  const bridge = await joined(t);
+  const addon = await loadAddon();
   await until(() => bridge.connected, "add-on connection");
   await bridge.request({ action: "open", url: `${origin}/form` });
   const main = bridge.resolveTab()!;
@@ -652,13 +842,11 @@ test("accessibility snapshots never include text typed into fields or editable r
 });
 
 test("disconnect during open, bind or re-adoption leaves no unkept tab or debugger behind", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
+  const bridge = await joined(t);
   let release!: () => void;
   let paused = false;
   const gate = { group: () => { paused = true; return new Promise<void>(resolve => { release = resolve; }); } };
-  const addon = await loadAddon({ token: bridge.connectionInfo().token, gate });
+  const addon = await loadAddon({ gate });
   await until(() => bridge.connected, "add-on connection");
   const open = bridge.request({ action: "open", url: `${origin}/slow` }).catch(error => error);
   await until(() => paused, "open paused in grouping");
@@ -671,9 +859,9 @@ test("disconnect during open, bind or re-adoption leaves no unkept tab or debugg
   assert.equal(addon.attached.has(100), false, "debugger released after the revoked open");
   assert.equal(vm.runInContext("controlled.size", addon.context), 0, "revoked open never registers");
   // A kept tab survives a revoked open, uncontrolled.
-  vm.runInContext("ready = true", addon.context);
+  vm.runInContext(`ready = true; joinSession("${"a".repeat(32)}")`, addon.context);
   paused = false;
-  const keptOpen = vm.runInContext(`openTab(${JSON.stringify({ url: `${origin}/kept`, name: "kept", keep: true })})`, addon.context).catch((error: Error) => error);
+  const keptOpen = vm.runInContext(`openTab(${JSON.stringify({ url: `${origin}/kept`, name: "kept", keep: true, session: "a".repeat(32) })})`, addon.context).catch((error: Error) => error);
   await until(() => paused, "kept open paused");
   vm.runInContext("dropAll('test disconnect')", addon.context);
   release();
@@ -685,7 +873,7 @@ test("disconnect during open, bind or re-adoption leaves no unkept tab or debugg
   // Bind revoked while the debugger attaches.
   let releaseAttach!: () => void;
   let attaching = false;
-  const slow = await loadAddon({ token: bridge.connectionInfo().token, tabs: [{ id: 7, url: `${origin}/inbox` }], gate: { attach: () => { attaching = true; return new Promise<void>(resolve => { releaseAttach = resolve; }); } } });
+  const slow = await loadAddon({ enabled: false, tabs: [{ id: 7, url: `${origin}/inbox` }], gate: { attach: () => { attaching = true; return new Promise<void>(resolve => { releaseAttach = resolve; }); } } });
   vm.runInContext("ready = true", slow.context);
   const bind = vm.runInContext("bindTab({ tabId: 7, origin: 'https://example.com' })", slow.context).catch((error: Error) => error);
   await until(() => attaching, "bind attaching");
@@ -697,10 +885,10 @@ test("disconnect during open, bind or re-adoption leaves no unkept tab or debugg
 
   // Re-adoption revoked midway: the unkept remembered tab still closes.
   attaching = false;
-  // No saved connection: the worker stays idle until the test drives re-adoption directly.
-  const restart = await loadAddon({ token: "ab".repeat(32), tabs: [{ id: 100, url: `${origin}/a` }], stored: { intent: null }, gate: { attach: () => { attaching = true; return new Promise<void>(resolve => { releaseAttach = resolve; }); } } });
+  // Disabled: the worker stays idle until the test drives re-adoption directly.
+  const restart = await loadAddon({ enabled: false, tabs: [{ id: 100, url: `${origin}/a` }], gate: { attach: () => { attaching = true; return new Promise<void>(resolve => { releaseAttach = resolve; }); } } });
   await delay(20);
-  vm.runInContext("pendingOwned = [{ name: 'main', tabId: 100, keep: false, kind: 'owned' }]; ready = true; void readopt()", restart.context);
+  vm.runInContext(`joinSession("${"a".repeat(32)}"); pendingOwned = [{ name: 'main', session: "${"a".repeat(32)}", tabId: 100, keep: false, kind: 'owned' }]; ready = true; void readopt()`, restart.context);
   await until(() => attaching, "re-adoption attaching");
   vm.runInContext("dropAll('test disconnect')", restart.context);
   releaseAttach();
@@ -711,10 +899,8 @@ test("disconnect during open, bind or re-adoption leaves no unkept tab or debugg
 });
 
 test("console, accessibility and evaluate results shrink to the UTF-8 envelope budget instead of failing", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
-  const addon = await loadAddon({ token: bridge.connectionInfo().token });
+  const bridge = await joined(t);
+  const addon = await loadAddon();
   await until(() => bridge.connected, "add-on connection");
   await bridge.request({ action: "open", url: `${origin}/page` });
   const main = bridge.resolveTab()!;
@@ -741,13 +927,11 @@ test("console, accessibility and evaluate results shrink to the UTF-8 envelope b
 });
 
 test("toolbar clicks cancel in-flight binds: a stale bind never restores control after unbinding", { timeout: 8000 }, async t => {
-  const bridge = new BrowserBridge(19347, 2000);
-  t.after(() => bridge.close());
-  await bridge.start();
+  const bridge = await joined(t);
   const waiting = new Map<number, () => void>();
   const gate = { attach: (tabId: number) => tabId === 1 ? new Promise<void>(resolve => waiting.set(1, resolve)) : Promise.resolve() };
   const tabs = [{ id: 1, url: `${origin}/one` }, { id: 2, url: `${origin}/two` }];
-  const addon = await loadAddon({ token: bridge.connectionInfo().token, tabs, gate });
+  const addon = await loadAddon({ tabs, gate });
   await until(() => bridge.connected, "add-on connection");
   const click = (id: number) => addon.fire("click", { id, url: tabs.find(tab => tab.id === id)!.url });
 
@@ -786,7 +970,7 @@ test("toolbar clicks cancel in-flight binds: a stale bind never restores control
 });
 
 test("trimmed console results stay within the byte budget including the dropped count", async () => {
-  const addon = await loadAddon({ token: "ab".repeat(32), stored: { intent: null } });
+  const addon = await loadAddon({ enabled: false });
   const measure = vm.runInContext(`(lastLength, count) => {
     const entries = Array.from({ length: count }, (_, n) => ({ level: "log", text: "x".repeat(n === count - 1 ? lastLength : 500) }));
     const response = { type: "result", id: "a".repeat(32), generation: "123e4567-e89b-12d3-a456-426614174000", ok: true, result: { entries, dropped: 0 } };
@@ -802,4 +986,97 @@ test("trimmed console results stay within the byte budget including the dropped 
     }
   }
   assert.equal(measure(479, 200).bytes <= 48000, true, "Sol's reproduction case");
+});
+
+test("two Pi sessions drive one add-on at once: own tabs, shared bound tab, queued actions, per-session cleanup", { timeout: 8000 }, async t => {
+  const { session } = await relayFor(t, 19347);
+  const a = await session();
+  const addon = await loadAddon({ tabs: [{ id: 7, url: `${origin}/inbox` }] });
+  const b = await session();
+  await until(() => a.connected && b.connected, "both sessions connected");
+  // Both sessions may use the same tab name; each sees only its own Pi-opened tabs.
+  await a.request({ action: "open", url: `${origin}/a` });
+  await b.request({ action: "open", url: "https://b.test/" });
+  await b.request({ action: "open", url: "https://b.test/kept", name: "kept", keep: true });
+  assert.deepEqual(a.tabs.map(t => [t.name, t.origin]), [["main", origin]]);
+  assert.deepEqual(b.tabs.map(t => [t.name, t.origin]).sort(), [["kept", "https://b.test"], ["main", "https://b.test"]]);
+  assert.deepEqual((plain(await a.request({ action: "tabs" })) as { tabs: Array<{ name: string }> }).tabs.map(t => t.name), ["main"]);
+  // A session cannot reach another session's tab, even by name and generation.
+  const bMain = b.resolveTab("main")!;
+  const raw = vm.runInContext("(m) => run({ ...m, incarnation: live.get(m.session) }, socket)", addon.context);
+  await assert.rejects(raw({ id: "a".repeat(32), session: a.session, deadline: Date.now() + 1000, action: "snapshot", tab: "main", generation: bMain.generation }), /Tab changed/);
+
+  // The toolbar-bound tab is shared by every session.
+  addon.fire("click", { id: 7, url: `${origin}/inbox` });
+  await until(() => a.resolveTab("bound") && b.resolveTab("bound"), "bound tab in both sessions");
+  assert.equal(a.resolveTab()!.name, "bound");
+
+  // Simultaneous requests from both sessions are queued, not refused as busy.
+  const [ra, rb] = await Promise.all([a.request({ action: "snapshot" }, a.resolveTab("main")), b.request({ action: "snapshot" }, b.resolveTab("main"))]) as Array<{ url: string }>;
+  assert.equal(ra.url, `${origin}/page`);
+  assert.equal(rb.url, `${origin}/page`);
+
+  // Session A ending closes only its unkept tabs; B keeps its tabs and the bound tab.
+  await a.close();
+  await until(() => addon.removed.length === 1, "A's tab closed");
+  assert.deepEqual(addon.removed, [100]);
+  await delay(30);
+  assert.deepEqual(b.tabs.map(t => t.name).sort(), ["bound", "kept", "main"]);
+  assert.ok(addon.attached.has(7), "bound tab stays controlled");
+  assert.deepEqual(plain(await b.request({ action: "snapshot" }, b.resolveTab("main"))).url, `${origin}/page`);
+  // B ending closes its unkept tab but never the kept one or the user's tab.
+  await b.close();
+  await until(() => addon.removed.length === 2, "B's tab closed");
+  assert.deepEqual(addon.removed.sort(), [100, 101]);
+  assert.equal(addon.tabs.has(102), true);
+  assert.equal(addon.tabs.has(7), true);
+});
+
+test("a request cancelled while queued never runs after its session rejoins under the same id", { timeout: 8000 }, async t => {
+  const { session } = await relayFor(t, 19347);
+  const a = await session();
+  const addon = await loadAddon({ tabs: [{ id: 7, url: `${origin}/inbox` }] });
+  const b = await session();
+  await until(() => a.connected && b.connected, "both sessions connected");
+  addon.page.elements["#go"] = [new FakeElement("BUTTON", {}, addon.page)];
+  addon.fire("click", { id: 7, url: `${origin}/inbox` });
+  await until(() => a.resolveTab("bound") && b.resolveTab("bound"), "shared bound tab");
+  const generation = a.resolveTab("bound")!.generation;
+  // B holds the add-on's queue with a slow wait.
+  const slow = b.request({ action: "waitFor", selector: "#absent", timeoutMs: 500 }, b.resolveTab("bound"));
+  await delay(50);
+  // A queues a click behind it, then cancels before it starts; A rejoins at once under the same session id.
+  const aborter = new AbortController();
+  const click = a.request({ action: "click", selector: "#go" }, a.resolveTab("bound"), aborter.signal).catch(error => error);
+  await delay(50);
+  aborter.abort();
+  assert.match(String(await click), /cancelled/);
+  await until(() => a.connected && a.resolveTab("bound")?.generation === generation, "A rejoined and sees the same bound tab");
+  assert.deepEqual(await slow, { found: false });
+  await delay(50);
+  assert.equal(addon.calls.filter(c => c.method === "Input.dispatchMouseEvent").length, 0, "the cancelled click never dispatched");
+  // A fresh click from the rejoined session works.
+  assert.deepEqual(await a.request({ action: "click", selector: "#go" }, a.resolveTab("bound")), { dispatched: true });
+});
+
+test("one session ending during worker-restart re-adoption does not strand another session's tabs", { timeout: 8000 }, async t => {
+  let releaseAttach!: () => void;
+  let paused = false;
+  const A = "a".repeat(32), B = "b".repeat(32);
+  const addon = await loadAddon({ enabled: false, tabs: [{ id: 100, url: `${origin}/a` }, { id: 101, url: `${origin}/b` }], gate: { attach: tabId => tabId === 100 ? new Promise<void>(resolve => { paused = true; releaseAttach = resolve; }) : Promise.resolve() } });
+  t.after(() => addon.dispose());
+  await delay(20);
+  vm.runInContext(`joinSession("${A}"); joinSession("${B}"); pendingOwned = [{ name: "main", session: "${A}", tabId: 100, keep: false, kind: "owned" }, { name: "main", session: "${B}", tabId: 101, keep: false, kind: "owned" }]; ready = true; void readopt()`, addon.context);
+  await until(() => paused, "A's tab attaching");
+  vm.runInContext(`endSession("${A}")`, addon.context);
+  await delay(10);
+  // B's not-yet-adopted tab stays saved while A's entry is gone.
+  assert.deepEqual(plain(addon.stored.owned), [{ name: "main", session: B, tabId: 101, keep: false }]);
+  releaseAttach();
+  await until(() => vm.runInContext(`controlled.has("${B}/main")`, addon.context), "B's tab re-adopted");
+  assert.equal(vm.runInContext(`controlled.has("${A}/main")`, addon.context), false);
+  assert.equal(addon.attached.has(100), false, "A's debugger released");
+  assert.deepEqual(addon.removed, [100], "A's unkept tab closed");
+  assert.deepEqual(plain(addon.stored.owned), [{ name: "main", session: B, tabId: 101, keep: false }]);
+  assert.equal(vm.runInContext("pendingOwned.length", addon.context), 0);
 });

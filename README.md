@@ -7,7 +7,7 @@ The package root is the workflow core. Each feature is its own extension under `
 | Extension | Provides |
 |---|---|
 | `extensions/workflow` | Stage routing, advisors, model fallback, cross-family review, the `locbt-router` skill policy |
-| `extensions/browser-bridge` | The `browser` tool, `/browser-connect`, `/browser-status` and the Chromium add-on |
+| `extensions/browser-bridge` | The `browser` tool, the shared local browser relay, `/browser-connect`, `/browser-status` and the Chromium add-on |
 | `extensions/herdr-layout` | herdr subagent pane layout |
 | `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
 | `extensions/setup` | `/pi-light setup` and the missing-AgentKit warning |
@@ -17,7 +17,7 @@ The package root is the workflow core. Each feature is its own extension under `
 - **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn and each advisor message, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol, and each advisor falls back to the other.
 - **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). The controller passes that model explicitly when it delegates a review subagent.
-- **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets Pi open and drive its own tabs in your signed-in browser, and use a tab you bind with the toolbar button. Every click, key press, navigation, script and tab open or close asks you first.
+- **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets every running Pi session open and drive its own tabs in your signed-in browser at the same time, and use a tab you bind with the toolbar button. You pair each browser profile once; there is no per-session token. Opening a tab always asks you first. On the tab you bound, clicks, typing, key presses, navigation, scripts and console reads ask each time; on tabs Pi opened, later actions run without asking (see Browser tool below).
 - **herdr subagent layout.** Up to 3 subagents from `pi-herdr-subagents` stack beside your pane. When a 4th starts, all of them move to their own tabs. `PI_HERDR_MAX_SPLIT` changes the limit, and `PI_HERDR_LAYOUT=tab|split` changes the mode.
 
 ## Install
@@ -38,7 +38,9 @@ Setup is safe to rerun, either as `/pi-light setup` inside Pi or as `node extens
 
 Load the browser add-on by hand: open `brave://extensions` (or `chrome://extensions`, `edge://extensions`), turn on Developer mode, choose **Load unpacked**, and pick `~/.pi/agent/pi-light/browser/chromium/`. After an update, rerun setup and click the add-on's reload button there. Firefox is not supported.
 
-Then run `/browser-connect` in Pi and paste the URL and token into the add-on's options page.
+Pair the add-on once per browser profile: run `/browser-connect` in Pi and paste the pairing secret it shows into the add-on's options page. There is no per-session token. Each Pi session joins a shared local relay on `127.0.0.1:19339` when it starts; the first session launches it and it exits about a minute after the last session leaves. The add-on connects to the relay on its own and reconnects whenever Pi runs again, so any number of Pi sessions can use the browser profile at once. The add-on's options page can disable it.
+
+The pairing secret lives in `~/.pi/agent/pi-light/browser-pairing.secret` (readable only by you) and in the add-on's storage. Pi sessions, the relay and the add-on run a challenge-response with it and each checks the relay's proof, so the secret never crosses the socket, and another account's program holding port 19339, or another extension, can neither pose as the relay nor as the add-on. Programs running as your own user can read the file and are not kept out. To re-pair, quit every Pi session, wait a minute for the relay to exit, delete the file, then run `/browser-connect` and paste the new secret. After updating from an add-on version that asked for a token, reload the add-on once (it needs the new `alarms` permission) and pair it.
 
 ### Load only some extensions
 
@@ -83,7 +85,8 @@ Without `tab`, actions use the bound tab, then `main`, then the only controlled 
 How control works and what it costs:
 
 - The add-on uses the browser's debugger API through a fixed list of allowed DevTools methods, and only on tabs you bound or Pi opened. The browser shows a "debugging this browser" bar while it does; dismissing it releases control of the tab.
-- Tabs Pi opened close when Pi disconnects, unless it opened them with `keep`. Pi never closes a tab it did not open.
+- Each Pi session sees only the tabs it opened, plus the tab you bound, which every session shares. Two sessions may each have a tab named `main`. Actions from several sessions run one at a time in the order they arrive.
+- Tabs a session opened close when that session ends, unless it opened them with `keep`. Pi never closes a tab it did not open.
 - A bound tab is released when it leaves its origin; bind it again to continue.
 - Page content, console output and evaluated values are untrusted and can contain private data or instructions. This is not secret isolation.
 
