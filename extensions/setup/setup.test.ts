@@ -126,6 +126,21 @@ test('permission rules: curl safe hosts sit between the curl ask and the later c
   assert.equal(bash['rm *'], 'allow');
 });
 
+test('permission rules: macOS and GitLab guards ask, read-only overrides come after their ask', () => {
+  const { bash, path } = buildPermissionConfig([]).permission;
+  const keys = Object.keys(bash);
+  for (const k of ['brew *', 'diskutil *', 'launchctl *', 'security *', 'osascript *', 'defaults write*', 'glab mr merge*', 'glab mr approve*']) {
+    assert.equal(bash[k], 'ask', k);
+  }
+  assert.equal(bash['security dump-keychain*'].action, 'deny');
+  for (const [allow, ask] of [['brew list*', 'brew *'], ['diskutil list*', 'diskutil *'], ['launchctl list*', 'launchctl *'], ['glab release list*', 'glab release *']]) {
+    assert.equal(bash[allow], 'allow', allow);
+    assert.ok(keys.indexOf(allow) > keys.indexOf(ask), `${allow} after ${ask}`);
+  }
+  assert.equal(path['~/Library/Keychains/*'], 'deny');
+  assert.equal(path['~/Library/Application Support/glab-cli/config.yml'], 'deny');
+});
+
 test('setup writes permission rules once; an edited file is reported, not overwritten', () => {
   const dir = agentHome([]);
   const opts = { env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux' as const, has: () => false, run: () => ({ ok: true, out: '', missing: false }), sshConfig: 'Host mini\n' };
