@@ -34,7 +34,7 @@ import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 
 import { writeContextUsageSidecar } from "./src/context-usage.ts";
-import { startHeartbeat, type Heartbeat } from "./src/heartbeat.ts";
+import { startHeartbeat, watchParentProcess, type Heartbeat, type ParentWatch } from "./src/heartbeat.ts";
 import { getActiveSubagentCount } from "./src/runtime-state.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -74,6 +74,22 @@ export function shouldAutoExitOnAgentEnd(
   }
 
   return true;
+}
+
+/**
+ * Headless children get PI_SUBAGENT_PARENT_PID (the controller). When that
+ * process disappears (e.g. SIGKILL, which runs no cleanup), the child
+ * terminates itself with SIGTERM, pi's own cleanup path for tool processes.
+ */
+export function parentWatchFromEnv(
+  env: Record<string, string | undefined>,
+  terminate: () => void = () => process.kill(process.pid, "SIGTERM"),
+): ParentWatch | undefined {
+  const raw = env.PI_SUBAGENT_PARENT_PID?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) return undefined;
+  const pid = Number.parseInt(raw, 10);
+  if (pid <= 1) return undefined;
+  return { parentAlive: watchParentProcess(pid), onParentGone: terminate };
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -240,7 +256,14 @@ export default function (pi: ExtensionAPI) {
     const heartbeatSession = process.env.PI_SUBAGENT_SESSION;
     const runId = process.env.PI_SUBAGENT_ID;
     if (heartbeatSession && runId && !heartbeat) {
-      heartbeat = startHeartbeat(`${heartbeatSession}.heartbeat`, runId);
+      heartbeat = startHeartbeat(
+        `${heartbeatSession}.heartbeat`,
+        runId,
+        undefined,
+        undefined,
+        undefined,
+        parentWatchFromEnv(process.env),
+      );
     }
 
     const tools = pi.getAllTools();

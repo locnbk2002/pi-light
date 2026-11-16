@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { startHeartbeat, type HeartbeatTimers } from "../src/heartbeat.ts";
+import { spawn } from "node:child_process";
+import { startHeartbeat, watchParentProcess, type HeartbeatTimers } from "../src/heartbeat.ts";
 import { HEARTBEAT_MS } from "../src/limits.ts";
 import {
   watchSubagent,
@@ -118,6 +119,7 @@ function watch(
     liveness: {
       heartbeatFile: `${running.sessionFile}.heartbeat`,
       deadAfterMs: 100_000,
+      firstBeatMs: 100_000,
       stallWarnMs: 100_000,
       maxRunMs: 100_000,
       timeoutGraceMs: 20,
@@ -155,6 +157,40 @@ describe("watcher liveness", () => {
     assert.notEqual(result, "pending");
     assert.equal((result as SubagentOutcome).kind, "crashed");
     assert.match((result as any).reason, /no heartbeat/);
+  });
+
+  it("fix 6: a dead heartbeat stops the run (kill settles) before crashed is reported", async () => {
+    const dir = tempDir();
+    const running = makeRun(dir);
+    writeFileSync(`${running.sessionFile}.heartbeat`, JSON.stringify({ runId: "run-1", at: 1 }));
+    let killed = false;
+    let killedBeforeOutcome = false;
+    const { outcome } = watch(
+      running,
+      {
+        deadAfterMs: 100,
+        kill: async () => {
+          await sleep(30);
+          killed = true;
+        },
+      },
+      { now: 0 },
+    );
+    void outcome.then(() => (killedBeforeOutcome = killed));
+    const result = await settledWithin(outcome, 2_000);
+    assert.equal((result as SubagentOutcome).kind, "crashed");
+    assert.equal(killedBeforeOutcome, true, "ownership is released only after the kill completed");
+  });
+
+  it("fix 6: the first beat gets firstBeatMs, later beats deadAfterMs", async () => {
+    const dir = tempDir();
+    const running = makeRun(dir);
+    const { outcome, abort } = watch(running, { deadAfterMs: 100, firstBeatMs: 100_000 }, { now: 0 });
+    assert.equal(await settledWithin(outcome, 300), "pending", "a slow start is not a dead child");
+    writeFileSync(`${running.sessionFile}.heartbeat`, JSON.stringify({ runId: "run-1", at: 1 }));
+    const result = await settledWithin(outcome, 2_000);
+    assert.equal((result as SubagentOutcome).kind, "crashed", "after the first beat the normal window applies");
+    abort.abort();
   });
 
   it("a stale foreign heartbeat does not crash a resumed run that beats", async () => {
@@ -215,5 +251,48 @@ describe("watcher liveness", () => {
     assert.equal(calls.interrupt, 0);
     abort.abort();
     await outcome;
+  });
+});
+
+describe("fix 12: headless children exit when their controller disappears", () => {
+  function fakeTimers() {
+    let tick: (() => void) | null = null;
+    const timers: HeartbeatTimers = {
+      setInterval(fn) {
+        tick = fn;
+        return 1;
+      },
+      clearInterval() {
+        tick = null;
+      },
+    };
+    return { timers, tick: () => tick?.() };
+  }
+
+  it("the heartbeat loop calls onParentGone once when the parent check fails", () => {
+    const file = join(tempDir(), "s.jsonl.heartbeat");
+    let parentAlive = true;
+    let gone = 0;
+    const t = fakeTimers();
+    startHeartbeat(file, "run-1", Date.now, t.timers, HEARTBEAT_MS, {
+      parentAlive: () => parentAlive,
+      onParentGone: () => void (gone += 1),
+    });
+    t.tick();
+    assert.equal(gone, 0);
+    parentAlive = false;
+    t.tick();
+    t.tick();
+    assert.equal(gone, 1);
+  });
+
+  it("watchParentProcess tracks a real pid and is not fooled by its disappearance", async () => {
+    const parent = spawn("sleep", ["30"], { stdio: "ignore" });
+    const alive = watchParentProcess(parent.pid!);
+    assert.equal(alive(), true);
+    parent.kill("SIGKILL");
+    await new Promise((resolve) => parent.once("exit", resolve));
+    assert.equal(alive(), false);
+    assert.equal(watchParentProcess(2 ** 30)(), false, "an absent pid is gone from the start");
   });
 });

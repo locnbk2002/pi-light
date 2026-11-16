@@ -125,7 +125,10 @@ export interface HeadlessProbe {
 
 export interface LivenessDeps {
   heartbeatFile: string;
+  /** No fresh beat for this long (after the first beat) → dead. */
   deadAfterMs: number;
+  /** Window for the run's first beat (startup: package installs, slow extension loads). */
+  firstBeatMs: number;
   stallWarnMs: number;
   maxRunMs: number;
   timeoutGraceMs: number;
@@ -135,7 +138,10 @@ export interface LivenessDeps {
   onStall(info: { idleMs: number }): void;
   /** Graceful stop request (headless: SIGINT to the group; herdr: Escape). */
   interrupt(): void | Promise<void>;
-  /** Hard stop after the grace period (headless: killTree; herdr: close pane). */
+  /**
+   * Hard stop (headless: TERM→KILL of the owned tree; herdr: close pane).
+   * Awaited before a dead-heartbeat or timed-out outcome is reported.
+   */
   kill(): void | Promise<void>;
 }
 
@@ -174,7 +180,7 @@ export function watchSubagent(
 
     let done = false;
     let paneEventSeen = false;
-    /** Run limit hit: only the grace timer may settle from now on. */
+    /** Run limit hit or heartbeat lost: only the stop path may settle from now on. */
     let timingOut = false;
     const cleanups: Array<() => void> = [];
 
@@ -543,19 +549,24 @@ export function watchSubagent(
           exitData?.type === "done" && typeof exitData.summary === "string" && exitData.summary.trim()
             ? exitData.summary.trim()
             : null;
-        void Promise.resolve()
-          .then(() => liveness.kill())
-          .catch(() => {});
-        finish(
-          {
-            kind: "timed-out",
-            summary: sidecarSummary ?? readSummary(),
-            elapsedMs: t - startedAt - suspendedTotal,
-          },
-          true,
-        );
+        const outcome: SubagentOutcome = {
+          kind: "timed-out",
+          summary: sidecarSummary ?? readSummary(),
+          elapsedMs: t - startedAt - suspendedTotal,
+        };
+        void stopThenFinish(liveness, outcome, true);
       }, liveness.timeoutGraceMs);
       cleanups.push(() => clearTimeout(grace));
+    }
+
+    /** Stop the run and wait for it before reporting, so ownership is never dropped while it lives. */
+    async function stopThenFinish(liveness: LivenessDeps, outcome: SubagentOutcome, consumeSidecars: boolean) {
+      try {
+        await liveness.kill();
+      } catch {
+        // best-effort; the outcome is still reported
+      }
+      finish(outcome, consumeSidecars);
     }
 
     function livenessTick(liveness: LivenessDeps): void {
@@ -583,8 +594,12 @@ export function watchSubagent(
         }
       }
 
-      if (t - lastAliveMark > liveness.deadAfterMs) {
-        finish(
+      const window = lastHeartbeatAt === null ? liveness.firstBeatMs : liveness.deadAfterMs;
+      if (t - lastAliveMark > window) {
+        // Presumed dead, but possibly alive with a stalled event loop: stop it first.
+        timingOut = true;
+        void stopThenFinish(
+          liveness,
           {
             kind: "crashed",
             exitCode: -1,

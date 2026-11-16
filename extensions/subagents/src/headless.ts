@@ -3,6 +3,12 @@
 // the whole tree: it drains stdout/stderr into a bounded in-memory tail (crash
 // diagnostics) and an on-disk `<session>.log`, and kills every descendant on
 // interrupt, timeout, shutdown or /reload.
+//
+// Ownership (OwnedTree): pi's bash tool runs commands in their own process
+// groups, and they are reparented away once pi dies, so a group signal plus a
+// later /proc walk can miss them. The tree records every member (pid + kernel
+// start time, so a reused pid is never signalled) before each signal, and a
+// run's ownership is released only after all recorded members are gone.
 import { spawn } from "node:child_process";
 import { createWriteStream, readdirSync, readFileSync, type WriteStream } from "node:fs";
 
@@ -20,6 +26,10 @@ export interface HeadlessChild {
   tail(): string;
   /** Called once when the process exits (immediately if it already has). */
   onExit(listener: () => void): () => void;
+  /** Resolves true once the process exited, false after `ms` without exit. */
+  waitExit(ms: number): Promise<boolean>;
+  /** Every process this run started, recorded before each signal. */
+  tree: OwnedTree;
 }
 
 /** Fixed-size byte ring: keeps only the newest `capacity` bytes. */
@@ -98,18 +108,33 @@ export function startHeadless(opts: { launchScriptFile: string; sessionFile: str
   // The controller must not stay alive just for its children (it kills them on shutdown).
   child.unref();
 
+  const onExit = (listener: () => void) => {
+    if (code !== null) {
+      queueMicrotask(listener);
+      return () => {};
+    }
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  };
   return {
     pid: child.pid ?? -1,
     exitCode: () => code,
     tail: () => ring.toString(),
-    onExit(listener) {
-      if (code !== null) {
-        queueMicrotask(listener);
-        return () => {};
-      }
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
+    onExit,
+    waitExit: (ms) =>
+      new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => {
+          off();
+          resolve(false);
+        }, ms);
+        const off = onExit(() => {
+          clearTimeout(timer);
+          resolve(true);
+        });
+      }),
+    tree: new OwnedTree(child.pid ?? -1),
   };
 }
 
@@ -152,28 +177,93 @@ function signal(target: number, sig: NodeJS.Signals): void {
   }
 }
 
-/**
- * Kill a headless process tree. SIGTERM goes to the group first (print mode
- * then kills its own detached tool children); after `escalateMs` SIGKILL goes
- * to the group and to every descendant found before the TERM (bash tool
- * children run in their own process groups and get reparented once their
- * parent dies, so they must be captured up front) or still present now.
- */
-export async function killTree(pid: number, escalateMs = KILL_ESCALATE_MS): Promise<void> {
-  if (!Number.isInteger(pid) || pid <= 1) return;
-  const initial = listDescendants(pid);
-  signal(-pid, "SIGTERM");
-  await new Promise((resolve) => setTimeout(resolve, escalateMs));
-  const remaining = new Set([...initial, ...listDescendants(pid)]);
-  signal(-pid, "SIGKILL");
-  signal(pid, "SIGKILL");
-  for (const descendant of remaining) signal(descendant, "SIGKILL");
+/** Start time and process group of a live process; null when gone or a zombie. */
+function procInfo(pid: number): { start: string; pgid: number } | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (fields[0] === "Z" || fields[19] === undefined) return null;
+    return { start: fields[19], pgid: Number.parseInt(fields[2], 10) };
+  } catch {
+    return null;
+  }
 }
 
-/** Graceful interrupt: SIGINT to the group so pi aborts its running tools. */
-export function interruptTree(pid: number): void {
-  if (!Number.isInteger(pid) || pid <= 1) return;
-  signal(-pid, "SIGINT");
+/** How long to wait for SIGKILLed members to disappear. */
+const KILL_CONFIRM_MS = 2_000;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The process tree a headless run owns: the group leader plus every
+ * descendant seen at any capture. Members are pinned to their start time, so
+ * a pid reused by an unrelated process is never signalled.
+ */
+export class OwnedTree {
+  private readonly members = new Map<number, string>();
+
+  constructor(readonly leader: number) {
+    if (Number.isInteger(leader) && leader > 1) this.add(leader);
+    this.capture();
+  }
+
+  private add(pid: number): void {
+    if (this.members.has(pid)) return;
+    const info = procInfo(pid);
+    if (info) this.members.set(pid, info.start);
+  }
+
+  /** Recorded members that are still the same live process. */
+  live(): number[] {
+    return [...this.members].filter(([pid, start]) => procInfo(pid)?.start === start).map(([pid]) => pid);
+  }
+
+  /** Record every current descendant of every live member (walks only verified roots). */
+  capture(): void {
+    for (const root of this.live()) {
+      for (const pid of listDescendants(root)) this.add(pid);
+    }
+  }
+
+  private signalGroup(sig: NodeJS.Signals): void {
+    // Only while a recorded member still belongs to the leader's group: never a recycled pgid.
+    if (this.live().some((pid) => procInfo(pid)?.pgid === this.leader)) signal(-this.leader, sig);
+  }
+
+  /** Capture, then signal the group (SIGINT: pi aborts; the tree stays owned). */
+  signal(sig: NodeJS.Signals): void {
+    this.capture();
+    this.signalGroup(sig);
+  }
+
+  private async waitGone(ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (this.live().length > 0) {
+      if (Date.now() >= deadline) return false;
+      await sleep(Math.min(25, Math.max(1, deadline - Date.now())));
+    }
+    return true;
+  }
+
+  /**
+   * SIGTERM to the group (print mode kills its own tool children), then
+   * SIGKILL to the group and every recorded member still alive after
+   * `escalateMs`. Resolves true once every member is gone.
+   */
+  async stop(escalateMs = KILL_ESCALATE_MS): Promise<boolean> {
+    this.capture();
+    if (this.live().length === 0) return true;
+    this.signalGroup("SIGTERM");
+    if (await this.waitGone(escalateMs)) return true;
+    this.capture();
+    this.signalGroup("SIGKILL");
+    for (const pid of this.live()) signal(pid, "SIGKILL");
+    return this.waitGone(KILL_CONFIRM_MS);
+  }
+}
+
+/** Stop a process tree not started by startHeadless (descendants captured before the first signal). */
+export function killTree(pid: number, escalateMs = KILL_ESCALATE_MS): Promise<boolean> {
+  return new OwnedTree(pid).stop(escalateMs);
 }
 
 /** Adapt a headless child to the watcher's herdr-shaped client/stream seams. */

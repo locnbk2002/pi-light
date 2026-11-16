@@ -35,15 +35,11 @@ import {
   type HerdrClient,
 } from "./src/herdr/client.ts";
 import { createHerdrEventStream } from "./src/herdr/events.ts";
-import {
-  headlessWatcherDeps,
-  interruptTree,
-  killTree,
-  startHeadless,
-  type HeadlessChild,
-} from "./src/headless.ts";
+import { headlessWatcherDeps, startHeadless, type HeadlessChild } from "./src/headless.ts";
 import {
   DEAD_AFTER_MS,
+  FIRST_BEAT_MS,
+  KILL_ESCALATE_MS,
   MAX_RUN_MS,
   POLL_MS,
   STALL_WARN_MS,
@@ -117,10 +113,22 @@ function getModuleAbortSignal(): AbortSignal {
 
 type WatcherStream = WatcherDeps["stream"] & { close(): void };
 
+/** Liveness and kill timings (fixed in production, shortened by tests). */
+interface RuntimeLimits {
+  pollMs: number;
+  deadAfterMs: number;
+  firstBeatMs: number;
+  stallWarnMs: number;
+  maxRunMs: number;
+  timeoutGraceMs: number;
+  escalateMs: number;
+}
+
 interface RuntimeDeps {
   client: HerdrClient;
   watch: typeof watchSubagent;
   createStream: (socketPath: string, signal: AbortSignal) => WatcherStream;
+  limits: RuntimeLimits;
 }
 
 function defaultDeps(): RuntimeDeps {
@@ -128,6 +136,15 @@ function defaultDeps(): RuntimeDeps {
     client: createHerdrClient(),
     watch: watchSubagent,
     createStream: (socketPath, signal) => createHerdrEventStream({ socketPath, signal }),
+    limits: {
+      pollMs: POLL_MS,
+      deadAfterMs: DEAD_AFTER_MS,
+      firstBeatMs: FIRST_BEAT_MS,
+      stallWarnMs: STALL_WARN_MS,
+      maxRunMs: MAX_RUN_MS,
+      timeoutGraceMs: TIMEOUT_GRACE_MS,
+      escalateMs: KILL_ESCALATE_MS,
+    },
   };
 }
 
@@ -208,8 +225,36 @@ function getEventStream(): WatcherStream {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
-/** Headless process handles of running subagents, keyed by run id (owned: killed on shutdown). */
+/**
+ * Headless process handles, keyed by run id. An entry is the ownership record:
+ * it is removed only after the run's whole recorded tree is gone.
+ */
 const headlessChildren = new Map<string, HeadlessChild>();
+
+/** TERM→KILL the run's owned tree (no-op when nothing it recorded is alive). */
+async function stopOwnedTree(id: string): Promise<void> {
+  const child = headlessChildren.get(id);
+  if (!child) return;
+  await child.tree.stop(deps.limits.escalateMs);
+}
+
+/**
+ * Release a finished run's process ownership: let a still-exiting child end
+ * on its own (bounded), then stop anything it recorded that is still alive,
+ * e.g. tool processes captured before an interrupt. Cancelled runs (shutdown,
+ * /reload) are stopped at once.
+ */
+async function releaseOwnership(id: string, cancelled: boolean): Promise<void> {
+  const child = headlessChildren.get(id);
+  if (!child) return;
+  try {
+    if (!cancelled && child.exitCode() === null) await child.waitExit(deps.limits.escalateMs);
+    await child.tree.stop(deps.limits.escalateMs);
+  } catch {
+    // best-effort: the result is still delivered
+  }
+  if (headlessChildren.get(id) === child) headlessChildren.delete(id);
+}
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
@@ -372,12 +417,14 @@ function herdrBackend(): WatcherBackend {
 
 function livenessFor(pi: ExtensionAPI, running: RunningSubagent): NonNullable<WatcherDeps["liveness"]> {
   const headless = running.backend === "headless";
+  const limits = deps.limits;
   return {
     heartbeatFile: `${running.sessionFile}.heartbeat`,
-    deadAfterMs: DEAD_AFTER_MS,
-    stallWarnMs: STALL_WARN_MS,
-    maxRunMs: MAX_RUN_MS,
-    timeoutGraceMs: TIMEOUT_GRACE_MS,
+    deadAfterMs: limits.deadAfterMs,
+    firstBeatMs: limits.firstBeatMs,
+    stallWarnMs: limits.stallWarnMs,
+    maxRunMs: limits.maxRunMs,
+    timeoutGraceMs: limits.timeoutGraceMs,
     exemptFromMaxRun: running.interactive,
     onStall({ idleMs }) {
       pi.sendMessage(
@@ -394,11 +441,11 @@ function livenessFor(pi: ExtensionAPI, running: RunningSubagent): NonNullable<Wa
       updateWidget();
     },
     interrupt() {
-      if (headless) interruptTree(running.pid ?? -1);
+      if (headless) headlessChildren.get(running.id)?.tree.signal("SIGINT");
       else return deps.client.paneSendKeys(running.paneId, ["esc"]);
     },
     kill() {
-      if (headless) return killTree(running.pid ?? -1);
+      if (headless) return stopOwnedTree(running.id);
       return deps.client.paneClose(running.paneId);
     },
   };
@@ -430,9 +477,10 @@ function armWatcher(
   markSubagentActive(running.id);
   startWidgetRefresh();
 
-  const settle = () => {
+  // Process ownership is released (tree confirmed gone) before the run is forgotten.
+  const settle = async (cancelled: boolean) => {
+    await releaseOwnership(running.id, cancelled);
     runningSubagents.delete(running.id);
-    headlessChildren.delete(running.id);
     markSubagentInactive(running.id);
     updateWidget();
   };
@@ -441,11 +489,11 @@ function armWatcher(
     .watch(running, {
       ...backend,
       signal: watcherAbort.signal,
-      pollIntervalMs: POLL_MS,
+      pollIntervalMs: deps.limits.pollMs,
       liveness: livenessFor(pi, running),
     })
-    .then((outcome) => {
-      settle();
+    .then(async (outcome) => {
+      await settle(outcome.kind === "cancelled");
       const contextUsage =
         outcome.kind === "cancelled"
           ? null
@@ -458,8 +506,8 @@ function armWatcher(
       if (message && deliver) pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
       return message;
     })
-    .catch((err: any) => {
-      settle();
+    .catch(async (err: any) => {
+      await settle(true);
       const message: SubagentSteerMessage = {
         customType: "subagent_result",
         content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -1120,8 +1168,9 @@ async function handleSubagentInterrupt(params: { id?: string; name?: string }) {
 
   const running = resolved.running;
   if (running.backend === "headless") {
-    // SIGINT to the process group: pi aborts its running tools.
-    interruptTree(running.pid ?? -1);
+    // SIGINT to the process group (pi aborts its running tools), after
+    // recording the tree so tools it leaves behind are still owned.
+    headlessChildren.get(running.id)?.tree.signal("SIGINT");
     return {
       content: [
         { type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` },
@@ -1374,11 +1423,14 @@ function registerCommands(pi: ExtensionAPI): void {
   });
 }
 
-/** Kill every running headless child and report it as cancelled. */
-function shutdownHeadlessChildren(pi: ExtensionAPI): void {
+/**
+ * Report every running headless child as cancelled and stop every owned tree.
+ * Resolves only after TERM→KILL escalation: Pi exits right after shutdown
+ * handlers return, which would cancel a pending escalation timer.
+ */
+async function shutdownHeadlessChildren(pi: ExtensionAPI): Promise<void> {
   for (const running of runningSubagents.values()) {
     if (running.backend !== "headless") continue;
-    void killTree(running.pid ?? -1).catch(() => {});
     try {
       pi.sendMessage(
         {
@@ -1391,7 +1443,17 @@ function shutdownHeadlessChildren(pi: ExtensionAPI): void {
       );
     } catch {}
   }
-  headlessChildren.clear();
+  const owned = [...headlessChildren];
+  await Promise.all(
+    owned.map(([id, child]) =>
+      child.tree
+        .stop(deps.limits.escalateMs)
+        .catch(() => false)
+        .then(() => {
+          if (headlessChildren.get(id) === child) headlessChildren.delete(id);
+        }),
+    ),
+  );
 }
 
 // ── extension entry ─────────────────────────────────────────────────────────
@@ -1449,10 +1511,10 @@ export default function herdrSubagents(pi: ExtensionAPI) {
       });
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     stopWidgetRefresh();
     // Owned process trees never outlive their controller (shutdown and /reload).
-    shutdownHeadlessChildren(pi);
+    const stopping = shutdownHeadlessChildren(pi);
     for (const running of runningSubagents.values()) {
       running.abortController?.abort();
       markSubagentInactive(running.id);
@@ -1463,6 +1525,7 @@ export default function herdrSubagents(pi: ExtensionAPI) {
     if (stream) stream.close();
     (globalThis as any)[STREAM_KEY] = null;
     ((globalThis as any)[ABORT_KEY] as AbortController).abort();
+    await stopping;
   });
 
   // Steer message renderers (registered regardless of activation so past

@@ -73,6 +73,8 @@ export interface LaunchPlanContext {
   subagentDonePath?: string;
   /** Launch as a background `pi -p` process instead of a herdr pane. */
   headless?: boolean;
+  /** Controller pid a headless child watches (default process.pid); it exits when this one is gone. */
+  parentPid?: number;
   /** Parent's active-tool ceiling (pi.getActiveTools() at call time). Always applied. */
   toolCeiling: ToolCeiling;
   /**
@@ -150,12 +152,15 @@ function commentSafe(value: string): string {
 
 export { shellEscape };
 
-/** Headless children run with no pane (and must never block on a hold-open `read`). */
-function backendExports(headless: boolean): string[] {
+/**
+ * Headless children run with no pane (and must never block on a hold-open
+ * `read`) and follow their controller's lifetime via PI_SUBAGENT_PARENT_PID.
+ */
+function backendExports(headless: boolean, parentPid: number): string[] {
   return headless
-    ? ["export PI_HERDR_HOLD_OPEN_SECS=0"]
+    ? ["export PI_HERDR_HOLD_OPEN_SECS=0", `export PI_SUBAGENT_PARENT_PID=${shellEscape(String(parentPid))}`]
     : // The pane id is only known inside the pane — forward herdr's injected env.
-      ['export PI_SUBAGENT_PANE="${HERDR_PANE_ID:-}"'];
+      ['export PI_SUBAGENT_PANE="${HERDR_PANE_ID:-}"', "unset PI_SUBAGENT_PARENT_PID"];
 }
 
 function wrapperEnv(
@@ -517,7 +522,7 @@ export function buildLaunchPlan(
       env,
     }),
   );
-  exports.push(...backendExports(ctx.headless === true));
+  exports.push(...backendExports(ctx.headless === true, ctx.parentPid ?? process.pid));
 
   // ── Wrapper script ──
   const { content: scriptContent, holdOpenSecs } = buildWrapperScript({
@@ -680,7 +685,7 @@ export function buildResumeLaunchPlan(
       env,
     }),
   );
-  exports.push(...backendExports(ctx.headless === true));
+  exports.push(...backendExports(ctx.headless === true, ctx.parentPid ?? process.pid));
 
   const { content: scriptContent, holdOpenSecs } = buildWrapperScript({
     env: wrapperEnv(env, ctx.headless === true),

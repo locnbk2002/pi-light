@@ -7,6 +7,8 @@ export const HEARTBEAT_MS = 15_000;
 export const POLL_MS = 5_000;
 /** No fresh heartbeat for this long → the child is considered dead. */
 export const DEAD_AFTER_MS = 60_000;
+/** Window for a run's first heartbeat (startup can install packages or load slow extensions). */
+export const FIRST_BEAT_MS = 180_000;
 /** No child activity for this long → one non-terminal stall warning. */
 export const STALL_WARN_MS = 600_000;
 /** Hard run limit for autonomous children (interactive children are exempt). */
