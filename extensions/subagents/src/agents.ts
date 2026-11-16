@@ -283,8 +283,11 @@ export function resolveLaunchBehavior(
 export function resolveEffectiveInteractive(
   params: SubagentSpawnParams,
   agentDefs: AgentDefaults | null,
+  opts: { headless?: boolean } = {},
 ): boolean {
   if (params.interactive != null) return params.interactive;
+  // pi-light: a bare background spawn (no agent definition) runs one-shot.
+  if (opts.headless && !agentDefs) return false;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
 }

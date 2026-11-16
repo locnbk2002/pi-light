@@ -166,6 +166,8 @@ export const BLOCKED_ACTIONS_INSTRUCTION =
 /** Extra system-prompt text appended to every child launch (empty → none). */
 export function buildRuntimePrompt(opts: { headless: boolean; agent?: string }): string {
   const parts: string[] = [];
+  // pi-permission-system matches the attribute form (ACTIVE_AGENT_TAG_REGEX).
+  if (opts.agent) parts.push(`<active_agent name="${opts.agent.replace(/["'<>]/g, "")}">`);
   if (opts.headless) parts.push(BLOCKED_ACTIONS_INSTRUCTION);
   return parts.join("\n\n");
 }
@@ -364,8 +366,10 @@ export function buildLaunchPlan(
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
-  const interactive = resolveEffectiveInteractive(params, agentDefs);
-  const autoExit = agentDefs?.autoExit ?? false;
+  const headless = ctx.headless === true;
+  const interactive = resolveEffectiveInteractive(params, agentDefs, { headless });
+  // A bare headless spawn is one-shot: non-interactive and auto-exit.
+  const autoExit = agentDefs?.autoExit ?? (headless && !agentDefs && !interactive);
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);
   const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(

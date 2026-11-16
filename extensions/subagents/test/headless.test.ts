@@ -177,6 +177,48 @@ describe("headless: launch plan", () => {
   });
 });
 
+// Copied from pi-permission-system src/session/active-agent.ts (ACTIVE_AGENT_TAG_REGEX).
+const ACTIVE_AGENT_TAG_REGEX = /<active_agent\s+name=["']([^"']+)["'][^>]*>/i;
+
+describe("headless: agent identity and bare spawns", () => {
+  function runtimePrompt(plan: ReturnType<typeof buildLaunchPlan>): string {
+    const files: string[] = [];
+    plan.piArgv.forEach((arg, i) => {
+      if (arg === "--append-system-prompt") files.push(plan.piArgv[i + 1]);
+    });
+    return files.map((path) => plan.files.find((f) => f.path === path)!.content).join("\n");
+  }
+
+  it('<active_agent name="debugger"> is present for agent: debugger (headless and herdr), absent without an agent', () => {
+    const defs = { autoExit: true };
+    for (const headless of [true, false]) {
+      const prompt = runtimePrompt(
+        buildLaunchPlan({ name: "D", task: "t", agent: "debugger" }, defs, { ...planCtx(), headless }),
+      );
+      assert.ok(prompt.includes('<active_agent name="debugger">'), prompt);
+      assert.equal(ACTIVE_AGENT_TAG_REGEX.exec(prompt)?.[1], "debugger");
+    }
+    for (const headless of [true, false]) {
+      const prompt = runtimePrompt(buildLaunchPlan({ name: "D", task: "t" }, null, { ...planCtx(), headless }));
+      assert.ok(!prompt.includes("<active_agent"), prompt);
+    }
+  });
+
+  it("a bare headless spawn plans interactive === false with auto-exit; herdr is unchanged", () => {
+    const headless = buildLaunchPlan({ name: "B", task: "t" }, null, { ...planCtx(), headless: true });
+    assert.equal(headless.interactive, false);
+    assert.equal(headless.autoExit, true);
+    const herdr = buildLaunchPlan({ name: "B", task: "t" }, null, planCtx());
+    assert.equal(herdr.interactive, true);
+    assert.equal(herdr.autoExit, false);
+  });
+
+  it("an agent without auto-exit (advisor) still plans interactive when headless", () => {
+    const plan = buildLaunchPlan({ name: "A", task: "t", agent: "advisor" }, {}, { ...planCtx(), headless: true });
+    assert.equal(plan.interactive, true);
+  });
+});
+
 describe("headless: classification", () => {
   function runFor(plan: ReturnType<typeof buildLaunchPlan>): RunningSubagent {
     return {
@@ -305,6 +347,27 @@ describe("headless: subagent tool", () => {
     } finally {
       process.argv.pop();
     }
+  });
+
+  it("a bare spawn with no agent runs one-shot in the background", async () => {
+    const t = setup();
+    const steer = t.nextSent();
+    const result = await t.tool("subagent").execute("t1", { name: "Bare", task: "t" }, undefined, undefined, t.ctx);
+    assert.equal(result.details.status, "started");
+    assert.match((await steer).content, /final answer/);
+  });
+
+  it("an advisor-style agent (no auto-exit) outside herdr is refused", async () => {
+    writeFileSync(join(root, "profile", "agents", "advisor.md"), "---\nname: advisor\n---\nAdvise.\n");
+    const t = setup();
+    const result = await t.tool("subagent").execute(
+      "t1",
+      { name: "Advisor", task: "t", agent: "advisor" },
+      undefined,
+      undefined,
+      t.ctx,
+    );
+    assert.equal(result.details.error, "interactive needs herdr");
   });
 
   it("an interactive agent outside herdr is refused and nothing is spawned", async () => {
