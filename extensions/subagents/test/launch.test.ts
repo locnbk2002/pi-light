@@ -8,7 +8,6 @@ import { tmpdir } from "node:os";
 import {
   buildLaunchPlan,
   buildPiPromptArgs,
-  buildSubagentToolAllowlist,
   shellEscape,
   type LaunchPlan,
   type LaunchPlanContext,
@@ -70,6 +69,8 @@ function makeCtx(fx: Fixture, overrides?: Partial<LaunchPlanContext>): LaunchPla
     env: fx.env,
     id: "abcd1234",
     now: new Date("2026-07-06T12:00:00.000Z"),
+    toolCeiling: { active: ["read", "bash", "edit", "write"] },
+    projectTrusted: true,
     ...overrides,
   };
 }
@@ -318,9 +319,10 @@ describe("launch plan: pi argv", () => {
     assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,caller_ping,subagent_done");
   });
 
-  it("omits --tools without an explicit restriction", () => {
+  it("without a requested restriction --tools is the parent's active set", () => {
     const fx = makeFixture();
-    assert.ok(!plan(fx).piArgv.includes("--tools"));
+    const argv = plan(fx).piArgv;
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,edit,write,caller_ping,subagent_done");
   });
 
   it("passes skill prompts with the empty-separator trick for artifact delivery", () => {
@@ -433,18 +435,6 @@ describe("ported helpers", () => {
     assert.equal(shellEscape("plain"), "'plain'");
     assert.equal(shellEscape("it's"), "'it'\\''s'");
     assert.equal(shellEscape(""), "''");
-  });
-
-  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
-    assert.equal(
-      buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
-    );
-  });
-
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(buildSubagentToolAllowlist(undefined), null);
-    assert.equal(buildSubagentToolAllowlist(""), null);
   });
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {

@@ -38,6 +38,8 @@ function fixture() {
     },
     id: "run12345",
     now: new Date("2026-11-16T12:00:00.000Z"),
+    toolCeiling: { active: ["read", "bash"] },
+    projectTrusted: true,
   };
   return { root, agentDir, cwd, ctx };
 }
@@ -75,7 +77,11 @@ describe("child env: launch scripts", () => {
   it("resume writes both unset hints and an explicit AUTO_EXIT", () => {
     const fx = fixture();
     const script = scriptOf(
-      buildResumeLaunchPlan({ sessionPath: join(fx.root, "child.jsonl"), autoExit: false }, fx.ctx),
+      buildResumeLaunchPlan(
+        { sessionPath: join(fx.root, "child.jsonl"), autoExit: false },
+        { version: 1, agent: null, denyTools: [], tools: ["read"] },
+        fx.ctx,
+      ),
     );
     assert.match(script, /^export PI_SUBAGENT_AUTO_EXIT=0$/m);
     assert.match(script, /^unset PI_SUBAGENT_PARENT_SESSION PI_AGENT_ROUTER_PARENT_SESSION_ID$/m);
@@ -90,10 +96,7 @@ describe("child env: launch scripts", () => {
 
   it("--tools is the restricted parent set intersected with params.tools, plus control tools", () => {
     const fx = fixture();
-    const ceiling = {
-      active: ["read", "grep", "find", "subagent"],
-      all: ["read", "grep", "find", "subagent", "bash", "edit", "write"],
-    };
+    const ceiling = { active: ["read", "grep", "find", "subagent"] };
     const plan = buildLaunchPlan(
       { name: "W", task: "t", tools: "read,bash,subagent" },
       null,
@@ -106,22 +109,16 @@ describe("child env: launch scripts", () => {
 });
 
 describe("child env: resolveChildTools", () => {
-  it("no --tools when the parent has the full default set and nothing is requested", () => {
-    assert.equal(resolveChildTools({ active: ["read", "bash"], all: ["read", "bash"] }), null);
-    assert.equal(resolveChildTools(undefined), null);
+  it("the parent's active set is the ceiling even when nothing is requested", () => {
+    assert.equal(resolveChildTools({ active: ["read", "bash"] }), "read,bash,caller_ping,subagent_done");
   });
 
-  it("a restricted parent caps the child even without requested tools", () => {
-    assert.equal(
-      resolveChildTools({ active: ["read"], all: ["read", "bash"] }),
-      "read,caller_ping,subagent_done",
-    );
+  it("a missing or malformed ceiling throws instead of omitting the flag", () => {
+    assert.throws(() => resolveChildTools(undefined as any), /active tool set is unavailable/);
+    assert.throws(() => resolveChildTools({ active: [1] } as any), /active tool set is unavailable/);
   });
 
-  it("an unrestricted parent passes requested tools through", () => {
-    assert.equal(
-      resolveChildTools({ active: ["read", "bash"], all: ["read", "bash"] }, "bash"),
-      "bash,caller_ping,subagent_done",
-    );
+  it("requested tools pass through only where the parent has them", () => {
+    assert.equal(resolveChildTools({ active: ["read", "bash"] }, "bash,write"), "bash,caller_ping,subagent_done");
   });
 });

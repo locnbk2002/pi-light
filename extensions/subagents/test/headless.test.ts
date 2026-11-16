@@ -148,6 +148,8 @@ function planCtx(): LaunchPlanContext {
     env: process.env,
     id: "run0001",
     now: new Date("2026-11-16T12:00:00.000Z"),
+    toolCeiling: { active: ["read", "bash"] },
+    projectTrusted: true,
   };
 }
 

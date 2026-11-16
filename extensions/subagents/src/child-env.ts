@@ -32,6 +32,13 @@ export const PARENT_SESSION_HINTS = [
   "PI_AGENT_ROUTER_PARENT_SESSION_ID",
 ] as const;
 
+/**
+ * Kit state/log overrides (pi-light-kit). Herdr panes do not inherit the
+ * controller's environment, so each is written explicitly: exported when the
+ * parent has it, unset otherwise.
+ */
+export const KIT_ENV_KEYS = ["PI_KIT_HOME", "PI_KIT_HOOK_LOG_DIR"] as const;
+
 /** The parent's resolved profile directory; never inferred from the child's cwd. */
 export function parentAgentDir(env: Record<string, string | undefined>): string {
   return env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -48,6 +55,7 @@ export function perRunExports(run: PerRunEnv): string[] {
     `export PI_SUBAGENT_SESSION=${shellEscape(run.sessionFile)}`,
     `export PI_SUBAGENT_AUTO_EXIT=${run.autoExit ? "1" : "0"}`,
     `export PI_DENY_TOOLS=${shellEscape([...run.denyTools].join(","))}`,
+    ...KIT_ENV_KEYS.map((key) => (run.env[key] ? `export ${key}=${shellEscape(run.env[key]!)}` : `unset ${key}`)),
   ];
 }
 
@@ -63,31 +71,25 @@ function splitTools(value?: string): string[] {
 /** Parent tool ceiling captured when `subagent`/`subagent_resume` executes. */
 export interface ToolCeiling {
   /** pi.getActiveTools() of the parent. */
-  active: string[];
-  /** Every registered tool name (pi.getAllTools()); equal to `active` means no ceiling. */
-  all: string[];
+  active: readonly string[];
 }
 
 /**
- * Child `--tools` allowlist: the parent's active tools intersected with any
- * requested tools, plus the child control tools. Returns null (no `--tools`
- * flag) when neither the parent nor the request restricts anything.
+ * Child `--tools` allowlist, always emitted: the parent's active tools
+ * intersected with any requested tools, plus the child control tools.
+ *
+ * Pi filters CLI-excluded tools out of getAllTools() too, so a restriction
+ * cannot be detected by comparing the two lists; the active set is the
+ * ceiling in every case. Throws when the ceiling is missing or malformed so
+ * the caller refuses to launch instead of omitting the flag.
  */
-export function resolveChildTools(ceiling: ToolCeiling | undefined, requested?: string): string | null {
-  const requestedTools = splitTools(requested);
-  const all = new Set(ceiling?.all ?? []);
-  const restricted =
-    ceiling !== undefined && (ceiling.active.length !== all.size || ceiling.active.some((t) => !all.has(t)));
-
-  let tools: string[];
-  if (restricted) {
-    const active = new Set(ceiling.active);
-    tools = requestedTools.length > 0 ? requestedTools.filter((t) => active.has(t)) : [...active];
-  } else if (requestedTools.length > 0) {
-    tools = requestedTools;
-  } else {
-    return null;
+export function resolveChildTools(ceiling: ToolCeiling, requested?: string): string {
+  if (!ceiling || !Array.isArray(ceiling.active) || ceiling.active.some((t) => typeof t !== "string")) {
+    throw new Error("the parent's active tool set is unavailable");
   }
+  const active = new Set(ceiling.active);
+  const requestedTools = splitTools(requested);
+  const tools = requestedTools.length > 0 ? requestedTools.filter((t) => active.has(t)) : [...active];
 
   const allow = new Set(tools);
   for (const tool of CONTROL_TOOLS) allow.add(tool);

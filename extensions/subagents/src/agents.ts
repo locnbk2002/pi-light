@@ -292,7 +292,15 @@ export function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
+/** Agent names resolve by file stem inside the search dirs; nothing that could leave them. */
+export const AGENT_NAME_PATTERN = /^[\w.-]+$/;
+
+export function isSafeAgentName(name: unknown): name is string {
+  return typeof name === "string" && AGENT_NAME_PATTERN.test(name);
+}
+
 export function loadAgentDefaults(agentName: string, opts: AgentLookup = {}): AgentDefaults | null {
+  if (!isSafeAgentName(agentName)) return null;
   // Agents resolve by file stem; highest-priority source first.
   const paths = agentSearchDirs(opts)
     .reverse()

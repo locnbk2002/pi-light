@@ -92,6 +92,9 @@ function createFakePi(opts?: { allTools?: FakeToolInfo[] }) {
       if (allTools) return allTools;
       return registeredTools.map((t) => ({ name: t.name, sourceInfo: { path: INDEX_PATH } }));
     },
+    getActiveTools(): string[] {
+      return registeredTools.map((t) => t.name);
+    },
     async exec() {
       return { stdout: "", stderr: "", code: 0 };
     },

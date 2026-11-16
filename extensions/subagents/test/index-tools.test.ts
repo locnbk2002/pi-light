@@ -86,6 +86,9 @@ function createFakePi() {
     getAllTools() {
       return registeredTools.map((t) => ({ name: t.name }));
     },
+    getActiveTools() {
+      return registeredTools.map((t) => t.name);
+    },
     async exec() {
       return { stdout: "", stderr: "", code: 0 };
     },
@@ -222,6 +225,11 @@ function writeChildSession(sessionFile: string, assistantText: string): void {
     }),
   ];
   writeFileSync(sessionFile, lines.join("\n") + "\n");
+  // The launch record a spawn leaves next to its session (resume reapplies it).
+  writeFileSync(
+    `${sessionFile}.launch.json`,
+    JSON.stringify({ version: 1, agent: null, denyTools: [], tools: ["read", "bash"] }),
+  );
 }
 
 function appendAssistantEntry(sessionFile: string, text: string): void {

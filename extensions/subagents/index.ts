@@ -15,7 +15,7 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,9 +23,11 @@ import {
   agentSearchDirs,
   discoverAgentDefinitions,
   getAgentConfigDir,
+  isSafeAgentName,
   loadAgentDefaults,
   type AgentLookup,
 } from "./src/agents.ts";
+import type { ToolCeiling } from "./src/child-env.ts";
 import {
   createHerdrClient,
   HERDR_PLUGIN_ID,
@@ -54,7 +56,10 @@ import {
   assertSafeLabel,
   buildLaunchPlan,
   buildResumeLaunchPlan,
+  launchRecordPath,
+  parseLaunchRecord,
   resolveResumeLaunchBehavior,
+  type LaunchRecord,
 } from "./src/launch.ts";
 import {
   type SubagentSteerMessage,
@@ -492,12 +497,38 @@ function agentLookup(pi: ExtensionAPI, ctx: { isProjectTrusted?: () => boolean }
   return { projectTrusted, extraDirs };
 }
 
-/** The parent's active-tool ceiling, captured when the tool executes. */
-function toolCeiling(pi: ExtensionAPI) {
+/**
+ * The parent's active-tool ceiling, captured when the tool executes. An
+ * unreadable tool set fails closed: the caller refuses to launch.
+ */
+function toolCeiling(pi: ExtensionAPI): ToolCeiling | null {
   try {
-    return { active: pi.getActiveTools(), all: pi.getAllTools().map((tool) => tool.name) };
+    const active = pi.getActiveTools();
+    if (!Array.isArray(active) || active.some((tool) => typeof tool !== "string")) return null;
+    return { active: [...active] };
   } catch {
-    return undefined;
+    return null;
+  }
+}
+
+const TOOL_CEILING_ERROR =
+  "Cannot start subagent: the parent's active tool set is unavailable, so the child's tool ceiling cannot be enforced.";
+
+/** Pi's effective trust for this session (saved, prompted or CLI --approve/--no-approve); errors mean untrusted. */
+function parentProjectTrusted(ctx: { isProjectTrusted?: () => boolean }): boolean {
+  try {
+    return ctx.isProjectTrusted?.() === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The original run's limits for a resume, or an error when they cannot be read. */
+function readLaunchRecord(sessionPath: string): LaunchRecord | { error: string } {
+  try {
+    return parseLaunchRecord(readFileSync(launchRecordPath(sessionPath), "utf8"));
+  } catch (error: any) {
+    return { error: error?.code === "ENOENT" ? "no launch record" : error?.message ?? String(error) };
   }
 }
 
@@ -636,6 +667,13 @@ async function executeSubagentSpawn(
     );
   }
 
+  if (params.agent !== undefined && !isSafeAgentName(params.agent)) {
+    return errorResult(
+      `Error: invalid agent name "${String(params.agent).slice(0, 80)}": use letters, digits, '_', '.' or '-'.`,
+      "invalid agent name",
+    );
+  }
+
   const lookup = agentLookup(pi, ctx);
   const agentDefs = params.agent ? loadAgentDefaults(params.agent, lookup) : null;
   if (params.agent && !agentDefs) {
@@ -670,6 +708,9 @@ async function executeSubagentSpawn(
     }
   }
 
+  const ceiling = toolCeiling(pi);
+  if (!ceiling) return errorResult(TOOL_CEILING_ERROR, "tool ceiling unavailable");
+
   let plan;
   try {
     plan = buildLaunchPlan(params, agentDefs, {
@@ -679,7 +720,8 @@ async function executeSubagentSpawn(
       parentCwd: ctx.cwd,
       env: process.env,
       headless,
-      toolCeiling: toolCeiling(pi),
+      toolCeiling: ceiling,
+      projectTrusted: parentProjectTrusted(ctx),
     });
   } catch (error: any) {
     const message = error?.message ?? String(error);
@@ -901,19 +943,33 @@ async function executeSubagentResume(
     }
   }
 
+  // The original run's agent and limits; resume arguments never widen them.
+  const record = readLaunchRecord(params.sessionPath);
+  if ("error" in record) {
+    return errorResult(
+      `Cannot resume subagent: its launch record (${launchRecordPath(params.sessionPath)}) is unavailable ` +
+        `(${record.error}), so its original limits cannot be reapplied. Spawn a new subagent instead.`,
+      "launch record unavailable",
+    );
+  }
+  const ceiling = toolCeiling(pi);
+  if (!ceiling) return errorResult(TOOL_CEILING_ERROR, "tool ceiling unavailable");
+
   // Record entry count before resuming so we can extract only new messages.
   const entryCountBefore = safeGetNewEntries(params.sessionPath, 0).length;
 
   let plan;
   try {
-    plan = buildResumeLaunchPlan(params, {
+    const { sessionPath, name, message, autoExit } = params;
+    plan = buildResumeLaunchPlan({ sessionPath, name, message, autoExit }, record, {
       sessionDir: ctx.sessionManager.getSessionDir(),
       sessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile: ctx.sessionManager.getSessionFile() ?? "",
       parentCwd: ctx.cwd,
       env: process.env,
       headless,
-      toolCeiling: toolCeiling(pi),
+      toolCeiling: ceiling,
+      projectTrusted: parentProjectTrusted(ctx),
     });
   } catch (error: any) {
     const message = error?.message ?? String(error);
@@ -940,6 +996,7 @@ async function executeSubagentResume(
     id: plan.id,
     name: plan.name,
     task: params.message ?? "resumed session",
+    ...(record.agent ? { agent: record.agent } : {}),
     paneId: started.paneId,
     startTime: Date.now(),
     sessionFile: params.sessionPath,

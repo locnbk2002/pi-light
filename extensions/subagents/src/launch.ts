@@ -20,7 +20,7 @@
 //   PI_HERDR_HOLD_OPEN_SECS, default 15) the script holds the pane open for
 //   post-mortem — the sidecar, not pane.exited, is the completion signal then.
 //
-// buildSubagentToolAllowlist / buildPiPromptArgs / shellEscape and artifact
+// buildPiPromptArgs / shellEscape and artifact
 // conventions ported from pi-interactive-subagents (MIT, HazAT)
 // pi-extension/subagents/{index.ts,cmux.ts} @ fix/launch-verify-retry.
 import { accessSync, constants, existsSync, statSync } from "node:fs";
@@ -32,6 +32,7 @@ import {
   type AgentDefaults,
   getAgentConfigDir,
   getDefaultSessionDirFor,
+  isSafeAgentName,
   resolveDenyTools,
   resolveEffectiveInteractive,
   resolveLaunchBehavior,
@@ -72,8 +73,13 @@ export interface LaunchPlanContext {
   subagentDonePath?: string;
   /** Launch as a background `pi -p` process instead of a herdr pane. */
   headless?: boolean;
-  /** Parent's active-tool ceiling (pi.getActiveTools / getAllTools at call time). */
-  toolCeiling?: ToolCeiling;
+  /** Parent's active-tool ceiling (pi.getActiveTools() at call time). Always applied. */
+  toolCeiling: ToolCeiling;
+  /**
+   * The parent's effective project trust (ctx.isProjectTrusted(), including a
+   * CLI --no-approve). An untrusted parent launches children with --no-approve.
+   */
+  projectTrusted: boolean;
 }
 
 export interface LaunchPlan {
@@ -172,30 +178,40 @@ export function buildRuntimePrompt(opts: { headless: boolean; agent?: string }):
   return parts.join("\n\n");
 }
 
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+/** Pi's CLI override that ignores trust-gated project-local files for one run. */
+const NO_APPROVE_FLAG = "--no-approve";
 
 /**
- * Build the child --tools allowlist.
- *
- * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
- * subagent definition restricts tools to e.g. "read,bash,write", the child
- * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call subagent_done.
+ * Limits of one run, persisted next to its session (`<session>.launch.json`)
+ * so a resume reapplies them instead of trusting model-supplied arguments.
  */
-export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
-  const requested = (effectiveTools ?? "")
-    .split(",")
-    .map((tool) => tool.trim())
-    .filter(Boolean);
+export interface LaunchRecord {
+  version: 1;
+  agent: string | null;
+  denyTools: string[];
+  /** The child's --tools allowlist. */
+  tools: string[];
+}
 
-  if (requested.length === 0) return null;
+export function launchRecordPath(sessionFile: string): string {
+  return `${sessionFile}.launch.json`;
+}
 
-  const allow = new Set(requested);
-  for (const tool of SUBAGENT_CONTROL_TOOLS) {
-    allow.add(tool);
-  }
+function launchRecordFile(sessionFile: string, record: LaunchRecord): { path: string; content: string } {
+  return { path: launchRecordPath(sessionFile), content: `${JSON.stringify(record)}\n` };
+}
 
-  return [...allow].join(",");
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+
+/** Parse and validate a launch record; throws on anything malformed. */
+export function parseLaunchRecord(text: string): LaunchRecord {
+  const data = JSON.parse(text) as Record<string, unknown> | null;
+  if (!data || typeof data !== "object" || data.version !== 1) throw new Error("unsupported launch record");
+  const agent = data.agent;
+  if (agent !== null && !isSafeAgentName(agent)) throw new Error("launch record has an invalid agent name");
+  if (!isStringArray(data.denyTools) || !isStringArray(data.tools)) throw new Error("launch record is malformed");
+  return { version: 1, agent, denyTools: data.denyTools, tools: data.tools };
 }
 
 /**
@@ -440,7 +456,7 @@ export function buildLaunchPlan(
   // auto-detect file paths, avoiding shell escaping issues with multiline content.
   let syspromptFile: string | null = null;
   if (identityInSystemPrompt && identity) {
-    syspromptFile = join(artifactDir, "context", `${name}-sysprompt-${artifactTimestamp}.md`);
+    syspromptFile = join(artifactDir, "context", `${name}-sysprompt-${artifactTimestamp}-${id}.md`);
     files.push({ path: syspromptFile, content: identity });
     piArgv.push(
       systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt",
@@ -450,15 +466,14 @@ export function buildLaunchPlan(
 
   const runtimePrompt = buildRuntimePrompt({ headless: ctx.headless === true, agent: params.agent });
   if (runtimePrompt) {
-    const runtimePromptFile = join(artifactDir, "context", `${name}-runtime-${artifactTimestamp}.md`);
+    const runtimePromptFile = join(artifactDir, "context", `${name}-runtime-${artifactTimestamp}-${id}.md`);
     files.push({ path: runtimePromptFile, content: runtimePrompt });
     piArgv.push("--append-system-prompt", runtimePromptFile);
   }
 
   const toolAllowlist = resolveChildTools(ctx.toolCeiling, effectiveTools);
-  if (toolAllowlist) {
-    piArgv.push("--tools", toolAllowlist);
-  }
+  piArgv.push("--tools", toolAllowlist);
+  if (!ctx.projectTrusted) piArgv.push(NO_APPROVE_FLAG);
 
   // Task delivery: fork inherits the conversation → direct arg; blank-session
   // modes get the artifact-backed handoff so wrapper instructions arrive as
@@ -468,13 +483,23 @@ export function buildLaunchPlan(
   if (launchBehavior.taskDelivery === "direct") {
     taskArg = fullTask;
   } else {
-    taskArtifactFile = join(artifactDir, "context", `${name}-${artifactTimestamp}.md`);
+    taskArtifactFile = join(artifactDir, "context", `${name}-${artifactTimestamp}-${id}.md`);
     files.push({ path: taskArtifactFile, content: fullTask });
     taskArg = `@${taskArtifactFile}`;
   }
 
   piArgv.push(
     ...buildPiPromptArgs({ effectiveSkills, taskDelivery: launchBehavior.taskDelivery, taskArg }),
+  );
+
+  const denyTools = [...resolveDenyTools(agentDefs)];
+  files.push(
+    launchRecordFile(sessionFile, {
+      version: 1,
+      agent: params.agent ?? null,
+      denyTools,
+      tools: toolAllowlist.split(","),
+    }),
   );
 
   // ── Curated env exports (never a full env dump) ──
@@ -488,7 +513,7 @@ export function buildLaunchPlan(
       agent: params.agent,
       sessionFile,
       autoExit,
-      denyTools: resolveDenyTools(agentDefs),
+      denyTools,
       env,
     }),
   );
@@ -542,8 +567,6 @@ export function buildLaunchPlan(
 export interface ResumeLaunchParams {
   sessionPath: string;
   name?: string;
-  /** Agent definition the resumed session runs as (identity for the permission system). */
-  agent?: string;
   message?: string;
   autoExit?: boolean;
 }
@@ -595,6 +618,7 @@ export interface ResumeLaunchPlan {
  */
 export function buildResumeLaunchPlan(
   params: ResumeLaunchParams,
+  record: LaunchRecord,
   ctx: LaunchPlanContext,
 ): ResumeLaunchPlan {
   const env = ctx.env;
@@ -621,18 +645,23 @@ export function buildResumeLaunchPlan(
     subagentDonePath,
   ];
 
-  const runtimePrompt = buildRuntimePrompt({ headless: ctx.headless === true, agent: params.agent });
+  // The original run's identity and limits, never resume arguments (red-team kongming 5).
+  const agent = record.agent ?? undefined;
+  const runtimePrompt = buildRuntimePrompt({ headless: ctx.headless === true, agent });
   if (runtimePrompt) {
-    const runtimePromptFile = join(artifactDir, "context", `${name}-resume-runtime-${artifactTimestamp}.md`);
+    const runtimePromptFile = join(artifactDir, "context", `${name}-resume-runtime-${artifactTimestamp}-${id}.md`);
     files.push({ path: runtimePromptFile, content: runtimePrompt });
     piArgv.push("--append-system-prompt", runtimePromptFile);
   }
-  const toolAllowlist = resolveChildTools(ctx.toolCeiling, undefined);
-  if (toolAllowlist) piArgv.push("--tools", toolAllowlist);
+  // The original allowlist, further capped by the resuming parent's active tools.
+  const toolAllowlist = resolveChildTools(ctx.toolCeiling, record.tools.join(","));
+  piArgv.push("--tools", toolAllowlist);
+  if (!ctx.projectTrusted) piArgv.push(NO_APPROVE_FLAG);
+  files.push(launchRecordFile(params.sessionPath, { ...record, tools: toolAllowlist.split(",") }));
 
   let resumeMessageFile: string | null = null;
   if (params.message) {
-    resumeMessageFile = join(artifactDir, "subagent-resume", `${name}-${artifactTimestamp}.md`);
+    resumeMessageFile = join(artifactDir, "subagent-resume", `${name}-${artifactTimestamp}-${id}.md`);
     files.push({ path: resumeMessageFile, content: params.message });
     piArgv.push(`@${resumeMessageFile}`);
   }
@@ -644,10 +673,10 @@ export function buildResumeLaunchPlan(
     ...perRunExports({
       id,
       name: displayName,
-      agent: params.agent,
+      agent,
       sessionFile: params.sessionPath,
       autoExit,
-      denyTools: [],
+      denyTools: record.denyTools,
       env,
     }),
   );

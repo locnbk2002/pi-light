@@ -55,6 +55,7 @@ function registerSubagentTool() {
     sendMessage() {},
     sendUserMessage() {},
     getAllTools: () => tools.map((t) => ({ name: t.name })),
+    getActiveTools: () => tools.map((t) => t.name),
   };
   herdrSubagents(api);
   const find = (name: string) => tools.find((t) => t.name === name);
@@ -104,6 +105,8 @@ function planFor(name: string, cwd?: string): LaunchPlan {
     },
     id: "abcd1234",
     now: new Date("2026-07-06T12:00:00.000Z"),
+    toolCeiling: { active: ["read", "bash"] },
+    projectTrusted: true,
   });
 }
 
