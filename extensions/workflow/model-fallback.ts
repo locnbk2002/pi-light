@@ -1,12 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
-import { ADVISORS, MAIN_MODEL } from './controller-policy.ts';
+import { MAIN_MODEL } from './controller-policy.ts';
 
 /** Fallback chains are ordered 'provider/model' references; the first entry is preferred. */
-export type FallbackRole = 'controller' | 'astra' | 'fable';
+export type FallbackRole = 'controller';
 export type ModelChains = Readonly<Record<FallbackRole, readonly string[]>>;
-export const ROLES: readonly FallbackRole[] = ['controller', 'astra', 'fable'];
+export const ROLES: readonly FallbackRole[] = ['controller'];
+/** Retired advisor roles: silently ignored in old override files. */
+const LEGACY_ROLES = ['astra', 'fable'];
 export const VIRTUAL_CONTROLLER = { provider: 'pi-light', id: 'controller', name: 'Opus (fallback)' } as const;
 export const DEFAULT_COOLDOWN_MS = 10 * 60_000;
 
@@ -14,9 +16,6 @@ const ref = (model: { provider: string; model: string }) => `${model.provider}/$
 const SOL = 'openai-codex/gpt-6.1-sol';
 export const DEFAULT_CHAINS: ModelChains = Object.freeze({
   controller: Object.freeze([ref(MAIN_MODEL), SOL]),
-  // Advisors fall back only to each other; Sol stays a controller-only fallback.
-  astra: Object.freeze([ref(ADVISORS.astra), ref(ADVISORS.fable)]),
-  fable: Object.freeze([ref(ADVISORS.fable), ref(ADVISORS.astra)]),
 });
 
 export function splitModel(model: string): { provider: string; id: string } {
@@ -55,12 +54,12 @@ export function modelFamily(model: string): string {
 }
 
 /**
- * Reviewer for work written by `implementer`: the first configured model (controller chain first,
- * then advisor chains) from a different vendor family, so the review does not share the author's blind spots.
+ * Reviewer for work written by `implementer`: the first configured controller-chain model
+ * from a different vendor family, so the review does not share the author's blind spots.
  */
 export function reviewerModel(chains: ModelChains, implementer: string, isAvailable: (model: string) => boolean = () => true): string | undefined {
   const family = modelFamily(implementer);
-  return [...chains.controller, ...chains.astra, ...chains.fable].find(model => modelFamily(model) !== family && isAvailable(model));
+  return chains.controller.find(model => modelFamily(model) !== family && isAvailable(model));
 }
 
 /** Rename the provider of a 'provider/model' reference (e.g. anthropic -> claude-bridge on a machine logged in elsewhere). */
@@ -69,19 +68,6 @@ export function renameProvider(model: string, providers: Readonly<Record<string,
   return provider in providers ? `${providers[provider]}/${id}` : model;
 }
 
-/**
- * Extension-backed providers that advisor children (started with --no-extensions) must load explicitly.
- * Paths are Pi's git package checkouts under the agent directory; setup installs these packages.
- */
-const EXTENSION_PROVIDERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  'claude-bridge': ['git', 'github.com', 'elidickinson', 'pi-claude-bridge'],
-});
-export function providerExtension(provider: string, agentDir = getAgentDir()): string | undefined {
-  const parts = EXTENSION_PROVIDERS[provider];
-  if (!parts) return undefined;
-  const path = join(agentDir, ...parts);
-  return existsSync(path) ? path : undefined;
-}
 const MAX_CHAIN = 8;
 /** Keys owned by the effort judge; parsed separately so they can never reset the chains above. */
 const EFFORT_KEYS = ['effort', 'judge'] as const;
@@ -128,6 +114,7 @@ function renameChain(role: string, chain: readonly string[], providers: Readonly
 export function parseModelChains(raw: unknown): ModelChains {
   const input = asObject(raw, 'top level');
   for (const key of Object.keys(input)) {
+    if (LEGACY_ROLES.includes(key)) continue;
     if (key !== 'providers' && key !== ACCOUNTS_KEY && !ROLES.includes(key as FallbackRole) && !(EFFORT_KEYS as readonly string[]).includes(key)) {
       throw new Error(`unknown key "${key.slice(0, 40)}" (allowed: ${ROLES.join(', ')}, providers, ${EFFORT_KEYS.join(', ')}, ${ACCOUNTS_KEY})`);
     }

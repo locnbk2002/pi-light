@@ -4,21 +4,22 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Cooldowns, DEFAULT_CHAINS, DEFAULT_EFFORT, isLimitOrCapacityError, loadModelChains, modelFamily, parseEffortSettings, parseModelChains, planCandidates,
-  providerExtension, reviewerModel, routeController } from './model-fallback.ts';
+  reviewerModel, routeController } from './model-fallback.ts';
 
 const OPUS = 'anthropic/claude-opus-5-5';
 const SOL = 'openai-codex/gpt-6.1-sol';
+// Arbitrary model ids for chain-ordering tests.
 const ASTRA = 'openai-codex/gpt-6-astra';
 const FABLE = 'anthropic/claude-fable-5-2';
 const redact = (value: unknown) => String(value).split('\n')[0].slice(0, 80);
 const all = (_model: string) => true;
 
 test('default fallback chains match the agreed order', () => {
-  assert.deepEqual(DEFAULT_CHAINS, {
-    controller: [OPUS, SOL],
-    astra: [ASTRA, FABLE],
-    fable: [FABLE, ASTRA],
-  });
+  assert.deepEqual(DEFAULT_CHAINS, { controller: [OPUS, SOL] });
+});
+
+test('retired advisor keys (astra, fable) in old override files are ignored without an error', () => {
+  assert.deepEqual(parseModelChains({ astra: ['openai-codex/gpt-6-astra'], fable: 'anything' }), DEFAULT_CHAINS);
 });
 
 test('classifier accepts provider limit and capacity errors only', () => {
@@ -40,11 +41,10 @@ test('classifier accepts provider limit and capacity errors only', () => {
 });
 
 test('override validation is strict and partial files keep other defaults', () => {
-  assert.deepEqual(parseModelChains({ astra: [SOL, FABLE] }), { ...DEFAULT_CHAINS, astra: [SOL, FABLE] });
   assert.deepEqual(parseModelChains({ controller: ['openrouter/anthropic/claude-opus'] }).controller, ['openrouter/anthropic/claude-opus']);
-  for (const bad of [null, [], 'x', { opus: [OPUS] }, { astra: [] }, { astra: 'x/y' }, { astra: [ASTRA, ASTRA] },
-    { astra: ['no-slash'] }, { astra: ['/model'] }, { astra: ['Bad Provider/x'] }, { astra: [42] },
-    { astra: Array.from({ length: 9 }, (_, i) => `p/m${i}`) }, { controller: ['pi-light/controller'] }]) {
+  for (const bad of [null, [], 'x', { opus: [OPUS] }, { controller: [] }, { controller: 'x/y' }, { controller: [SOL, SOL] },
+    { controller: ['no-slash'] }, { controller: ['/model'] }, { controller: ['Bad Provider/x'] }, { controller: [42] },
+    { controller: Array.from({ length: 9 }, (_, i) => `p/m${i}`) }, { controller: ['pi-light/controller'] }]) {
     assert.throws(() => parseModelChains(bad), Error, JSON.stringify(bad));
   }
 });
@@ -54,20 +54,20 @@ test('override file: missing uses defaults silently; invalid notifies without ec
   try {
     const path = join(folder, 'pi-light-models.json');
     assert.deepEqual(loadModelChains(path), { chains: DEFAULT_CHAINS, effort: DEFAULT_EFFORT, claudeAccounts: { enabled: false } });
-    await writeFile(path, '{"astra": ["secret-looking-value"');
+    await writeFile(path, '{"controller": ["secret-looking-value"');
     let loaded = loadModelChains(path);
     assert.equal(loaded.chains, DEFAULT_CHAINS);
     assert.match(loaded.error!, /invalid JSON/);
     assert.equal(loaded.error!.includes('secret-looking-value'), false);
     assert.equal(loaded.effort.enabled, false, 'an unparsable file disables judging (fail closed)');
     assert.match(loaded.effortError!, /effort judging is disabled/);
-    await writeFile(path, JSON.stringify({ astra: ['secret-looking-value'] }));
+    await writeFile(path, JSON.stringify({ controller: ['secret-looking-value'] }));
     loaded = loadModelChains(path);
     assert.equal(loaded.chains, DEFAULT_CHAINS);
     assert.match(loaded.error!, /provider\/model/);
     assert.equal(loaded.error!.includes('secret-looking-value'), false);
-    await writeFile(path, JSON.stringify({ fable: [SOL] }));
-    assert.deepEqual(loadModelChains(path), { chains: { ...DEFAULT_CHAINS, fable: [SOL] }, effort: DEFAULT_EFFORT, claudeAccounts: { enabled: false } });
+    await writeFile(path, JSON.stringify({ controller: [SOL] }));
+    assert.deepEqual(loadModelChains(path), { chains: { controller: [SOL] }, effort: DEFAULT_EFFORT, claudeAccounts: { enabled: false } });
     await writeFile(path, JSON.stringify({ claudeAccounts: { enabled: true } }));
     assert.deepEqual(loadModelChains(path).claudeAccounts, { enabled: true });
     await writeFile(path, JSON.stringify({ claudeAccounts: { enabled: 1 } }));
@@ -133,25 +133,12 @@ test('virtual controller routing: sticky continuation, limit retry switches, non
 test('a providers map renames every chain entry for a machine logged in under other provider names', () => {
   const chains = parseModelChains({ providers: { anthropic: 'claude-bridge', 'openai-codex': 'openai' } });
   assert.deepEqual(chains.controller, ['claude-bridge/claude-opus-5-5', 'openai/gpt-6.1-sol']);
-  assert.deepEqual(chains.astra, ['openai/gpt-6-astra', 'claude-bridge/claude-fable-5-2']);
-  assert.deepEqual(chains.fable, ['claude-bridge/claude-fable-5-2', 'openai/gpt-6-astra']);
   assert.deepEqual(parseModelChains({ providers: { anthropic: 'claude-bridge' }, controller: ['anthropic/claude-opus-5-5'] }).controller,
     ['claude-bridge/claude-opus-5-5'], 'explicit chains are renamed too');
   for (const bad of [{ providers: [] }, { providers: { anthropic: 7 } }, { providers: { 'Bad Name': 'x' } }, { providers: { anthropic: 'pi-light' } },
     { providers: { anthropic: 'openai-codex' }, controller: ['anthropic/x', 'openai-codex/x'] }]) {
     assert.throws(() => parseModelChains(bad));
   }
-});
-
-test('providerExtension finds the installed claude-bridge package only', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'pi-light-agent-'));
-  try {
-    assert.equal(providerExtension('claude-bridge', dir), undefined, 'not installed');
-    const path = join(dir, 'git', 'github.com', 'elidickinson', 'pi-claude-bridge');
-    await import('node:fs/promises').then(fs => fs.mkdir(path, { recursive: true }));
-    assert.equal(providerExtension('claude-bridge', dir), path);
-    assert.equal(providerExtension('anthropic', dir), undefined);
-  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('cross-family reviewer: Opus work is reviewed by Sol, Sol work by Opus, renames keep the family', () => {
@@ -162,8 +149,8 @@ test('cross-family reviewer: Opus work is reviewed by Sol, Sol work by Opus, ren
   assert.equal(modelFamily('local/llama-3'), 'local');
   assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5'), 'openai-codex/gpt-6.1-sol');
   assert.equal(reviewerModel(DEFAULT_CHAINS, 'openai-codex/gpt-6.1-sol'), 'anthropic/claude-opus-5-5');
-  // Sol unavailable: fall through to the other-family advisor model rather than a same-family one.
-  assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5', m => !m.endsWith('gpt-6.1-sol')), 'openai-codex/gpt-6-astra');
+  // Sol unavailable: no other-family model is left, never a same-family one.
+  assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5', m => !m.endsWith('gpt-6.1-sol')), undefined);
   assert.equal(reviewerModel(DEFAULT_CHAINS, 'anthropic/claude-opus-5-5', m => modelFamily(m) === 'anthropic'), undefined);
   const renamed = parseModelChains({ providers: { anthropic: 'claude-bridge' } });
   assert.equal(reviewerModel(renamed, 'openai-codex/gpt-6.1-sol'), 'claude-bridge/claude-opus-5-5');
@@ -205,7 +192,7 @@ test('config isolation: invalid effort settings leave custom chains and renames 
     assert.match(loaded.effortError!, /timeoutMs/);
     assert.equal(loaded.effortError!.includes('slow'), false, 'no file contents echoed');
     // A broken chain falls back to default chains without touching valid effort settings.
-    await writeFile(path, JSON.stringify({ astra: [], effort: { fallback: 'low' } }));
+    await writeFile(path, JSON.stringify({ controller: [], effort: { fallback: 'low' } }));
     loaded = loadModelChains(path);
     assert.equal(loaded.chains, DEFAULT_CHAINS);
     assert.ok(loaded.error);
@@ -213,7 +200,7 @@ test('config isolation: invalid effort settings leave custom chains and renames 
   } finally { await rm(folder, { recursive: true, force: true }); }
 });
 
-test('the judge chain never feeds the reviewer, controller or advisor chains', () => {
+test('the judge chain never feeds the reviewer or controller chains', () => {
   const chains = parseModelChains({ judge: ['openai-codex/gpt-5.6-luna'] });
   assert.deepEqual(chains, DEFAULT_CHAINS);
   assert.equal('judge' in chains, false);

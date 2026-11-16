@@ -715,7 +715,7 @@ test("add-on only allowlisted CDP methods and fixed page functions", async () =>
   assert.equal((background.match(/chrome\.debugger\.sendCommand/g) ?? []).length, 0);
 });
 
-test("browser tool: open always asks, bound-tab mutations and console ask, Pi-owned tabs run freely, read-only blocks mutations", async t => {
+test("browser tool: open always asks, bound-tab mutations and console ask, Pi-owned tabs run freely", async t => {
   const tools: any[] = [];
   const pi = { registerCommand: () => {}, registerTool: (tool: any) => tools.push(tool), on: () => {} };
   const requests: Array<{ action: string }> = [];
@@ -724,8 +724,7 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
     resolveTab: (name?: string) => (!name || name === "bound" ? { ...bound } : name === "main" ? { ...owned } : undefined),
     request: async (action: { action: string }) => { requests.push(action); return action.action === "screenshot" ? { data: "QUJD", width: 2, height: 1 } : { ok: 1 }; }
   });
-  let readOnly = false;
-  registerBrowserTools(pi, { isReadOnly: () => readOnly }, fake as unknown as BrowserBridge);
+  registerBrowserTools(pi, fake as unknown as BrowserBridge);
   const tool = tools[0];
   const confirms: string[] = [];
   let answer = true;
@@ -761,18 +760,6 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
   answer = true;
   await assert.rejects(run({ action: "click", selector: "a" }, { ...ctx, mode: "rpc" }), /interactive confirmation/);
 
-  // Read-only refuses mutations on every tab, but reads (including console) still work.
-  readOnly = true;
-  const blocked = requests.length;
-  await assert.rejects(run({ action: "open", url: `${origin}/` }), /read-only/);
-  await assert.rejects(run({ action: "click", selector: "a", tab: "main" }), /read-only/);
-  await assert.rejects(run({ action: "evaluate", code: "1", tab: "main" }), /read-only/);
-  await assert.rejects(run({ action: "close", tab: "main" }), /read-only/);
-  assert.equal(requests.length, blocked);
-  await run({ action: "snapshot", tab: "main" });
-  await run({ action: "console", tab: "main" });
-  await run({ action: "console" });
-  readOnly = false;
   await assert.rejects(run({ action: "snapshot", tab: "nope" }), /No such controlled tab/);
   t.diagnostic(`tool description length ${tool.description.length}`);
 });

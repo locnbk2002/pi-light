@@ -511,7 +511,10 @@ describe("index tools: subagents_list", () => {
     const text = result.content[0].text;
     assert.match(text, /• worker \[anthropic\/claude-sonnet-4-5\] — Implements tasks/);
     assert.ok(!text.includes("hidden"), "disable-model-invocation agents are hidden");
-    assert.equal(result.details.agents.length, 1);
+    // pi-light's own package agents (counsel, advisor) are always listed too.
+    const nonPackage = result.details.agents.filter((agent: { source: string }) => agent.source !== "package");
+    assert.equal(nonPackage.length, 1);
+    assert.match(text, /• counsel \(package\)/);
   });
 });
 

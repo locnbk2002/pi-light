@@ -6,19 +6,20 @@ The package root is the workflow core. Each feature is its own extension under `
 
 | Extension | Provides |
 |---|---|
-| `extensions/workflow` | Stage routing, advisors, model fallback, cross-family review, the `locbt-router` skill policy |
+| `extensions/workflow` | Stage routing, model fallback, cross-family review, the `locbt-router` skill policy |
+| `extensions/subagents` | The `subagent` tools: herdr panes inside herdr, background `pi -p` processes outside it |
 | `extensions/browser-bridge` | The `browser` tool, the shared local browser relay, `/browser-connect`, `/browser-status` and the Chromium add-on |
 | `extensions/herdr-layout` | herdr subagent pane layout |
 | `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
 | `extensions/setup` | `/pi-light setup` and the missing-AgentKit warning |
 
 - **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to an AgentKit skill. The agent only edits files when you ask for an implementation.
-- **Advisors.** Astra (`gpt-6-astra`) and Fable (`claude-fable-5-2`) give a second opinion through hidden Pi processes. `/advisor astra|fable` opens a direct chat, and `/back` hands the result back to Opus.
-- **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn and each advisor message, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
-- **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol, and each advisor falls back to the other.
+- **Advisors.** Advice comes from subagents: spawn `counsel` for autonomous counsel and `advisor` for an interactive interview (herdr only). A cross-family review is a `subagent` call on the other-family model. Both agent definitions ship in `agents/` (`counsel.md`, `advisor.md`) and use `claude-fable-5-2`.
+- **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
+- **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol.
 - **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). The controller passes that model explicitly when it delegates a review subagent.
 - **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets every running Pi session open and drive its own tabs in your signed-in browser at the same time, and use a tab you bind with the toolbar button. You pair each browser profile once; there is no per-session token. Opening a tab always asks you first. On the tab you bound, clicks, typing, key presses, navigation, scripts and console reads ask each time; on tabs Pi opened, later actions run without asking (see Browser tool below).
-- **herdr subagent layout.** Up to 3 subagents from `pi-herdr-subagents` stack beside your pane. When a 4th starts, all of them move to their own tabs. `PI_HERDR_MAX_SPLIT` changes the limit, and `PI_HERDR_LAYOUT=tab|split` changes the mode.
+- **herdr subagent layout.** Up to 3 subagents stack beside your pane. When a 4th starts, all of them move to their own tabs. `PI_HERDR_MAX_SPLIT` changes the limit, and `PI_HERDR_LAYOUT=tab|split` changes the mode.
 
 ## Install
 
@@ -56,7 +57,7 @@ Or load only the browser bridge, without the workflow skill:
 { "source": "git:github.com/locnbk2002/pi-light", "extensions": ["extensions/browser-bridge/index.ts"], "skills": [] }
 ```
 
-Without the workflow extension there is no direct advisor chat, so the browser never enters read-only mode. Extensions never import each other; the browser asks the workflow for read-only state over `pi.events`. The model chains are machine-local: see Models below.
+Extensions never import each other; shared state goes over `pi.events`. The model chains are machine-local: see Models below.
 
 ## Browser tool
 
@@ -78,7 +79,7 @@ The `browser` tool takes named actions; there is no raw DevTools endpoint.
 | `evaluate {code}` | Run JavaScript in the page and return its JSON value | yes |
 | `navigate {url}` | Go to a URL. A bound tab must stay on its origin; Pi's own tabs may go anywhere over HTTP(S) | yes |
 
-Approval: opening a tab always asks. On a tab Pi opened, every other action runs without a prompt, so approving `open` lets Pi browse, type, run scripts and read console output there, signed in as you. On the tab you bound, the actions marked above ask each time. Read-only mode (during direct advisor chat) refuses every action that changes something (open, close, click, fill, press, navigate, evaluate) on any tab.
+Approval: opening a tab always asks. On a tab Pi opened, every other action runs without a prompt, so approving `open` lets Pi browse, type, run scripts and read console output there, signed in as you. On the tab you bound, the actions marked above ask each time.
 
 Without `tab`, actions use the bound tab, then `main`, then the only controlled tab.
 
@@ -108,17 +109,17 @@ Setup never overwrites an existing rule file; it reports when the file differs f
 
 ## Models
 
-The defaults are the controller `anthropic/claude-opus-5-5` with fallback `openai-codex/gpt-6.1-sol`, Astra `openai-codex/gpt-6-astra`, and Fable `anthropic/claude-fable-5-2`. If a machine is logged in under other provider names, rename them in `~/.pi/agent/pi-light-models.json`:
+The defaults are the controller `anthropic/claude-opus-5-5` with fallback `openai-codex/gpt-6.1-sol`. If a machine is logged in under other provider names, rename them in `~/.pi/agent/pi-light-models.json`:
 
 ```json
 { "providers": { "anthropic": "claude-bridge", "openai-codex": "openai" } }
 ```
 
-You can also replace whole lists with the `controller`, `astra` and `fable` keys. Advisors run without extensions, except the one that provides their model's provider (for example `pi-claude-bridge`).
+You can also replace the whole list with the `controller` key. The retired `astra` and `fable` keys are ignored.
 
 ## Effort judge
 
-Before a subagent is spawned or an advisor answers, a small judge model rates how open-ended the task is and picks the child's reasoning level. It judges whether the fix or design is given or which causes stay open, not how much work there is, and picks the lower level when torn.
+Before a subagent is spawned, a small judge model rates how open-ended the task is and picks the child's reasoning level. It judges whether the fix or design is given or which causes stay open, not how much work there is, and picks the lower level when torn.
 
 | Level | When |
 |---|---|
@@ -129,10 +130,9 @@ Before a subagent is spawned or an advisor answers, a small judge model rates ho
 
 `max` is never chosen automatically. The main controller's level is never changed.
 
-- **What the judge reads.** For a subagent, the first `solutionSpace:` line of its task (the controller is told to write one), otherwise the task text. For an advisor, `consult_advisor`'s optional `solutionSpace`, otherwise the question; every `/consult` and direct `/advisor` message is judged too. Input is cut to 2,000 characters and treated as untrusted data.
+- **What the judge reads.** For a subagent, the first `solutionSpace:` line of its task (the controller is told to write one), otherwise the task text. Input is cut to 2,000 characters and treated as untrusted data.
 - **Subagents.** The level travels as a `model` suffix (`pi-light/controller:high`, or `<model>:high` when a model is given). Precedence: an explicit `:level` in `model`, then an agent definition's `thinking:`, then the judge. A notice shows each spawn's level and source.
-- **Advisors.** The level is set before every message and again after a fallback switch. The reply label shows the level actually used, e.g. `effort high (judge xhigh, clamped; 0.8s)`.
-- **Time and failure.** One 8 s deadline covers the whole judge chain. Each judge except the last gets an even share of the time left (4 s for Haiku by default), so a slow first judge still leaves the next one a turn. All subagent calls in one message are judged at once. A timeout, provider error or unreadable reply falls back to `medium` and never blocks the spawn or the answer; the advisor label and subagent notice then name the reason, e.g. `effort medium (fallback: anthropic/claude-haiku-5-5: no answer within 4.0s; …)`.
+- **Time and failure.** One 8 s deadline covers the whole judge chain. Each judge except the last gets an even share of the time left (4 s for Haiku by default), so a slow first judge still leaves the next one a turn. All subagent calls in one message are judged at once. A timeout, provider error or unreadable reply falls back to `medium` and never blocks the spawn; the subagent notice then names the reason, e.g. `effort medium (fallback: anthropic/claude-haiku-5-5: no answer within 4.0s; …)`.
 - **Disclosure.** Each judged task or message (up to 2,000 characters) is sent to the judge provider: Anthropic for `claude-haiku-5-5`, or OpenAI Codex for the fallback `gpt-5.6-luna`. If `providers` renames `anthropic`, the judge is renamed too; `claude-bridge` was unusable as a judge in testing (not logged in, ignored aborts), so set `judge` explicitly on such a machine.
 
 Settings live in the same `~/.pi/agent/pi-light-models.json` (all optional; defaults shown):
@@ -144,7 +144,7 @@ Settings live in the same `~/.pi/agent/pi-light-models.json` (all optional; defa
 }
 ```
 
-`"effort": { "enabled": false }` turns the judge off: no judge requests, no judged levels and no effort labels. The precedence repairs stay on, so an explicit `:level` still beats an agent definition's `thinking:`, and a definition with only `thinking:` still reaches the child. Invalid effort or judge settings, including `null` values, also turn the judge off (with a warning), and never change the controller or advisor lists.
+`"effort": { "enabled": false }` turns the judge off: no judge requests, no judged levels and no effort labels. The precedence repairs stay on, so an explicit `:level` still beats an agent definition's `thinking:`, and a definition with only `thinking:` still reaches the child. Invalid effort or judge settings, including `null` values, also turn the judge off (with a warning), and never change the controller list.
 
 ## Claude account rotation
 
@@ -179,6 +179,6 @@ Without stored accounts, or with rotation off, the bridge uses its own login as 
 pnpm install && pnpm test && pnpm typecheck
 ```
 
-Layout: `extensions/<name>/index.ts` is each extension's entry (the only files Pi loads), with its tests beside it. `lib/` holds stateless helpers shared by the extensions (run-mode checks, the read-only event). Pi loads every extension with its own module instance, so shared state must go through `pi.events`. To try a working copy, remove the git install first (`pi remove git:github.com/locnbk2002/pi-light`), then `pi install ~/code/pi-light`; otherwise every tool registers twice.
+Layout: `extensions/<name>/index.ts` is each extension's entry (the only files Pi loads), with its tests beside it. `lib/` holds stateless helpers shared by the extensions (run-mode checks, the agent-dirs event, redaction). Pi loads every extension with its own module instance, so shared state must go through `pi.events`. To try a working copy, remove the git install first (`pi remove git:github.com/locnbk2002/pi-light`), then `pi install ~/code/pi-light`; otherwise every tool registers twice.
 
 MIT licensed.

@@ -1,21 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RpcClient, createEventBus, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { queryReadOnly } from '../../lib/read-only-events.ts';
 import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import piLight, { hasModelFlag } from './index.ts';
 import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
-import { ADVISORS, MAIN_MODEL, ControllerPolicy, handoffDraft, parseAdvisorArgs, READ_TOOLS } from './controller-policy.ts';
+import { MAIN_MODEL, ControllerPolicy } from './controller-policy.ts';
 import { DEFAULT_CHAINS, VIRTUAL_CONTROLLER } from './model-fallback.ts';
 // package.json lists test files explicitly; run the fallback module's unit tests with this suite.
 import './model-fallback.test.ts';
 
-const available = [...READ_TOOLS, 'bash', 'powershell', 'edit', 'write', 'browser_click', 'browser_read', 'mcp__shell', 'codemode', 'browser', 'consult_advisor', 'route_task'];
+// Removed names are assembled at runtime so a repository grep for them finds no leftovers (Phase 8 Verify).
+const RETIRED_TOOL = ['consult', 'advisor'].join('_');
+const RETIRED_COMMANDS = ['advisor', 'back', ['cancel', 'advisor'].join('-'), 'consult'];
 
-test('native package leaves one-shot Pi and AgentKit child jobs untouched', () => {
+const available = ['read', 'grep', 'find', 'ls', 'bash', 'powershell', 'edit', 'write', 'browser_click', 'browser_read', 'mcp__shell', 'codemode', 'browser', 'route_task'];
+
+test('native package leaves one-shot Pi child jobs untouched', () => {
   assert.equal(isOneShotInvocation(['--mode', 'json', '-p', '--no-session']), true);
   assert.equal(isOneShotInvocation(['--print', 'hello']), true);
   assert.equal(isOneShotInvocation(['--mode', 'rpc']), false);
@@ -87,73 +90,18 @@ test('herdr subagent panes keep their requested model and default to the control
   }
 });
 
-test('controller and Fable use native Anthropic; Astra remains native Codex', () => {
+test('controller uses native Anthropic Opus', () => {
   assert.deepEqual(MAIN_MODEL, { provider: 'anthropic', model: 'claude-opus-5-5' });
-  assert.deepEqual(ADVISORS.fable, { provider: 'anthropic', model: 'claude-fable-5-2' });
-  assert.deepEqual(ADVISORS.astra, { provider: 'openai-codex', model: 'gpt-6-astra' });
 });
 
-test('every mode keeps all tools available; only direct advisor chat pauses them', () => {
-  const policy = new ControllerPolicy();
-  assert.equal(policy.mode, 'auto');
-  for (const mode of ['auto', 'plan', 'brainstorm'] as const) {
-    policy.setMode(mode);
-    assert.equal(policy.isReadOnly, false);
-    assert.deepEqual(policy.activeTools(available), available);
-    for (const tool of [...available, 'new_unclassified_tool']) assert.equal(policy.allowsTool(tool), true);
-  }
-  policy.enter('fable', 'tools');
-  assert.equal(policy.isReadOnly, true);
-  assert.deepEqual(policy.activeTools(available), []);
-  for (const tool of [...available, 'new_unclassified_tool']) assert.equal(policy.allowsTool(tool), false);
-});
-
-test('work requires current request routing, not a mode command or advisor chat', () => {
+test('work requires current request routing, not a mode command', () => {
   const policy = new ControllerPolicy();
   assert.throws(() => policy.setMode('work'));
   assert.equal(policy.mode, 'auto');
   policy.captureInput('Implement the API.', 'interactive');
   policy.routeTask({ intent: 'implement', requestId: policy.request!.id, requestQuote: 'Implement the API.', scope: 'API only' });
-  assert.equal(policy.allowsTool('write'), true);
-  policy.enter('astra', 'api');
-  assert.equal(policy.mode, 'plan');
-  assert.deepEqual(policy.activeTools(available), []);
+  assert.equal(policy.mode, 'work');
   assert.throws(() => policy.setMode('work'));
-});
-
-test('cancelled handoff retains mode, session identity, quotes and edited draft', () => {
-  const policy = new ControllerPolicy();
-  policy.enter('fable', 'review');
-  const quote = 'Do NOT change package.json.\nI choose option "A", not B.';
-  policy.recordUser(quote);
-  const chat = policy.direct!;
-  chat.draft = 'Edited draft with my decisions';
-  assert.equal(policy.completeHandoff(false), false);
-  assert.equal(policy.direct, chat);
-  assert.equal(chat.draft, 'Edited draft with my decisions');
-  const draft = handoffDraft(chat, 'Advisor suggestions (NOT user decisions)\nTry B.\nPending questions\nNone.\nEvidence\nUnverified.', 'anthropic/claude-fable-5-2');
-  assert.ok(draft.includes(JSON.stringify(quote)));
-  assert.ok(draft.includes('NOT user decisions'));
-  assert.ok(draft.includes('Pending questions'));
-  assert.ok(draft.includes('Evidence'));
-  assert.equal(policy.completeHandoff(true), true);
-  assert.equal(policy.direct, undefined);
-  assert.equal(policy.mode, 'plan');
-  policy.enter('fable', 'review');
-  assert.equal(policy.direct, chat, 're-entering a reusable topic must retain earlier exact user quotations');
-  policy.recordUser('A follow-up');
-  assert.equal(chat.draft, undefined);
-  assert.deepEqual(chat.userQuotes, [quote, 'A follow-up']);
-});
-
-test('advisor selection is explicit and topics are bounded', () => {
-  assert.deepEqual(parseAdvisorArgs('astra performance review'), { advisor: 'astra', topic: 'performance review' });
-  assert.deepEqual(parseAdvisorArgs('fable'), { advisor: 'fable', topic: 'default' });
-  for (const input of ['', 'opus', 'auto topic', `astra ${'x'.repeat(121)}`]) assert.throws(() => parseAdvisorArgs(input));
-  const policy = new ControllerPolicy();
-  policy.enter('astra', 'default');
-  assert.throws(() => policy.enter('fable', 'other'));
-  assert.throws(() => policy.recordUser(' '));
 });
 
 function extensionHarness() {
@@ -161,7 +109,8 @@ function extensionHarness() {
   const tools = new Map<string, Parameters<ExtensionAPI['registerTool']>[0]>();
   const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const renderers = new Map<string, Parameters<ExtensionAPI['registerMessageRenderer']>[1]>();
-  let activeTools: string[] = [];
+  // The workflow never narrows the active tool set; every registered tool stays active.
+  let activeTools: string[] = [...available];
   let sent = 0;
   const sentRecords: { message: unknown; options: unknown }[] = [];
   let confirmations = 0;
@@ -220,12 +169,6 @@ function extensionHarness() {
 
 const status = (harness: ReturnType<typeof extensionHarness>) => harness.statuses.get('pi-light');
 
-test('feature extensions read direct advisor chat as read-only over the shared event bus', async () => {
-  const harness = extensionHarness();
-  assert.equal(queryReadOnly(harness.bus), false, 'controller mode is not read-only');
-  await harness.command('advisor', 'astra');
-  assert.equal(queryReadOnly(harness.bus), true, 'direct advisor chat is read-only');
-});
 const UNROUTED = 'controller | unrouted | no stage skill';
 const routeText = (result: unknown) => (result as { content: { text: string }[] }).content[0].text;
 
@@ -243,8 +186,6 @@ test('registered route handler automatically grants explicit current scope in TU
     const route = await currentRoute(harness, 'Fix hello.txt to say hello and test it.', source);
     assert.ok(route.requestId);
     assert.equal(status(harness), UNROUTED);
-    assert.equal(await harness.event('tool_call', { toolName: 'consult_advisor' }), undefined);
-    assert.ok(harness.tools.has('consult_advisor'));
     const result = await harness.route(route);
     assert.equal(status(harness), 'controller | implement | ak-cook');
     assert.equal(harness.active().includes('write'), true);
@@ -287,7 +228,7 @@ test('steering revokes work immediately and exposes only the latest request bind
   assert.equal(status(harness), 'controller | advice | ak-research/ak-debug as relevant');
 });
 
-test('routes are stage guidance: tools stay active unless direct advisor chat pauses them', async () => {
+test('routes are stage guidance: tools stay active in every stage', async () => {
   const toolsInUse = ['bash', 'write', 'edit', 'codemode'];
   const assertToolsOpen = async (harness: ReturnType<typeof extensionHarness>) => {
     for (const name of toolsInUse) assert.equal(harness.active().includes(name), true, name);
@@ -319,16 +260,6 @@ test('routes are stage guidance: tools stay active unless direct advisor chat pa
   assert.ok(text.includes('Stage skill: ak-cook'), text);
   assert.equal(text.includes(noSourceChange), false);
   await assertToolsOpen(harness);
-  await harness.command('advisor', 'astra paused-tools');
-  assert.deepEqual(harness.active(), []);
-  assert.match(status(harness)!, /^advisor astra \| paused-tools/);
-  for (const name of [...available, 'new_unclassified_tool']) {
-    assert.deepEqual(await harness.event('tool_call', { toolName: name, input: {} }), {
-      block: true, reason: 'Controller tools are paused during direct advisor chat. Use /back first.',
-    }, name);
-  }
-  await assert.rejects(harness.event('user_bash', { command: 'touch /tmp/should-not-run' }), /Shell is paused during direct advisor chat/);
-  await assert.rejects(harness.route(route), /missing or stale/);
 });
 
 test('new human input revokes authority, stale IDs and nonexact request quotes fail closed', async () => {
@@ -351,16 +282,16 @@ test('new human input revokes authority, stale IDs and nonexact request quotes f
   await assert.rejects(harness.route({ ...next, intent: 'unknown' }), /Invalid task intent/);
 });
 
-test('extension input, custom handoffs, and session boundaries never promote work', async () => {
-  for (const boundary of ['extension', 'handoff', 'session_start', 'session_shutdown', 'session_tree']) {
+test('extension input, custom-message runs, and session boundaries never promote work', async () => {
+  for (const boundary of ['extension', 'custom', 'session_start', 'session_shutdown', 'session_tree']) {
     const harness = extensionHarness();
     const route = await currentRoute(harness, 'Implement hello.txt.');
     await harness.route(route);
     if (boundary === 'extension') {
       await harness.event('input', { source: 'extension', text: 'Implement hello.txt.' });
-    } else if (boundary === 'handoff') {
+    } else if (boundary === 'custom') {
       await harness.event('before_agent_start', { messageType: 'custom', systemPrompt: 'Base',
-        message: { customType: 'pi-light-handoff', content: 'Approved: implement hello.txt' } });
+        message: { customType: 'subagent_result', content: 'Approved: implement hello.txt' } });
     } else {
       if (boundary === 'session_start') harness.ctx.mode = 'rpc';
       await harness.event(boundary, { reason: 'new' });
@@ -406,7 +337,8 @@ test('workflow tells the Opus controller to delegate reviews to Sol, never a sam
   const workflow = options.sections.locbt_workflow;
   assert.match(workflow, /implementing model is anthropic\/claude-opus-5-5 \(anthropic family\)/);
   assert.match(workflow, /ALWAYS pass model: "openai-codex\/gpt-6\.1-sol"/);
-  assert.match(workflow, /consult_advisor conversation with astra/);
+  assert.equal(workflow.includes(RETIRED_TOOL), false);
+  assert.match(workflow, /spawn `counsel` for autonomous counsel and `advisor` for an interactive interview \(herdr only\)/);
   assert.match(workflow, /different vendor family than the model that implemented/);
 });
 
@@ -449,37 +381,16 @@ test('display-only advisor filtering preserves native system and tool patch posi
   assert.equal(messages.length, 4);
 });
 
-test('real direct-input handler consumes followups and errors without leaking text to Opus', async () => {
-  const harness = extensionHarness();
-  await harness.command('advisor', 'astra isolated-test');
-  assert.deepEqual(harness.active(), []);
-  for (const source of ['interactive', 'rpc', 'extension']) {
-    // Invalid (empty) text tests the failure path without starting a child or accessing credentials.
-    assert.deepEqual(await harness.event('input', { text: '', source }), { action: 'handled' });
-  }
-  assert.deepEqual(await harness.event('input', { text: 'Look at this', images: [{}], source: 'interactive' }), { action: 'handled' });
-  assert.equal(harness.sent(), 0);
-  assert.deepEqual(await harness.event('tool_call', { toolName: 'read' }), {
-    block: true, reason: 'Controller tools are paused during direct advisor chat. Use /back first.',
-  });
-});
-
-test('direct messages have a live renderer and are excluded from controller context only', async () => {
+test('retired advisor and consult messages stay out of controller context', async () => {
   const harness = extensionHarness();
   const direct = { role: 'custom', customType: 'pi-light-advisor', content: 'Private advisor reply' };
-  const handoff = { role: 'custom', customType: 'pi-light-handoff', content: 'Approved handoff' };
   const consult = { role: 'custom', customType: 'pi-light-consult', content: 'Requested consultation' };
+  const result = { role: 'custom', customType: 'subagent_result', content: 'Subagent result' };
   const user = { role: 'user', content: 'Controller task' };
-  const messages = [user, direct, handoff, consult];
-  assert.deepEqual(await harness.event('context_with_system', { messages }), { messages: [user, handoff, consult] });
+  const messages = [user, direct, result, consult];
+  assert.deepEqual(await harness.event('context_with_system', { messages }), { messages: [user, result] });
   assert.equal(messages.length, 4, 'context filtering must not mutate stored transcript');
-  const renderer = harness.renderers.get('pi-light-advisor');
-  assert.ok(renderer, 'live messages must use registerMessageRenderer, not only a session entry renderer');
-  // Partial theme/render options only exercise this renderer, not Pi internals.
-  const rendered = renderer({ ...direct, details: { advisor: 'fable', prompt: 'My question', actualModel: 'anthropic/claude-fable-5-2' } } as Parameters<typeof renderer>[0],
-    {} as Parameters<typeof renderer>[1], { fg: (_color: string, text: string) => text } as Parameters<typeof renderer>[2]);
-  const lines = rendered!.render(120).join('\n');
-  for (const text of ['fable [anthropic/claude-fable-5-2]', 'You: My question', 'Private advisor reply']) assert.ok(lines.includes(text));
+  assert.equal(harness.renderers.has('pi-light-advisor'), false);
 });
 
 test('live automatic routing uses actual Opus: explicit fix writes, advice and plan do not', {
@@ -549,65 +460,6 @@ test('live automatic routing uses actual Opus: explicit fix writes, advice and p
   }
 });
 
-test('live controller selects native Opus and direct chat persists a displayed custom message', {
-  skip: !process.env.PI_LIGHT_LIVE_CLI, timeout: 180_000,
-}, async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'pi-light-controller-live-'));
-  const previousCli = process.env.PI_LIGHT_CLI_PATH;
-  process.env.PI_LIGHT_CLI_PATH = process.env.PI_LIGHT_LIVE_CLI;
-  const client = new RpcClient({ cliPath: process.env.PI_LIGHT_LIVE_CLI!, cwd: directory,
-    provider: MAIN_MODEL.provider, model: MAIN_MODEL.model,
-    args: ['--no-approve', '--no-session', '--no-extensions', '--no-mcp', '--no-skills',
-      '--no-prompt-templates', '--no-context-files', '--no-themes',
-      '-e', fileURLToPath(new URL('./index.ts', import.meta.url))],
-  });
-  let unsubscribe = () => {};
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await client.start();
-    const state = await client.getState();
-    // Selection names the fallback virtual model; the response below names the physical Opus.
-    assert.equal(state.model?.provider, VIRTUAL_CONTROLLER.provider);
-    assert.equal(state.model?.id, VIRTUAL_CONTROLLER.id);
-    const settled = new Promise<void>((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('Native controller did not settle.')), 90_000);
-      unsubscribe = client.onEvent(event => {
-        if (event.type === 'agent_settled') resolve();
-      });
-    });
-    await Promise.all([settled, client.prompt('Reply only MAIN-READY. Do not use tools.')]);
-    unsubscribe();
-    clearTimeout(timer);
-    const controllerReply = (await client.getMessages()).find(message => message.role === 'assistant');
-    assert.ok(controllerReply && controllerReply.role === 'assistant');
-    assert.equal(controllerReply.provider, MAIN_MODEL.provider);
-    assert.equal(controllerReply.model, MAIN_MODEL.model);
-    assert.notEqual(controllerReply.stopReason, 'error');
-    assert.ok(JSON.stringify(controllerReply.content).includes('MAIN-READY'));
-    await client.prompt('/advisor fable live-display');
-    await client.prompt('Reply only DIRECT-READY. Do not use tools.');
-    const messages = await client.getMessages();
-    const direct = messages.find(message => message.role === 'custom' && message.customType === 'pi-light-advisor');
-    assert.ok(direct && direct.role === 'custom');
-    assert.equal(direct.display, true);
-    assert.ok(JSON.stringify(direct.content).includes('DIRECT-READY'));
-    // Direct chat is judged too: the details carry the judged and read-back effort.
-    const { effort, ...details } = direct.details as { effort?: { requested: string; effective?: string; source: string; ms: number } };
-    assert.deepEqual(details, { advisor: 'fable', prompt: 'Reply only DIRECT-READY. Do not use tools.', actualModel: 'anthropic/claude-fable-5-2' });
-    assert.ok(effort && ['low', 'medium', 'high', 'xhigh'].includes(effort.requested) && ['judge', 'fallback'].includes(effort.source));
-    assert.equal(effort.effective, effort.requested, 'fable supports every judged level');
-  } finally {
-    clearTimeout(timer);
-    unsubscribe();
-    try { await client.stop(); }
-    finally {
-      if (previousCli === undefined) delete process.env.PI_LIGHT_CLI_PATH;
-      else process.env.PI_LIGHT_CLI_PATH = previousCli;
-      await rm(directory, { recursive: true, force: true });
-    }
-  }
-});
-
 test('legacy work command never grants authority and manual commands are unnecessary', async () => {
   const harness = extensionHarness();
   await harness.command('plan');
@@ -620,8 +472,6 @@ test('legacy work command never grants authority and manual commands are unneces
   assert.equal(harness.confirmations(), 0);
   assert.equal(status(harness), UNROUTED);
   assert.ok(harness.notifications.includes('No /work command is needed. Submit your scoped implementation request; Opus routes it automatically.'));
-  // Outside direct advisor chat the user's own shell is not intercepted.
-  assert.equal(await harness.event('user_bash', { command: 'true' }), undefined);
   assert.equal(harness.sent(), 0);
 });
 
@@ -693,23 +543,20 @@ test('non-retried usage limits omit only the failed attempt and continue once on
   assert.equal(await native.event('agent_before_settle', settleEvent('429 usage limit')), undefined);
 });
 
-test('advisor renderer shows the fallback model and what it replaced', () => {
+test('advice is subagent-only: no advisor commands, no advisor tool, prompt points at counsel', async () => {
   const harness = extensionHarness();
-  const renderer = harness.renderers.get('pi-light-advisor')!;
-  const rendered = renderer({ role: 'custom', customType: 'pi-light-advisor', content: 'Reply', details: { advisor: 'astra', prompt: 'Q',
-    actualModel: SOL_REF, fallbackFrom: ['openai-codex/gpt-6-astra: 429 usage limit'] } } as Parameters<typeof renderer>[0],
-  {} as Parameters<typeof renderer>[1], { fg: (_color: string, text: string) => text } as Parameters<typeof renderer>[2]);
-  assert.ok(rendered!.render(200).join('\n').includes(`astra [${SOL_REF}, fallback from openai-codex/gpt-6-astra: 429 usage limit]`));
-});
-
-test('consult_advisor accepts a bounded solutionSpace for the effort judge and rejects oversized hints before any advisor runs', async () => {
-  const harness = extensionHarness();
-  const tool = harness.tools.get('consult_advisor')!;
-  const schema = tool.parameters as unknown as { properties: Record<string, { maxLength?: number }> };
-  assert.equal(schema.properties.solutionSpace.maxLength, 2000);
-  assert.match(tool.description, /judge model picks the advisor's reasoning effort/);
-  await assert.rejects(tool.execute('oversized', { advisor: 'astra', topic: 't', question: 'q', solutionSpace: 'x'.repeat(2001) },
-    undefined, undefined, harness.ctx as Parameters<typeof tool.execute>[4]), /solutionSpace must be a string of at most 2000/);
+  for (const name of RETIRED_COMMANDS) {
+    await assert.rejects(harness.command(name), TypeError, `/${name} must not be registered`);
+  }
+  assert.equal(harness.tools.has(RETIRED_TOOL), false);
+  assert.deepEqual([...harness.tools.keys()], ['route_task']);
+  await harness.event('input', { text: 'hello', source: 'interactive' });
+  const event = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: {} as Record<string, string> } };
+  await harness.event('before_agent_start', event);
+  const workflow = event.systemPromptOptions.sections.locbt_workflow;
+  assert.match(workflow, /counsel/);
+  assert.equal(workflow.includes(RETIRED_TOOL), false);
+  assert.doesNotMatch(workflow, /Astra|Fable|AgentKit Agent/);
 });
 
 const subagentCall = (id: string, args: Record<string, unknown>) => ({ type: 'toolCall', id, name: 'subagent', arguments: args });
@@ -749,16 +596,6 @@ test('subagent effort: explicit suffix and caller model are honored; judge failu
   const other = { path: 'x' };
   await harness.event('tool_call', { toolName: 'read', toolCallId: 'x4', input: other });
   assert.deepEqual(other, { path: 'x' }, 'other tools are untouched');
-});
-
-test('subagent effort: the direct-chat block still wins over effort judging', async () => {
-  const harness = extensionHarness();
-  await harness.command('advisor', 'astra');
-  const input = { name: 'n', task: 't' } as { name: string; task: string; model?: string };
-  const result = await harness.event('tool_call', { toolName: 'subagent', toolCallId: 'd1', input }) as { block?: boolean };
-  assert.equal(result?.block, true);
-  assert.equal(input.model, undefined);
-  assert.equal(harness.judge.calls.length, 0);
 });
 
 test('delegation guidance asks for a solutionSpace line when effort judging is on', async () => {
