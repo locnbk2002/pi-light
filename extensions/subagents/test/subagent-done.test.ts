@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -12,6 +12,7 @@ import {
   writeExitSidecar,
 } from "../subagent-done.ts";
 import { writeContextUsageSidecar } from "../src/context-usage.ts";
+import { watchSubagent } from "../src/watcher.ts";
 import {
   clearActiveSubagents,
   markSubagentActive,
@@ -561,5 +562,76 @@ describe("subagent-done: agent_end writes .exit sidecar on clean auto-exit", () 
     let sidecarExists = false;
     try { readFileSync(`${sessionFile}.exit`); sidecarExists = true; } catch {}
     assert.equal(sidecarExists, false, "must not signal completion before children settle");
+  });
+});
+
+describe("subagent-done + watcher: only a clean stop is a success (fix 8)", () => {
+  it("auto-exit after stopReason length is reported failed with the partial text, not completed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-done-length-"));
+    const sessionFile = join(dir, "child.jsonl");
+    const partial = { role: "assistant", content: [{ type: "text", text: "partial answer" }], stopReason: "length" };
+    writeFileSync(sessionFile, JSON.stringify({ type: "message", id: "a1", message: partial }) + "\n");
+    const saved = { session: process.env.PI_SUBAGENT_SESSION, autoExit: process.env.PI_SUBAGENT_AUTO_EXIT };
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    cleanups.push(() => {
+      rmSync(dir, { recursive: true, force: true });
+      if (saved.session !== undefined) process.env.PI_SUBAGENT_SESSION = saved.session;
+      else delete process.env.PI_SUBAGENT_SESSION;
+      if (saved.autoExit !== undefined) process.env.PI_SUBAGENT_AUTO_EXIT = saved.autoExit;
+      else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+    });
+
+    const handlers: Record<string, Function> = {};
+    let shutdownCalled = false;
+    const mod = await import("../subagent-done.ts");
+    mod.default({
+      on: (event: string, handler: Function) => { handlers[event] = handler; },
+      registerTool: () => {},
+      registerShortcut: () => {},
+      getAllTools: () => [],
+    } as any);
+    handlers.agent_end({ messages: [partial] }, {
+      shutdown: () => { shutdownCalled = true; },
+      getContextUsage: () => undefined,
+      ui: { setWidget: () => {} },
+    });
+    assert.equal(shutdownCalled, true, "an auto-exit child still exits instead of hanging");
+
+    const outcome = await watchSubagent(
+      {
+        id: "run-1", name: "W", task: "t", paneId: "w1:p2", startTime: 0, sessionFile,
+        launchScriptFile: join(dir, "x.sh"), interactive: false, autoExit: true,
+      },
+      {
+        client: { paneGet: async () => null, paneRead: async () => "", paneList: async () => [] },
+        stream: { watch: () => () => {}, onReconcile: () => () => {} },
+        signal: new AbortController().signal,
+        pollIntervalMs: 20,
+      },
+    );
+    assert.equal(outcome.kind, "failed");
+    assert.equal((outcome as any).reason, "length");
+    assert.equal((outcome as any).summary, "partial answer");
+  });
+
+  it("auto-exit after a clean stop still writes the done sidecar", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-done-stop-"));
+    const sessionFile = join(dir, "child.jsonl");
+    const saved = { session: process.env.PI_SUBAGENT_SESSION, autoExit: process.env.PI_SUBAGENT_AUTO_EXIT };
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    cleanups.push(() => {
+      rmSync(dir, { recursive: true, force: true });
+      if (saved.session !== undefined) process.env.PI_SUBAGENT_SESSION = saved.session;
+      else delete process.env.PI_SUBAGENT_SESSION;
+      if (saved.autoExit !== undefined) process.env.PI_SUBAGENT_AUTO_EXIT = saved.autoExit;
+      else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+    });
+    const handlers: Record<string, Function> = {};
+    const mod = await import("../subagent-done.ts");
+    mod.default({ on: (e: string, h: Function) => { handlers[e] = h; }, registerTool: () => {}, registerShortcut: () => {}, getAllTools: () => [] } as any);
+    handlers.agent_end({ messages: [{ role: "assistant", stopReason: "stop" }] }, { shutdown: () => {}, getContextUsage: () => undefined, ui: { setWidget: () => {} } });
+    assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
   });
 });

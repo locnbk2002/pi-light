@@ -12,7 +12,8 @@
 //       check; a watched-but-missing pane exited during the gap.
 //
 // Semantic sidecars (written by the child / wrapper script):
-//   <sessionFile>.exit     — {"type":"done"[,"summary"]} or {"type":"ping","name","message"}
+//   <sessionFile>.exit     — {"type":"done"[,"summary"]}, {"type":"failed","reason"}
+//                            or {"type":"ping","name","message"}
 //                            written by subagent-done.ts before the child exits.
 //                            A `summary` is the child's explicit handoff and
 //                            wins over the transcript (see SummarySource).
@@ -252,6 +253,7 @@ export function watchSubagent(
       name?: string;
       message?: string;
       summary?: string;
+      reason?: unknown;
     } | null {
       try {
         return JSON.parse(readFileSync(exitFile, "utf8"));
@@ -290,6 +292,20 @@ export function watchSubagent(
           kind: "ping",
           name: exitData.name ?? running.name,
           message: exitData.message ?? "",
+        };
+      }
+      if (exitData?.type === "failed") {
+        // An auto-exit child that stopped on anything but a clean `stop`.
+        const reason = typeof exitData.reason === "string" && exitData.reason.trim()
+          ? exitData.reason.trim().slice(0, 200)
+          : "unknown stop reason";
+        const summary = readSummary();
+        return {
+          kind: "failed",
+          reason,
+          exitCode: null,
+          summary: summary ? truncateSummary(summary) : null,
+          paneOutput: null,
         };
       }
       if (exitData?.type === "done") {

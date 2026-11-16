@@ -11,8 +11,11 @@
  *
  * The `.exit` sidecar written here is a cross-extension contract: the
  * orchestrator's watcher (src/watcher.ts) classifies completion from exactly
- * these shapes — {"type":"done"}, {"type":"done","summary":...} and
- * {"type":"ping","name":...,"message":...}.
+ * these shapes — {"type":"done"}, {"type":"done","summary":...},
+ * {"type":"failed","reason":...} and {"type":"ping","name":...,"message":...}.
+ * Only a clean `stop` is a success; an auto-exit after any other stop reason
+ * (e.g. `length`) is signalled as failed so the partial text is not reported
+ * as a finished result.
  *
  * The `summary` field is the handoff payload. Reading the child's transcript
  * for "the last assistant text" at sidecar time is racy and lossy: models with
@@ -82,7 +85,17 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 
 export type ExitSidecarData =
   | { type: "done"; summary?: string }
+  | { type: "failed"; reason: string }
   | { type: "ping"; name: string; message: string };
+
+/** Stop reason of the latest assistant message, or undefined when there is none. */
+export function lastAssistantStopReason(messages: any[] | undefined): string | undefined {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const msg = messages![i];
+    if (msg?.role === "assistant") return typeof msg.stopReason === "string" ? msg.stopReason : "unknown stop reason";
+  }
+  return undefined;
+}
 
 /**
  * Normalize a model-supplied summary: trimmed, or undefined when blank so an
@@ -100,6 +113,7 @@ export function normalizeSummary(summary: unknown): string | undefined {
  * when no summary is carried, so older watchers keep classifying correctly:
  *   {"type":"done"}
  *   {"type":"done","summary":"..."}
+ *   {"type":"failed","reason":"..."}
  *   {"type":"ping","name":"...","message":"..."}
  */
 export function writeExitSidecar(sessionFile: string, data: ExitSidecarData): void {
@@ -108,6 +122,8 @@ export function writeExitSidecar(sessionFile: string, data: ExitSidecarData): vo
     payload = { type: "done" };
     const summary = normalizeSummary(data.summary);
     if (summary !== undefined) payload.summary = summary;
+  } else if (data.type === "failed") {
+    payload = { type: "failed", reason: data.reason };
   } else {
     payload = { type: "ping", name: data.name, message: data.message };
   }
@@ -269,9 +285,14 @@ export default function (pi: ExtensionAPI) {
       // Write the .exit sidecar so the watcher classifies this as a proper
       // completion, not a user close. Most models finish and stop talking
       // without explicitly calling subagent_done — a clean auto-exit IS a
-      // completion.
+      // completion. Any other stop reason (e.g. `length`) is a failure.
       snapshotContextUsage(ctx);
-      signalTerminalSidecar({ type: "done" });
+      const stopReason = lastAssistantStopReason(messages);
+      signalTerminalSidecar(
+        stopReason === undefined || stopReason === "stop"
+          ? { type: "done" }
+          : { type: "failed", reason: stopReason },
+      );
       ctx.shutdown();
       return;
     }
