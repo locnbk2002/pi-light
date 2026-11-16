@@ -50,6 +50,7 @@ import {
   TIMEOUT_GRACE_MS,
 } from "./src/limits.ts";
 import { queryAgentDirs } from "../../lib/agent-dirs-events.ts";
+import { isProjectExplicitlyTrusted, type ProjectTrustContext } from "../../lib/project-trust.ts";
 import { isOneShotInvocation } from "../../lib/run-mode.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
 import {
@@ -484,12 +485,9 @@ interface LaunchCtx {
   isProjectTrusted?: () => boolean;
 }
 
-/** Agent discovery options for this call (trusted project + event-bus package dirs). */
-function agentLookup(pi: ExtensionAPI, ctx: { isProjectTrusted?: () => boolean }): AgentLookup {
-  let projectTrusted = false;
-  try {
-    projectTrusted = ctx.isProjectTrusted?.() === true;
-  } catch {}
+/** Agent discovery options for this call (explicitly trusted project + event-bus package dirs). */
+function agentLookup(pi: ExtensionAPI, ctx: ProjectTrustContext): AgentLookup {
+  const projectTrusted = isProjectExplicitlyTrusted(ctx);
   let extraDirs: string[] = [];
   try {
     extraDirs = queryAgentDirs(pi.events);

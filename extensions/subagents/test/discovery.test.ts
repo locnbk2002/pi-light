@@ -1,12 +1,13 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { answerAgentDirsQueries, queryAgentDirs } from "../../../lib/agent-dirs-events.ts";
 import { discoverAgentDefinitions, loadAgentDefaults } from "../src/agents.ts";
+import herdrSubagents, { __test__ } from "../index.ts";
 
 let root = "";
 let previousCwd = "";
@@ -35,6 +36,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __test__.reset();
   process.chdir(previousCwd);
   rmSync(root, { recursive: true, force: true });
   if (savedAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
@@ -97,5 +99,36 @@ describe("agent discovery: package, global, trusted project", () => {
     assert.deepEqual(dirs, [kit]);
     const list = discoverAgentDefinitions({ extraDirs: dirs });
     assert.equal(list.filter((a) => a.name === "kit-agent").length, 1);
+  });
+});
+
+/** subagents_list as Pi runs it: Pi reports a fresh clone with no Pi-gated resources as trusted. */
+async function listedModel(name: string): Promise<string | undefined> {
+  const tools: any[] = [];
+  herdrSubagents({
+    registerTool: (tool: any) => tools.push(tool),
+    registerCommand() {},
+    registerShortcut() {},
+    registerMessageRenderer() {},
+    on() {},
+    events: bus(),
+    getAllTools: () => [],
+    getActiveTools: () => [],
+  } as any);
+  const ctx = { cwd: join(root, "project"), isProjectTrusted: () => true, ui: { notify() {} } };
+  const result = await tools.find((t) => t.name === "subagents_list").execute("t1", {}, undefined, undefined, ctx);
+  return result.details.agents.find((a: any) => a.name === name)?.model;
+}
+
+describe("fix 3: .pi/agents needs an explicit trust decision", () => {
+  it("a fresh clone whose only Pi content is .pi/agents does not get its agents loaded", async () => {
+    agent(join(root, "project", ".pi", "agents"), "counsel", "evil/model");
+    assert.notEqual(await listedModel("counsel"), "evil/model");
+  });
+
+  it("a saved trust record for the project (or a parent) admits its agents", async () => {
+    agent(join(root, "project", ".pi", "agents"), "counsel", "project/model");
+    writeFileSync(join(root, "profile", "trust.json"), JSON.stringify({ [realpathSync(root)]: true }));
+    assert.equal(await listedModel("counsel"), "project/model");
   });
 });

@@ -5,10 +5,11 @@ import { Type } from 'typebox';
 import { providerErrorSummary } from '../../lib/redact.ts';
 import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
 import { queryAgentDirs } from '../../lib/agent-dirs-events.ts';
-import { PI_LIGHT_AGENTS_DIR } from '../subagents/src/agents.ts';
+import { loadAgentDefaults } from '../subagents/src/agents.ts';
+import { isProjectExplicitlyTrusted } from '../../lib/project-trust.ts';
 import { ControllerPolicy } from './controller-policy.ts';
 import { judgeEffort, judgeInput, registryJudgeCall, type JudgeResult } from './effort-judge.ts';
-import { innerExplicitLevel, planSubagentEffort, readAgentDefaults, type SubagentEffortPlan } from './subagent-effort.ts';
+import { innerExplicitLevel, planSubagentEffort, type SubagentEffortPlan } from './subagent-effort.ts';
 import { Cooldowns, isLimitOrCapacityError, loadModelChains, modelConfigPath, modelFamily, planCandidates, reviewerModel, routeController, splitModel,
   VIRTUAL_CONTROLLER, type ControllerRouteDecision, type ModelConfig } from './model-fallback.ts';
 import { ACCOUNT_PROVIDER, accountFailureKind, accountsDir, BRIDGE_PROVIDER, ClaudeAccountRouter, safeToReplay } from './claude-account-routing.ts';
@@ -415,11 +416,12 @@ export default function piLight(pi: ExtensionAPI): void {
   // by the text it read: precedence is decided again in tool_call from the call's current arguments,
   // because earlier tool_call handlers may have changed them.
   const pendingJudgments = new Map<string, { input: string; judged: Promise<JudgeResult> }>();
-  function subagentPlan(input: Record<string, unknown>): SubagentEffortPlan {
+  function subagentPlan(input: Record<string, unknown>, ctx: ExtensionContext): SubagentEffortPlan {
     const agent = typeof input.agent === 'string' && input.agent.trim() ? input.agent.trim() : undefined;
-    // Package dirs, highest priority first (the subagents extension lets later replies win).
-    const packageDirs = [...queryAgentDirs(pi.events).reverse(), PI_LIGHT_AGENTS_DIR];
-    return planSubagentEffort(input, agent ? readAgentDefaults(agent, undefined, undefined, packageDirs) : undefined);
+    // The launch resolver itself (same sources, precedence and trust gate), so an untrusted
+    // project definition can never become the child's model through the effort path.
+    const defs = agent ? loadAgentDefaults(agent, { projectTrusted: isProjectExplicitlyTrusted(ctx), extraDirs: queryAgentDirs(pi.events) }) : null;
+    return planSubagentEffort(input, defs ?? undefined);
   }
   function startJudgment(input: string, ctx: ExtensionContext): Promise<JudgeResult> {
     const judged = judgeEffort({ input, settings: models.effort, call: registryJudgeCall(ctx.modelRegistry),
@@ -432,7 +434,7 @@ export default function piLight(pi: ExtensionAPI): void {
     const message = event.message;
     if (message.role !== 'assistant' || !models.effort.enabled) return;
     for (const block of message.content) {
-      if (block.type !== 'toolCall' || block.name !== 'subagent' || subagentPlan(block.arguments).action !== 'judge') continue;
+      if (block.type !== 'toolCall' || block.name !== 'subagent' || subagentPlan(block.arguments, ctx).action !== 'judge') continue;
       const input = taskOf(block.arguments);
       pendingJudgments.set(block.id, { input, judged: startJudgment(input, ctx) });
     }
@@ -441,7 +443,7 @@ export default function piLight(pi: ExtensionAPI): void {
     const cached = pendingJudgments.get(toolCallId);
     pendingJudgments.delete(toolCallId);
     // Precedence repairs (explicit suffix, agent-definition thinking) apply even with the judge off.
-    const plan = subagentPlan(input);
+    const plan = subagentPlan(input, ctx);
     const name = typeof input.name === 'string' ? input.name.slice(0, 60) : 'subagent';
     if (plan.action === 'set-model') input.model = plan.model;
     if (plan.action !== 'judge') {

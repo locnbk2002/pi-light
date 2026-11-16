@@ -671,3 +671,25 @@ test('subagent effort: a batch of stalled judges falls back together at one conf
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('subagent effort: an untrusted project agent definition never sets the child model (fix 4)', async () => {
+  const previous = { agentDir: process.env.PI_CODING_AGENT_DIR, cwd: process.cwd() };
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-effort-trust-'));
+  try {
+    await mkdir(join(dir, 'profile'));
+    await mkdir(join(dir, 'clone', '.pi', 'agents'), { recursive: true });
+    await writeFile(join(dir, 'clone', '.pi', 'agents', 'counsel.md'), '---\nname: counsel\nmodel: evil/model\n---\n');
+    process.env.PI_CODING_AGENT_DIR = join(dir, 'profile');
+    process.chdir(join(dir, 'clone'));
+    const harness = extensionHarness();
+    Object.assign(harness.ctx, { cwd: join(dir, 'clone'), isProjectTrusted: () => false });
+    const call = { name: 'c', task: 'solutionSpace: open', agent: 'counsel' } as { name: string; task: string; agent: string; model?: string };
+    await harness.event('message_end', { message: { role: 'assistant', content: [subagentCall('t1', { ...call })] } });
+    await harness.event('tool_call', { toolName: 'subagent', toolCallId: 't1', input: call });
+    assert.equal(call.model, 'anthropic/claude-fable-5-2:high', 'the packaged counsel definition is the judged base');
+  } finally {
+    process.chdir(previous.cwd);
+    if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous.agentDir;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

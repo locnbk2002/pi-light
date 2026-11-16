@@ -2,9 +2,6 @@
 // pi-light cannot change the upstream tool, so the level travels as a `--model <base>:<level>` suffix,
 // which upstream builds as `${model}:${agentDef.thinking}` when the agent definition sets thinking.
 // Precedence: explicit `:level` in model > agent-definition `thinking:` > judge > configured fallback.
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { VIRTUAL_CONTROLLER } from './model-fallback.ts';
 
 /** Pi's thinking levels, as accepted in a `--model <pattern>:<level>` suffix. */
@@ -13,28 +10,6 @@ const isLevel = (value: string | undefined) => !!value && (THINKING_LEVELS as re
 export const CONTROLLER_MODEL = `${VIRTUAL_CONTROLLER.provider}/${VIRTUAL_CONTROLLER.id}`;
 
 export interface AgentDefaults { model?: string; thinking?: string }
-
-function frontmatterValue(frontmatter: string, key: string): string | undefined {
-  return frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1].trim();
-}
-
-/**
- * The `model:` and `thinking:` that upstream `loadAgentDefaults` would read, with the same lookup order
- * and parsing (pi-herdr-subagents src/agents.ts @ 2489019): project `.pi/agents` first, then the agent dir,
- * then (pi-light) package agent directories, highest priority first.
- */
-export function readAgentDefaults(name: string, cwd = process.cwd(),
-  agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'), packageDirs: string[] = []): AgentDefaults | undefined {
-  const paths = [join(cwd, '.pi', 'agents', `${name}.md`), join(agentDir, 'agents', `${name}.md`),
-    ...packageDirs.map(dir => join(dir, `${name}.md`))];
-  for (const path of paths) {
-    if (!existsSync(path)) continue;
-    const frontmatter = /^---\n([\s\S]*?)\n---/.exec(readFileSync(path, 'utf8'))?.[1];
-    if (frontmatter === undefined) continue;
-    return { model: frontmatterValue(frontmatter, 'model'), thinking: frontmatterValue(frontmatter, 'thinking') };
-  }
-  return undefined;
-}
 
 /** True when a model pattern already ends in a thinking suffix (`provider/id:high`). */
 export function hasThinkingSuffix(model: string | undefined): boolean {

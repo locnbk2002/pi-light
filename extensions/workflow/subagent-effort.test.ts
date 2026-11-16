@@ -1,9 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { CONTROLLER_MODEL, hasThinkingSuffix, innerExplicitLevel, planSubagentEffort, readAgentDefaults } from './subagent-effort.ts';
+import { CONTROLLER_MODEL, hasThinkingSuffix, innerExplicitLevel, planSubagentEffort } from './subagent-effort.ts';
 
 const SOL = 'openai-codex/gpt-6.1-sol';
 
@@ -38,47 +37,6 @@ test('child fix-up finds the explicit level only in a double suffix', () => {
   assert.equal(innerExplicitLevel(['--model', 'openrouter/x:free:low']), undefined);
   assert.equal(innerExplicitLevel(['--', '--model', `${SOL}:high:low`]), undefined);
   assert.equal(innerExplicitLevel(['@task.md']), undefined);
-});
-
-test('agent definitions are read like upstream: project first, then the agent dir', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pi-light-agents-'));
-  try {
-    const project = join(root, 'project');
-    const agentDir = join(root, 'agent');
-    await mkdir(join(project, '.pi', 'agents'), { recursive: true });
-    await mkdir(join(agentDir, 'agents'), { recursive: true });
-    await writeFile(join(agentDir, 'agents', 'reviewer.md'), '---\nname: reviewer\nmodel: openai-codex/gpt-6.1-sol\nthinking: high\n---\nBody\n');
-    await writeFile(join(agentDir, 'agents', 'scout.md'), '---\nname: scout\ndescription: x\n---\n');
-    await writeFile(join(agentDir, 'agents', 'broken.md'), 'no frontmatter');
-    assert.deepEqual(readAgentDefaults('reviewer', project, agentDir), { model: SOL, thinking: 'high' });
-    assert.deepEqual(readAgentDefaults('scout', project, agentDir), { model: undefined, thinking: undefined });
-    assert.equal(readAgentDefaults('broken', project, agentDir), undefined);
-    assert.equal(readAgentDefaults('missing', project, agentDir), undefined);
-    await writeFile(join(project, '.pi', 'agents', 'reviewer.md'), '---\nmodel: anthropic/claude-sonnet-5-5\n---\n');
-    assert.deepEqual(readAgentDefaults('reviewer', project, agentDir), { model: 'anthropic/claude-sonnet-5-5', thinking: undefined },
-      'a project definition overrides the global one');
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-test('package agent dirs are searched last, after the project and the agent dir', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pi-light-agents-'));
-  try {
-    const project = join(root, 'project');
-    const agentDir = join(root, 'agent');
-    const kit = join(root, 'kit', 'agents');
-    const light = join(root, 'light', 'agents');
-    await mkdir(join(agentDir, 'agents'), { recursive: true });
-    await mkdir(kit, { recursive: true });
-    await mkdir(light, { recursive: true });
-    await writeFile(join(kit, 'counsel.md'), '---\nmodel: openai-codex/gpt-6.1-sol\nthinking: high\n---\n');
-    await writeFile(join(light, 'counsel.md'), '---\nmodel: anthropic/claude-fable-5-2\n---\n');
-    assert.deepEqual(readAgentDefaults('counsel', project, agentDir, [kit, light]), { model: SOL, thinking: 'high' },
-      'the first package dir wins');
-    assert.equal(readAgentDefaults('counsel', project, agentDir), undefined, 'no package dirs: not found');
-    await writeFile(join(agentDir, 'agents', 'counsel.md'), '---\nmodel: anthropic/claude-sonnet-5-5\n---\n');
-    assert.deepEqual(readAgentDefaults('counsel', project, agentDir, [kit, light]), { model: 'anthropic/claude-sonnet-5-5', thinking: undefined },
-      'the agent dir overrides package dirs');
-  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('the upstream launch format this relies on is unchanged at the pinned commit', async t => {
