@@ -201,11 +201,11 @@ describe("launch plan: curated env exports", () => {
     assert.ok(!script.includes("parents-own-id"), "orchestrator's own PI_SUBAGENT_ID must not leak");
   });
 
-  it("omits PI_SUBAGENT_AUTO_EXIT and PI_SUBAGENT_AGENT without agent defs", () => {
+  it("writes PI_SUBAGENT_AUTO_EXIT=0 and an empty PI_SUBAGENT_AGENT without agent defs", () => {
     const fx = makeFixture();
     const script = scriptOf(plan(fx));
-    assert.ok(!script.includes("PI_SUBAGENT_AUTO_EXIT"));
-    assert.ok(!script.includes("PI_SUBAGENT_AGENT="));
+    assert.ok(script.includes("export PI_SUBAGENT_AUTO_EXIT=0"));
+    assert.ok(script.includes("export PI_SUBAGENT_AGENT=''"));
   });
 
   it("a cwd-local .pi/agent never replaces the parent's PI_CODING_AGENT_DIR", () => {

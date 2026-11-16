@@ -220,10 +220,10 @@ function makeSpawnFixture() {
 // ── activation guard ───────────────────────────────────────────────────────
 
 describe("index: activation guard", () => {
-  it("not inside herdr → no tools registered at load", () => {
+  it("not inside herdr → all four tools registered (headless backend)", () => {
     const fake = createFakePi();
     herdrSubagents(fake.api);
-    assert.deepEqual(fake.toolNames(), []);
+    assert.deepEqual(fake.toolNames(), ["subagent", "subagent_resume", "subagent_interrupt", "subagents_list"]);
   });
 
   it("inside herdr → subagent tool registered at load", () => {
@@ -233,13 +233,13 @@ describe("index: activation guard", () => {
     assert.ok(fake.toolNames().includes("subagent"));
   });
 
-  it("outside herdr: session_start registers no stubs and stays silent", () => {
+  it("outside herdr: session_start runs no herdr check and stays silent", () => {
     const fake = createFakePi({ allTools: [] });
     herdrSubagents(fake.api);
     const { ctx, notifications } = makeFakeCtx();
     fake.fire("session_start", {}, ctx);
 
-    assert.deepEqual(fake.toolNames(), []);
+    assert.equal(fake.toolNames().length, 4);
     assert.deepEqual(notifications, []);
   });
 

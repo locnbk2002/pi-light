@@ -25,12 +25,18 @@
 //
 // Pane text is never used for lifecycle detection. A bounded, best-effort
 // `pane read` captures diagnostics only after a failure has been classified.
-// Stall detection/status transitions remain absent (discarded per plan §9).
+//
+// pi-light additions (D10):
+//   - headless runs (`deps.headless`) classify from the run's own session
+//     entries and stop reason, because `pi -p` exits 0 on errors too;
+//   - `deps.liveness` adds the run-scoped heartbeat check (crashed), a single
+//     non-terminal stall warning, and the hard run limit (timed-out), with
+//     suspend tolerance (a long gap between ticks extends every deadline).
 import { readFileSync, rmSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 
 import type { PaneInfo } from "./herdr/client.ts";
-import { findLastAssistantMessage, getNewEntries } from "./session.ts";
+import { findLastAssistantMessage, findLastAssistantOutcome, getNewEntries } from "./session.ts";
 
 export interface RunningSubagent {
   id: string;
@@ -44,6 +50,10 @@ export interface RunningSubagent {
   interactive: boolean;
   autoExit: boolean;
   abortController?: AbortController;
+  /** "herdr" (pane) or "headless" (background `pi -p`). Default herdr. */
+  backend?: "herdr" | "headless";
+  /** Headless only: process-group leader pid. */
+  pid?: number;
 }
 
 /**
@@ -60,7 +70,22 @@ export type SubagentOutcome =
   | { kind: "completed-user-exit"; summary: string; exitCode: 0 } // no .exit sidecar
   | { kind: "ping"; name: string; message: string }
   | { kind: "launch-failed"; exitCode: number; heldOpen: boolean; paneOutput: string | null }
-  | { kind: "crashed"; exitCode: number; summary: string | null; paneOutput: string | null }
+  | {
+      kind: "crashed";
+      exitCode: number;
+      summary: string | null;
+      paneOutput: string | null;
+      /** Set when the crash was inferred (e.g. dead heartbeat) rather than exited. */
+      reason?: string;
+    }
+  | {
+      kind: "failed";
+      reason: string;
+      exitCode: number | null;
+      summary: string | null;
+      paneOutput: string | null;
+    }
+  | { kind: "timed-out"; summary: string | null; elapsedMs: number }
   | { kind: "pane-killed"; summary: string | null }
   | { kind: "gap-exit"; summary: string | null; exitCode: number | null }
   | { kind: "cancelled" };
@@ -82,6 +107,50 @@ export interface WatcherDeps {
   startupWindowMs?: number;
   /** Clock seam for tests. */
   now?: () => number;
+  /** Headless backend: classify from the run's session entries, not pane state. */
+  headless?: HeadlessProbe;
+  /** Heartbeat / stall / run-limit supervision. */
+  liveness?: LivenessDeps;
+}
+
+export interface HeadlessProbe {
+  /** Session entries that existed before this run (resume): ignored. */
+  entryOffset: number;
+  /** Process exit code, or null while the process is still running. */
+  exitCode(): number | null;
+  /** Bounded stdout/stderr tail for failure diagnostics. */
+  tail(): string;
+}
+
+export interface LivenessDeps {
+  heartbeatFile: string;
+  deadAfterMs: number;
+  stallWarnMs: number;
+  maxRunMs: number;
+  timeoutGraceMs: number;
+  /** Interactive children are exempt from maxRunMs. */
+  exemptFromMaxRun: boolean;
+  /** One non-terminal stall notice per run. */
+  onStall(info: { idleMs: number }): void;
+  /** Graceful stop request (headless: SIGINT to the group; herdr: Escape). */
+  interrupt(): void | Promise<void>;
+  /** Hard stop after the grace period (headless: killTree; herdr: close pane). */
+  kill(): void | Promise<void>;
+}
+
+/** Final assistant text kept in a headless outcome. */
+export const MAX_SUMMARY_BYTES = 50 * 1024;
+
+function truncateSummary(text: string): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= MAX_SUMMARY_BYTES) return text;
+  return `${buf.subarray(0, MAX_SUMMARY_BYTES).toString("utf8")}\n… [truncated at 50 KB]`;
+}
+
+interface HeartbeatRecord {
+  runId?: unknown;
+  at?: unknown;
+  lastActivityAt?: unknown;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -104,6 +173,8 @@ export function watchSubagent(
 
     let done = false;
     let paneEventSeen = false;
+    /** Run limit hit: only the grace timer may settle from now on. */
+    let timingOut = false;
     const cleanups: Array<() => void> = [];
 
     function finish(outcome: SubagentOutcome, consumeSidecars: boolean): void {
@@ -240,6 +311,8 @@ export function watchSubagent(
         };
       }
 
+      if (deps.headless) return classifyHeadless(deps.headless);
+
       const exitInfo = readExitCode();
       if (exitInfo !== null) {
         // A sidecar stamped with a different run's id is definitively not ours
@@ -287,6 +360,52 @@ export function watchSubagent(
       return null; // sidecar trigger without sidecars — not a signal
     }
 
+    /** Headless order: .exit done (above) → run's last assistant message → exit code. */
+    function classifyHeadless(probe: HeadlessProbe): SubagentOutcome | null {
+      const exitInfo = readExitCode();
+      if (exitInfo !== null && exitInfo.id !== null && exitInfo.id !== running.id) {
+        try {
+          rmSync(exitcodeFile, { force: true });
+        } catch {}
+        return null;
+      }
+      // Wait for the process (and its drained stdio) even if the wrapper's
+      // exitcode sidecar already landed; the close event re-triggers us.
+      const processExit = probe.exitCode();
+      if (processExit === null) return null;
+      const exitCode = exitInfo?.code ?? processExit;
+
+      let entries: ReturnType<typeof getNewEntries> = [];
+      try {
+        entries = getNewEntries(running.sessionFile, probe.entryOffset);
+      } catch {}
+      const last = findLastAssistantOutcome(entries);
+      if (last) {
+        if (last.stopReason === "stop") {
+          return {
+            kind: "completed",
+            summary: truncateSummary(last.text || "Sub-agent exited without output"),
+            exitCode: 0,
+            summarySource: "transcript",
+          };
+        }
+        return {
+          kind: "failed",
+          reason: last.stopReason ?? "unknown stop reason",
+          exitCode,
+          summary: last.text ? truncateSummary(last.text) : null,
+          paneOutput: probe.tail(),
+        };
+      }
+      return {
+        kind: "failed",
+        reason: exitCode === 0 ? "exited without output" : `exit code ${exitCode}`,
+        exitCode,
+        summary: null,
+        paneOutput: probe.tail(),
+      };
+    }
+
     let staleCheckInFlight = false;
     let paneCaptureInFlight = false;
 
@@ -304,7 +423,7 @@ export function watchSubagent(
     }
 
     function trySettle(trigger: Trigger): void {
-      if (done) return;
+      if (done || timingOut) return;
       const outcome = classify(trigger);
       if (!outcome) return;
 
@@ -377,10 +496,111 @@ export function watchSubagent(
       }
     }
 
+    // ── liveness: run-scoped heartbeat, stall warning, hard run limit ──
+
+    const startedAt = now();
+    let prevTick = startedAt;
+    let suspendedTotal = 0;
+    /** Watcher-clock time we last saw this run's heartbeat advance (or launch). */
+    let lastAliveMark = startedAt;
+    let lastHeartbeatAt: number | null = null;
+    let lastActivityAt = startedAt;
+    let stallWarned = false;
+
+    function readHeartbeat(file: string): HeartbeatRecord | null {
+      try {
+        return JSON.parse(readFileSync(file, "utf8")) as HeartbeatRecord;
+      } catch {
+        return null;
+      }
+    }
+
+    function startTimeout(liveness: LivenessDeps, t: number): void {
+      timingOut = true;
+      void Promise.resolve()
+        .then(() => liveness.interrupt())
+        .catch(() => {});
+      const grace = setTimeout(() => {
+        if (done) return;
+        const exitData = readExitSidecar();
+        const sidecarSummary =
+          exitData?.type === "done" && typeof exitData.summary === "string" && exitData.summary.trim()
+            ? exitData.summary.trim()
+            : null;
+        void Promise.resolve()
+          .then(() => liveness.kill())
+          .catch(() => {});
+        finish(
+          {
+            kind: "timed-out",
+            summary: sidecarSummary ?? readSummary(),
+            elapsedMs: t - startedAt - suspendedTotal,
+          },
+          true,
+        );
+      }, liveness.timeoutGraceMs);
+      cleanups.push(() => clearTimeout(grace));
+    }
+
+    function livenessTick(liveness: LivenessDeps): void {
+      const t = now();
+      const gap = t - prevTick;
+      prevTick = t;
+      if (gap > 2 * pollIntervalMs) {
+        // Laptop suspend (or a stalled event loop): extend every deadline by
+        // the missing time and skip judging liveness on this tick.
+        const missing = gap - pollIntervalMs;
+        suspendedTotal += missing;
+        lastAliveMark += missing;
+        lastActivityAt += missing;
+        return;
+      }
+
+      const hb = readHeartbeat(liveness.heartbeatFile);
+      if (hb && hb.runId === running.id && typeof hb.at === "number") {
+        if (hb.at !== lastHeartbeatAt) {
+          lastHeartbeatAt = hb.at;
+          lastAliveMark = t;
+        }
+        if (typeof hb.lastActivityAt === "number" && hb.lastActivityAt > lastActivityAt) {
+          lastActivityAt = hb.lastActivityAt;
+        }
+      }
+
+      if (t - lastAliveMark > liveness.deadAfterMs) {
+        finish(
+          {
+            kind: "crashed",
+            exitCode: -1,
+            summary: readSummary(),
+            paneOutput: deps.headless ? deps.headless.tail() : null,
+            reason: `no heartbeat for ${Math.round((t - lastAliveMark) / 1000)}s`,
+          },
+          false,
+        );
+        return;
+      }
+
+      if (!stallWarned && t - lastActivityAt > liveness.stallWarnMs) {
+        stallWarned = true;
+        try {
+          liveness.onStall({ idleMs: t - lastActivityAt });
+        } catch {}
+      }
+
+      if (!liveness.exemptFromMaxRun && t - startedAt - suspendedTotal > liveness.maxRunMs) {
+        startTimeout(liveness, t);
+      }
+    }
+
     const pollTimer = setInterval(() => {
-      if (done) return;
+      if (done || timingOut) return;
       trySettle("sidecar");
       if (done) return;
+      if (deps.liveness) {
+        livenessTick(deps.liveness);
+        if (done || timingOut) return;
+      }
       void checkPaneGone(false);
     }, pollIntervalMs);
     cleanups.push(() => clearInterval(pollTimer));

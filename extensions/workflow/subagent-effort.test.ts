@@ -60,6 +60,27 @@ test('agent definitions are read like upstream: project first, then the agent di
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('package agent dirs are searched last, after the project and the agent dir', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-light-agents-'));
+  try {
+    const project = join(root, 'project');
+    const agentDir = join(root, 'agent');
+    const kit = join(root, 'kit', 'agents');
+    const light = join(root, 'light', 'agents');
+    await mkdir(join(agentDir, 'agents'), { recursive: true });
+    await mkdir(kit, { recursive: true });
+    await mkdir(light, { recursive: true });
+    await writeFile(join(kit, 'counsel.md'), '---\nmodel: openai-codex/gpt-6.1-sol\nthinking: high\n---\n');
+    await writeFile(join(light, 'counsel.md'), '---\nmodel: anthropic/claude-fable-5-2\n---\n');
+    assert.deepEqual(readAgentDefaults('counsel', project, agentDir, [kit, light]), { model: SOL, thinking: 'high' },
+      'the first package dir wins');
+    assert.equal(readAgentDefaults('counsel', project, agentDir), undefined, 'no package dirs: not found');
+    await writeFile(join(agentDir, 'agents', 'counsel.md'), '---\nmodel: anthropic/claude-sonnet-5-5\n---\n');
+    assert.deepEqual(readAgentDefaults('counsel', project, agentDir, [kit, light]), { model: 'anthropic/claude-sonnet-5-5', thinking: undefined },
+      'the agent dir overrides package dirs');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('the upstream launch format this relies on is unchanged at the pinned commit', async t => {
   // pi-herdr-subagents src/launch.ts @ 2489019: `--model ${model}:${thinking}`, only when a model is set.
   const launch = join(process.env.HOME ?? '', '.pi/agent/git/github.com/modem-dev/pi-herdr-subagents/src/launch.ts');

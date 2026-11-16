@@ -23,6 +23,9 @@ import {
   SPAWNING_TOOLS,
 } from "../src/agents.ts";
 
+/** These upstream tests exercise project agents; pi-light reads them only for trusted projects. */
+const TRUSTED = { projectTrusted: true } as const;
+
 // --- Helpers (same technique as the reference tests) ---
 
 function createTestDir(): string {
@@ -161,7 +164,7 @@ describe("agents.ts", () => {
           ].join("\n"),
         );
 
-        const loaded = loadAgentDefaults("lineage-mode-test-agent");
+        const loaded = loadAgentDefaults("lineage-mode-test-agent", TRUSTED);
         assert.ok(loaded, "expected agent to load");
         assert.equal(loaded.sessionMode, "lineage-only");
       });
@@ -188,8 +191,8 @@ describe("agents.ts", () => {
           ].join("\n"),
         );
 
-        assert.equal(loadAgentDefaults("interactive-true-test-agent")?.interactive, true);
-        assert.equal(loadAgentDefaults("interactive-false-test-agent")?.interactive, false);
+        assert.equal(loadAgentDefaults("interactive-true-test-agent", TRUSTED)?.interactive, true);
+        assert.equal(loadAgentDefaults("interactive-false-test-agent", TRUSTED)?.interactive, false);
       });
     });
 
@@ -203,7 +206,7 @@ describe("agents.ts", () => {
           ),
         );
 
-        assert.equal(loadAgentDefaults("interactive-unset-test-agent")?.interactive, undefined);
+        assert.equal(loadAgentDefaults("interactive-unset-test-agent", TRUSTED)?.interactive, undefined);
       });
     });
 
@@ -219,7 +222,7 @@ describe("agents.ts", () => {
           ].join("\n"),
         );
 
-        const loaded = loadAgentDefaults("invalid-mode-test-agent");
+        const loaded = loadAgentDefaults("invalid-mode-test-agent", TRUSTED);
         assert.ok(loaded, "expected agent to load");
         assert.equal(loaded.sessionMode, undefined);
       });
@@ -240,7 +243,7 @@ describe("agents.ts", () => {
           "You are the project agent.",
         );
 
-        const loaded = loadAgentDefaults("precedence-test-agent");
+        const loaded = loadAgentDefaults("precedence-test-agent", TRUSTED);
         assert.equal(loaded?.model, "anthropic/test-project");
         assert.equal(loaded?.body, "You are the project agent.");
       });
@@ -254,13 +257,13 @@ describe("agents.ts", () => {
           ["name: global-only-test-agent", "model: anthropic/test-global-only"].join("\n"),
         );
 
-        assert.equal(loadAgentDefaults("global-only-test-agent")?.model, "anthropic/test-global-only");
+        assert.equal(loadAgentDefaults("global-only-test-agent", TRUSTED)?.model, "anthropic/test-global-only");
       });
     });
 
     it("returns null for unknown agents", async () => {
       await withIsolatedAgentEnv(async () => {
-        assert.equal(loadAgentDefaults("no-such-agent-anywhere"), null);
+        assert.equal(loadAgentDefaults("no-such-agent-anywhere", TRUSTED), null);
       });
     });
   });
@@ -284,7 +287,7 @@ describe("agents.ts", () => {
           ["name: shadowed-discovery-agent", "model: anthropic/test-project"].join("\n"),
         );
 
-        const agents = discoverAgentDefinitions();
+        const agents = discoverAgentDefinitions(TRUSTED);
         const global = agents.find((a) => a.name === "global-discovery-agent");
         assert.ok(global);
         assert.equal(global.source, "global");
@@ -316,12 +319,12 @@ describe("agents.ts", () => {
           "You are the hidden agent.",
         );
 
-        const agents = discoverAgentDefinitions();
+        const agents = discoverAgentDefinitions(TRUSTED);
         const hidden = agents.find((a) => a.name === "hidden-discovery-test-agent");
         assert.ok(hidden, "expected discovery to include the hidden agent");
         assert.equal(hidden.disableModelInvocation, true);
 
-        const loaded = loadAgentDefaults("hidden-discovery-test-agent");
+        const loaded = loadAgentDefaults("hidden-discovery-test-agent", TRUSTED);
         assert.ok(loaded, "expected hidden agent to remain directly loadable");
         assert.equal(loaded.model, "anthropic/test-hidden");
         assert.equal(loaded.body, "You are the hidden agent.");
@@ -353,12 +356,12 @@ describe("agents.ts", () => {
           "You are the project hidden agent.",
         );
 
-        const agents = discoverAgentDefinitions();
+        const agents = discoverAgentDefinitions(TRUSTED);
         const found = agents.find((a) => a.name === "shadowed-hidden-test-agent");
         assert.ok(found);
         assert.equal(found.disableModelInvocation, true, "project hidden def wins");
 
-        const loaded = loadAgentDefaults("shadowed-hidden-test-agent");
+        const loaded = loadAgentDefaults("shadowed-hidden-test-agent", TRUSTED);
         assert.ok(loaded, "expected project override to remain directly loadable");
         assert.equal(loaded.model, "anthropic/test-project");
         assert.equal(loaded.body, "You are the project hidden agent.");

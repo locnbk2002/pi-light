@@ -142,6 +142,29 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
 }
 
 /**
+ * Last assistant message of a run with its stop reason (pi-light headless
+ * classification). `text` is the joined non-empty text blocks (may be "").
+ */
+export function findLastAssistantOutcome(
+  entries: SessionEntry[],
+): { text: string; stopReason: string | null } | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    const msg = entry as MessageEntry;
+    if (msg.message.role !== "assistant") continue;
+    const text = msg.message.content
+      .filter((block) => block.type === "text" && typeof block.text === "string")
+      .map((block) => block.text as string)
+      .join("\n")
+      .trim();
+    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
+    return { text, stopReason: typeof stopReason === "string" ? stopReason : null };
+  }
+  return null;
+}
+
+/**
  * Append a branch_summary entry to the session file.
  * Returns the new entry's id.
  */

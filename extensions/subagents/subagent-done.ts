@@ -31,6 +31,7 @@ import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 
 import { writeContextUsageSidecar } from "./src/context-usage.ts";
+import { startHeartbeat, type Heartbeat } from "./src/heartbeat.ts";
 import { getActiveSubagentCount } from "./src/runtime-state.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -215,8 +216,17 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Run-scoped heartbeat for the parent's watchdog (pi-light).
+  let heartbeat: Heartbeat | null = null;
+
   // Show widget on session start
   pi.on("session_start", (_event, ctx) => {
+    const heartbeatSession = process.env.PI_SUBAGENT_SESSION;
+    const runId = process.env.PI_SUBAGENT_ID;
+    if (heartbeatSession && runId && !heartbeat) {
+      heartbeat = startHeartbeat(`${heartbeatSession}.heartbeat`, runId);
+    }
+
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -233,9 +243,23 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    heartbeat?.touch({ kind: "agent_start" });
+  });
+
+  pi.on("turn_start", () => {
+    heartbeat?.touch({ kind: "turn_start" });
+  });
+
+  pi.on("tool_execution_start", (event) => {
+    heartbeat?.touch({ kind: "tool_start", tool: String((event as { toolName?: unknown }).toolName ?? "") });
+  });
+
+  pi.on("tool_execution_end", () => {
+    heartbeat?.touch({ kind: "tool_end" });
   });
 
   pi.on("agent_end", (event, ctx) => {
+    heartbeat?.touch({ kind: "agent_end" });
     const messages = (event as any).messages as any[] | undefined;
     const shouldExit =
       autoExit &&
@@ -262,6 +286,8 @@ export default function (pi: ExtensionAPI) {
   // User-driven exits do not pass through a terminal tool or clean agent_end.
   // Do not overwrite a snapshot already published by another terminal path.
   pi.on("session_shutdown", (_event, ctx) => {
+    heartbeat?.stop();
+    heartbeat = null;
     snapshotContextUsage(ctx, true);
   });
 
@@ -306,6 +332,8 @@ export default function (pi: ExtensionAPI) {
           { type: "text", text: "Ping sent. Session will exit and parent will be notified." },
         ],
         details: {},
+        // ctx.shutdown() is a no-op in print mode; terminate stops the agent loop.
+        terminate: true,
       };
     },
   });
@@ -337,6 +365,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
         details: {},
+        terminate: true,
       };
     },
   });

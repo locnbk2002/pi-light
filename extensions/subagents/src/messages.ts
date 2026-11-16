@@ -78,6 +78,13 @@ export function resolveResultPresentation(
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef(result.sessionFile)}`;
 }
 
+/** Where the child runs, for failure messages. */
+function location(running: RunningSubagent): string {
+  return running.backend === "headless"
+    ? `Process: pid ${running.pid ?? "?"} (headless; output log: ${running.sessionFile}.log)`
+    : `Pane: ${running.paneId} (herdr)`;
+}
+
 /**
  * Convert a terminal SubagentOutcome into a steer message payload for
  * pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" }).
@@ -104,7 +111,9 @@ export function buildOutcomeMessage(
     elapsed,
     sessionFile: running.sessionFile,
     ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
-    paneId: running.paneId,
+    ...(running.backend === "headless"
+      ? { backend: "headless", pid: running.pid }
+      : { paneId: running.paneId }),
     disposition: outcome.kind,
     ...(opts?.contextUsage ? { contextUsage: opts.contextUsage } : {}),
   };
@@ -148,7 +157,7 @@ export function buildOutcomeMessage(
 
     case "launch-failed": {
       const summaryLines = [
-        `Pane: ${running.paneId} (herdr)`,
+        location(running),
         `Launch script: ${running.launchScriptFile}`,
         "",
         ...(outcome.heldOpen ? ["The pane was left open for post-mortem."] : []),
@@ -159,7 +168,7 @@ export function buildOutcomeMessage(
       const content = [
         `Sub-agent "${running.name}" failed to launch (exit code ${outcome.exitCode}).`,
         "",
-        `Pane: ${running.paneId} (herdr)`,
+        location(running),
         `Launch script: ${running.launchScriptFile}`,
         "",
         paneOutputSection(outcome.paneOutput),
@@ -185,7 +194,11 @@ export function buildOutcomeMessage(
     }
 
     case "crashed": {
-      const summary = outcome.summary ?? `Sub-agent exited with code ${outcome.exitCode}`;
+      const summary =
+        outcome.summary ??
+        (outcome.reason
+          ? `Sub-agent presumed dead: ${outcome.reason}`
+          : `Sub-agent exited with code ${outcome.exitCode}`);
       return {
         customType: "subagent_result",
         content:
@@ -200,9 +213,47 @@ export function buildOutcomeMessage(
           ...baseDetails,
           exitCode: outcome.exitCode,
           error: "crashed",
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
           summary: outcome.summary,
           paneOutput: outcome.paneOutput,
         },
+      };
+    }
+
+    case "failed": {
+      const content = [
+        `Sub-agent "${running.name}" failed (${outcome.reason}) after ${formatElapsed(elapsed)}.`,
+        location(running),
+        ...(outcome.summary ? ["", "Last message:", "", outcome.summary] : []),
+        "",
+        paneOutputSection(outcome.paneOutput),
+      ].join("\n");
+      return {
+        customType: "subagent_result",
+        content: content + sessionRef(running.sessionFile) + usageSuffix,
+        display: true,
+        details: {
+          ...baseDetails,
+          ...(outcome.exitCode != null ? { exitCode: outcome.exitCode } : {}),
+          error: "failed",
+          reason: outcome.reason,
+          summary: outcome.summary,
+          paneOutput: outcome.paneOutput,
+        },
+      };
+    }
+
+    case "timed-out": {
+      const minutes = Math.round(outcome.elapsedMs / 60_000);
+      const summary = outcome.summary ?? "No assistant output captured.";
+      return {
+        customType: "subagent_result",
+        content:
+          `Sub-agent "${running.name}" timed out after ${minutes} min (hard limit) and was stopped. ` +
+          `Split long jobs into smaller subagent tasks. Partial result:\n\n` +
+          `${summary}${sessionRef(running.sessionFile)}${usageSuffix}`,
+        display: true,
+        details: { ...baseDetails, error: "timed-out", summary: outcome.summary },
       };
     }
 
@@ -211,7 +262,7 @@ export function buildOutcomeMessage(
       return {
         customType: "subagent_result",
         content:
-          `Sub-agent "${running.name}" failed: herdr pane ${running.paneId} was ` +
+          `Sub-agent "${running.name}" failed: subagent ${running.paneId} was ` +
           `closed before completion (killed externally, no exit recorded) — last message:\n\n` +
           `${summary}${sessionRef(running.sessionFile)}${usageSuffix}`,
         display: true,
@@ -225,7 +276,7 @@ export function buildOutcomeMessage(
         customType: "subagent_result",
         content:
           `Sub-agent "${running.name}" ended while the event stream was down ` +
-          `(herdr pane ${running.paneId} is gone; no exit sidecars found) — last message:\n\n` +
+          `(subagent ${running.paneId} is gone; no exit sidecars found) — last message:\n\n` +
           `${summary}${sessionRef(running.sessionFile)}${usageSuffix}`,
         display: true,
         details: {
@@ -275,6 +326,10 @@ function statusText(disposition: string | undefined, exitCode: number): string {
       return "pane closed externally";
     case "gap-exit":
       return "ended (event-stream gap)";
+    case "failed":
+      return "failed";
+    case "timed-out":
+      return "timed out (30 min limit)";
     default:
       return exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
   }

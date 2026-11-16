@@ -20,11 +20,14 @@ function frontmatterValue(frontmatter: string, key: string): string | undefined 
 
 /**
  * The `model:` and `thinking:` that upstream `loadAgentDefaults` would read, with the same lookup order
- * and parsing (pi-herdr-subagents src/agents.ts @ 2489019): project `.pi/agents` first, then the agent dir.
+ * and parsing (pi-herdr-subagents src/agents.ts @ 2489019): project `.pi/agents` first, then the agent dir,
+ * then (pi-light) package agent directories, highest priority first.
  */
 export function readAgentDefaults(name: string, cwd = process.cwd(),
-  agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')): AgentDefaults | undefined {
-  for (const path of [join(cwd, '.pi', 'agents', `${name}.md`), join(agentDir, 'agents', `${name}.md`)]) {
+  agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'), packageDirs: string[] = []): AgentDefaults | undefined {
+  const paths = [join(cwd, '.pi', 'agents', `${name}.md`), join(agentDir, 'agents', `${name}.md`),
+    ...packageDirs.map(dir => join(dir, `${name}.md`))];
+  for (const path of paths) {
     if (!existsSync(path)) continue;
     const frontmatter = /^---\n([\s\S]*?)\n---/.exec(readFileSync(path, 'utf8'))?.[1];
     if (frontmatter === undefined) continue;

@@ -5,6 +5,8 @@ import { Type } from 'typebox';
 import { Text } from '@earendil-works/pi-tui';
 import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
 import { answerReadOnlyQueries } from '../../lib/read-only-events.ts';
+import { queryAgentDirs } from '../../lib/agent-dirs-events.ts';
+import { PI_LIGHT_AGENTS_DIR } from '../subagents/src/agents.ts';
 import { ControllerPolicy, advisorName, handoffDraft, HANDOFF_REQUEST,
   nonempty, parseAdvisorArgs, type Advisor } from './controller-policy.ts';
 import { AdvisorSessions, providerErrorSummary, replyModelLabel, resolvePiCliPath, type AdvisorEffort, type AdvisorReply, type AskOptions } from './rpc-session.ts';
@@ -620,7 +622,9 @@ export default function piLight(pi: ExtensionAPI): void {
   const pendingJudgments = new Map<string, { input: string; judged: Promise<JudgeResult> }>();
   function subagentPlan(input: Record<string, unknown>): SubagentEffortPlan {
     const agent = typeof input.agent === 'string' && input.agent.trim() ? input.agent.trim() : undefined;
-    return planSubagentEffort(input, agent ? readAgentDefaults(agent) : undefined);
+    // Package dirs, highest priority first (the subagents extension lets later replies win).
+    const packageDirs = [...queryAgentDirs(pi.events).reverse(), PI_LIGHT_AGENTS_DIR];
+    return planSubagentEffort(input, agent ? readAgentDefaults(agent, undefined, undefined, packageDirs) : undefined);
   }
   function startJudgment(input: string, ctx: ExtensionContext): Promise<JudgeResult> {
     const judged = judgeEffort({ input, settings: models.effort, call: registryJudgeCall(ctx.modelRegistry),

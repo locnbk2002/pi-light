@@ -774,7 +774,7 @@ describe("index tools: commands", () => {
 
     assert.equal(result.details.error, "agent not found");
     assert.match(result.content[0].text, /Agent "missing" not found/);
-    assert.match(result.content[0].text, /\.pi\/agents/);
+    assert.match(result.content[0].text, /agents\/missing\.md/);
     assert.equal(launchCount, 0);
   });
 

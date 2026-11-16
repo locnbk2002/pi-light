@@ -27,7 +27,7 @@ import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
+import { perRunExports, resolveChildTools, shellEscape, type ToolCeiling } from "./child-env.ts";
 import {
   type AgentDefaults,
   getAgentConfigDir,
@@ -70,6 +70,10 @@ export interface LaunchPlanContext {
   resolvePiBin?: (env: Record<string, string | undefined>) => string;
   /** Override the child extension path (default: <package root>/subagent-done.ts). */
   subagentDonePath?: string;
+  /** Launch as a background `pi -p` process instead of a herdr pane. */
+  headless?: boolean;
+  /** Parent's active-tool ceiling (pi.getActiveTools / getAllTools at call time). */
+  toolCeiling?: ToolCeiling;
 }
 
 export interface LaunchPlan {
@@ -138,8 +142,32 @@ function commentSafe(value: string): string {
   return value.replace(/[^\x20-\x7E]/g, "?");
 }
 
-export function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
+export { shellEscape };
+
+/** Headless children run with no pane (and must never block on a hold-open `read`). */
+function backendExports(headless: boolean): string[] {
+  return headless
+    ? ["export PI_HERDR_HOLD_OPEN_SECS=0"]
+    : // The pane id is only known inside the pane — forward herdr's injected env.
+      ['export PI_SUBAGENT_PANE="${HERDR_PANE_ID:-}"'];
+}
+
+function wrapperEnv(
+  env: Record<string, string | undefined>,
+  headless: boolean,
+): Record<string, string | undefined> {
+  return headless ? { ...env, PI_HERDR_HOLD_OPEN_SECS: "0" } : env;
+}
+
+/** Headless children cannot ask the user; denials must reach the controller. */
+export const BLOCKED_ACTIONS_INSTRUCTION =
+  "If any tool call is denied by permission policy, finish with a section 'Blocked actions' listing tool, target and reason.";
+
+/** Extra system-prompt text appended to every child launch (empty → none). */
+export function buildRuntimePrompt(opts: { headless: boolean; agent?: string }): string {
+  const parts: string[] = [];
+  if (opts.headless) parts.push(BLOCKED_ACTIONS_INSTRUCTION);
+  return parts.join("\n\n");
 }
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
@@ -395,7 +423,7 @@ export function buildLaunchPlan(
 
   // ── pi argv ──
   const piBin = env.PI_HERDR_PI_BIN ?? (ctx.resolvePiBin ?? defaultResolvePiBin)(env);
-  const piArgv: string[] = [piBin, "--session", sessionFile];
+  const piArgv: string[] = [piBin, ...(ctx.headless ? ["-p"] : []), "--session", sessionFile];
 
   const subagentDonePath = ctx.subagentDonePath ?? join(PACKAGE_ROOT, "subagent-done.ts");
   piArgv.push("-e", subagentDonePath);
@@ -416,7 +444,14 @@ export function buildLaunchPlan(
     );
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  const runtimePrompt = buildRuntimePrompt({ headless: ctx.headless === true, agent: params.agent });
+  if (runtimePrompt) {
+    const runtimePromptFile = join(artifactDir, "context", `${name}-runtime-${artifactTimestamp}.md`);
+    files.push({ path: runtimePromptFile, content: runtimePrompt });
+    piArgv.push("--append-system-prompt", runtimePromptFile);
+  }
+
+  const toolAllowlist = resolveChildTools(ctx.toolCeiling, effectiveTools);
   if (toolAllowlist) {
     piArgv.push("--tools", toolAllowlist);
   }
@@ -441,29 +476,23 @@ export function buildLaunchPlan(
   // ── Curated env exports (never a full env dump) ──
   const exports: string[] = [];
   if (env.PATH) exports.push(`export PATH=${shellEscape(env.PATH)}`);
-  // Never switch profile by cwd: a repo-local .pi/agent is not trusted.
-  if (env.PI_CODING_AGENT_DIR) {
-    exports.push(`export PI_CODING_AGENT_DIR=${shellEscape(env.PI_CODING_AGENT_DIR)}`);
-  }
-  const denySet = resolveDenyTools(agentDefs);
-  if (denySet.size > 0) {
-    exports.push(`export PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
-  }
-  exports.push(`export PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  if (params.agent) {
-    exports.push(`export PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  if (autoExit) {
-    exports.push("export PI_SUBAGENT_AUTO_EXIT=1");
-  }
-  exports.push(`export PI_SUBAGENT_SESSION=${shellEscape(sessionFile)}`);
-  exports.push(`export PI_SUBAGENT_ID=${shellEscape(id)}`);
-  // The pane id is only known inside the pane — forward herdr's injected env.
-  exports.push('export PI_SUBAGENT_PANE="${HERDR_PANE_ID:-}"');
+  // Never switch profile by cwd: the child always gets the parent's profile.
+  exports.push(
+    ...perRunExports({
+      id,
+      name: params.name,
+      agent: params.agent,
+      sessionFile,
+      autoExit,
+      denyTools: resolveDenyTools(agentDefs),
+      env,
+    }),
+  );
+  exports.push(...backendExports(ctx.headless === true));
 
   // ── Wrapper script ──
   const { content: scriptContent, holdOpenSecs } = buildWrapperScript({
-    env,
+    env: wrapperEnv(env, ctx.headless === true),
     headerLines: [
       `# Subagent launch script for ${params.name}`,
       `# Generated: ${now.toISOString()}`,
@@ -509,6 +538,8 @@ export function buildLaunchPlan(
 export interface ResumeLaunchParams {
   sessionPath: string;
   name?: string;
+  /** Agent definition the resumed session runs as (identity for the permission system). */
+  agent?: string;
   message?: string;
   autoExit?: boolean;
 }
@@ -577,7 +608,23 @@ export function buildResumeLaunchPlan(
   // ── pi argv ──
   const piBin = env.PI_HERDR_PI_BIN ?? (ctx.resolvePiBin ?? defaultResolvePiBin)(env);
   const subagentDonePath = ctx.subagentDonePath ?? join(PACKAGE_ROOT, "subagent-done.ts");
-  const piArgv: string[] = [piBin, "--session", params.sessionPath, "-e", subagentDonePath];
+  const piArgv: string[] = [
+    piBin,
+    ...(ctx.headless ? ["-p"] : []),
+    "--session",
+    params.sessionPath,
+    "-e",
+    subagentDonePath,
+  ];
+
+  const runtimePrompt = buildRuntimePrompt({ headless: ctx.headless === true, agent: params.agent });
+  if (runtimePrompt) {
+    const runtimePromptFile = join(artifactDir, "context", `${name}-resume-runtime-${artifactTimestamp}.md`);
+    files.push({ path: runtimePromptFile, content: runtimePrompt });
+    piArgv.push("--append-system-prompt", runtimePromptFile);
+  }
+  const toolAllowlist = resolveChildTools(ctx.toolCeiling, undefined);
+  if (toolAllowlist) piArgv.push("--tools", toolAllowlist);
 
   let resumeMessageFile: string | null = null;
   if (params.message) {
@@ -589,19 +636,21 @@ export function buildResumeLaunchPlan(
   // ── Curated env exports (never a full env dump) ──
   const exports: string[] = [];
   if (env.PATH) exports.push(`export PATH=${shellEscape(env.PATH)}`);
-  if (env.PI_CODING_AGENT_DIR) {
-    exports.push(`export PI_CODING_AGENT_DIR=${shellEscape(env.PI_CODING_AGENT_DIR)}`);
-  }
-  exports.push(`export PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
-  if (autoExit) {
-    exports.push("export PI_SUBAGENT_AUTO_EXIT=1");
-  }
-  exports.push(`export PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
-  exports.push(`export PI_SUBAGENT_ID=${shellEscape(id)}`);
-  exports.push('export PI_SUBAGENT_PANE="${HERDR_PANE_ID:-}"');
+  exports.push(
+    ...perRunExports({
+      id,
+      name: displayName,
+      agent: params.agent,
+      sessionFile: params.sessionPath,
+      autoExit,
+      denyTools: [],
+      env,
+    }),
+  );
+  exports.push(...backendExports(ctx.headless === true));
 
   const { content: scriptContent, holdOpenSecs } = buildWrapperScript({
-    env,
+    env: wrapperEnv(env, ctx.headless === true),
     headerLines: [
       `# Subagent resume script for ${displayName}`,
       `# Generated: ${now.toISOString()}`,

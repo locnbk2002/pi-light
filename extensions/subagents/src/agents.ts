@@ -11,8 +11,9 @@
 // - No bundled `package` source in runtime discovery; package templates must be copied into
 //   user-owned config explicitly with /subagents-init.
 // - Params typed as a plain interface instead of the extension's typebox schema.
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 export type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -49,7 +50,44 @@ export interface AgentDefaults {
   disableModelInvocation?: boolean;
 }
 
-export type AgentSource = "global" | "project";
+export type AgentSource = "package" | "global" | "project";
+
+/**
+ * Discovery options (pi-light). Sources, later winning: package dirs
+ * (pi-light's own agents/ plus `extraDirs` from the agent-dirs event bus),
+ * then the global profile, then the project's .pi/agents — the last only
+ * when the project is trusted.
+ */
+export interface AgentLookup {
+  projectTrusted?: boolean;
+  extraDirs?: string[];
+}
+
+/** pi-light's own agents/ (src → subagents → extensions → package root). */
+export const PI_LIGHT_AGENTS_DIR = join(
+  dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url))))),
+  "agents",
+);
+
+/** Search directories in increasing priority. */
+export function agentSearchDirs(opts: AgentLookup = {}): Array<{ path: string; source: AgentSource }> {
+  const dirs: Array<{ path: string; source: AgentSource }> = [];
+  const seen = new Set<string>();
+  const add = (path: string, source: AgentSource) => {
+    let key = path;
+    try {
+      key = realpathSync(path);
+    } catch {}
+    if (seen.has(key)) return;
+    seen.add(key);
+    dirs.push({ path, source });
+  };
+  add(PI_LIGHT_AGENTS_DIR, "package");
+  for (const dir of opts.extraDirs ?? []) add(dir, "package");
+  add(join(getAgentConfigDir(), "agents"), "global");
+  if (opts.projectTrusted === true) add(join(process.cwd(), ".pi", "agents"), "project");
+  return dirs;
+}
 
 export interface AgentDefinition extends AgentDefaults {
   name: string;
@@ -154,12 +192,9 @@ export function parseAgentDefinition(
   };
 }
 
-export function discoverAgentDefinitions(): ListedAgentDefinition[] {
+export function discoverAgentDefinitions(opts: AgentLookup = {}): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
-  const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-  ];
+  const dirs = agentSearchDirs(opts);
 
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
@@ -254,12 +289,11 @@ export function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-export function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-  ];
+export function loadAgentDefaults(agentName: string, opts: AgentLookup = {}): AgentDefaults | null {
+  // Agents resolve by file stem; highest-priority source first.
+  const paths = agentSearchDirs(opts)
+    .reverse()
+    .map(({ path }) => join(path, `${agentName}.md`));
 
   for (const p of paths) {
     if (!existsSync(p)) continue;

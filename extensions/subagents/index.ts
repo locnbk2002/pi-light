@@ -20,9 +20,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  agentSearchDirs,
   discoverAgentDefinitions,
   getAgentConfigDir,
   loadAgentDefaults,
+  type AgentLookup,
 } from "./src/agents.ts";
 import {
   createHerdrClient,
@@ -31,6 +33,22 @@ import {
   type HerdrClient,
 } from "./src/herdr/client.ts";
 import { createHerdrEventStream } from "./src/herdr/events.ts";
+import {
+  headlessWatcherDeps,
+  interruptTree,
+  killTree,
+  startHeadless,
+  type HeadlessChild,
+} from "./src/headless.ts";
+import {
+  DEAD_AFTER_MS,
+  MAX_RUN_MS,
+  POLL_MS,
+  STALL_WARN_MS,
+  TIMEOUT_GRACE_MS,
+} from "./src/limits.ts";
+import { queryAgentDirs } from "../../lib/agent-dirs-events.ts";
+import { isOneShotInvocation } from "../../lib/run-mode.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
 import {
   assertSafeLabel,
@@ -39,6 +57,7 @@ import {
   resolveResumeLaunchBehavior,
 } from "./src/launch.ts";
 import {
+  type SubagentSteerMessage,
   buildOutcomeMessage,
   renderSubagentPing,
   renderSubagentResult,
@@ -182,6 +201,9 @@ function getEventStream(): WatcherStream {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+/** Headless process handles of running subagents, keyed by run id (owned: killed on shutdown). */
+const headlessChildren = new Map<string, HeadlessChild>();
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
@@ -335,11 +357,62 @@ function startWidgetRefresh(): void {
 
 // ── watcher arming + outcome→steer wiring ───────────────────────────────────
 
+/** Per-run backend: herdr client/stream, or a headless process adapter. */
+type WatcherBackend = Omit<WatcherDeps, "signal" | "liveness">;
+
+function herdrBackend(): WatcherBackend {
+  return { client: deps.client, stream: getEventStream() };
+}
+
+function livenessFor(pi: ExtensionAPI, running: RunningSubagent): NonNullable<WatcherDeps["liveness"]> {
+  const headless = running.backend === "headless";
+  return {
+    heartbeatFile: `${running.sessionFile}.heartbeat`,
+    deadAfterMs: DEAD_AFTER_MS,
+    stallWarnMs: STALL_WARN_MS,
+    maxRunMs: MAX_RUN_MS,
+    timeoutGraceMs: TIMEOUT_GRACE_MS,
+    exemptFromMaxRun: running.interactive,
+    onStall({ idleMs }) {
+      pi.sendMessage(
+        {
+          customType: "subagent-stall",
+          content:
+            `Sub-agent "${running.name}" shows no activity for ${Math.round(idleMs / 60_000)} min ` +
+            "(still alive; it is stopped at the 30 min limit).",
+          display: true,
+          details: { id: running.id, name: running.name, idleMs },
+        },
+        { triggerTurn: false },
+      );
+      updateWidget();
+    },
+    interrupt() {
+      if (headless) interruptTree(running.pid ?? -1);
+      else return deps.client.paneSendKeys(running.paneId, ["esc"]);
+    },
+    kill() {
+      if (headless) return killTree(running.pid ?? -1);
+      return deps.client.paneClose(running.paneId);
+    },
+  };
+}
+
+/**
+ * Watch one run. The outcome becomes a steer message (interactive
+ * controllers) or is returned to the caller (`deliver: false`, one-shot
+ * controllers, which dispose before any later steer could arrive).
+ */
 function armWatcher(
   pi: ExtensionAPI,
   running: RunningSubagent,
-  mapOutcome?: (outcome: SubagentOutcome) => SubagentOutcome,
-): void {
+  backend: WatcherBackend,
+  opts: {
+    mapOutcome?: (outcome: SubagentOutcome) => SubagentOutcome;
+    deliver?: boolean;
+  } = {},
+): Promise<SubagentSteerMessage | null> {
+  const deliver = opts.deliver ?? true;
   const watcherAbort = new AbortController();
   running.abortController = watcherAbort;
 
@@ -351,44 +424,131 @@ function armWatcher(
   markSubagentActive(running.id);
   startWidgetRefresh();
 
-  void deps
+  const settle = () => {
+    runningSubagents.delete(running.id);
+    headlessChildren.delete(running.id);
+    markSubagentInactive(running.id);
+    updateWidget();
+  };
+
+  return deps
     .watch(running, {
-      client: deps.client,
-      stream: getEventStream(),
+      ...backend,
       signal: watcherAbort.signal,
+      pollIntervalMs: POLL_MS,
+      liveness: livenessFor(pi, running),
     })
     .then((outcome) => {
-      runningSubagents.delete(running.id);
-      markSubagentInactive(running.id);
-      updateWidget();
+      settle();
       const contextUsage =
         outcome.kind === "cancelled"
           ? null
           : consumeContextUsageSidecar(running.sessionFile, running.id);
       const message = buildOutcomeMessage(
         running,
-        mapOutcome ? mapOutcome(outcome) : outcome,
+        opts.mapOutcome ? opts.mapOutcome(outcome) : outcome,
         { contextUsage, sessionId: getSessionId(running.sessionFile) },
       );
-      if (message) pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+      if (message && deliver) pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+      return message;
     })
     .catch((err: any) => {
-      runningSubagents.delete(running.id);
-      markSubagentInactive(running.id);
-      updateWidget();
-      pi.sendMessage(
-        {
-          customType: "subagent_result",
-          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-          display: true,
-          details: { name: running.name, task: running.task, error: err?.message ?? String(err) },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
+      settle();
+      const message: SubagentSteerMessage = {
+        customType: "subagent_result",
+        content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+        display: true,
+        details: { name: running.name, task: running.task, error: err?.message ?? String(err) },
+      };
+      if (deliver) pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+      return message;
     })
     .finally(() => {
       moduleSignal.removeEventListener("abort", onModuleAbort);
     });
+}
+
+/** Shared launch context for spawn and resume. */
+interface LaunchCtx {
+  cwd: string;
+  sessionManager: {
+    getSessionFile(): string | null;
+    getSessionId(): string;
+    getSessionDir(): string;
+  };
+  isProjectTrusted?: () => boolean;
+}
+
+/** Agent discovery options for this call (trusted project + event-bus package dirs). */
+function agentLookup(pi: ExtensionAPI, ctx: { isProjectTrusted?: () => boolean }): AgentLookup {
+  let projectTrusted = false;
+  try {
+    projectTrusted = ctx.isProjectTrusted?.() === true;
+  } catch {}
+  let extraDirs: string[] = [];
+  try {
+    extraDirs = queryAgentDirs(pi.events);
+  } catch {}
+  return { projectTrusted, extraDirs };
+}
+
+/** The parent's active-tool ceiling, captured when the tool executes. */
+function toolCeiling(pi: ExtensionAPI) {
+  try {
+    return { active: pi.getActiveTools(), all: pi.getAllTools().map((tool) => tool.name) };
+  } catch {
+    return undefined;
+  }
+}
+
+const HEADLESS_INTERACTIVE_REFUSAL =
+  "interactive agent needs herdr; run the interview in the main session with ask_user";
+
+/**
+ * Start a planned run: a herdr pane, or (outside herdr) a detached headless
+ * process. Returns the running record and its watcher backend, or an error.
+ */
+async function startRun(
+  plan: { id: string; name: string; launchScriptFile: string; sessionFile: string; paneStart: any },
+  headless: boolean,
+  entryOffset: number,
+): Promise<{ paneId: string; pid?: number; backend: WatcherBackend } | { error: string }> {
+  if (headless) {
+    const child = startHeadless({ launchScriptFile: plan.launchScriptFile, sessionFile: plan.sessionFile });
+    if (child.pid <= 0) return { error: "failed to spawn the headless subagent process" };
+    headlessChildren.set(plan.id, child);
+    const paneId = `headless:${plan.id}`;
+    return { paneId, pid: child.pid, backend: headlessWatcherDeps(child, paneId, entryOffset) };
+  }
+  try {
+    const started = await deps.client.paneStart(plan.paneStart);
+    // Best-effort sidebar label; the pane is already running the subagent.
+    await deps.client.paneRename(started.paneId, plan.name).catch(() => {});
+    return { paneId: started.paneId, backend: herdrBackend() };
+  } catch (error: any) {
+    return { error: `Failed to start herdr pane for "${plan.name}": ${error?.message ?? String(error)}` };
+  }
+}
+
+/** One-shot controllers get the outcome inline; interactive ones get the acknowledgement. */
+function inlineOutcome(message: SubagentSteerMessage | null, running: RunningSubagent) {
+  const text = message?.content ?? `Sub-agent "${running.name}" was cancelled.`;
+  return {
+    content: [{ type: "text" as const, text }],
+    details: {
+      ...(message?.details ?? {}),
+      id: running.id,
+      name: running.name,
+      status: "finished",
+    } as Record<string, unknown>,
+  };
+}
+
+/** Tool-result run details: headless runs carry `pid`, never `paneId` (herdr-layout keys on it). */
+function runDetails(running: RunningSubagent): Record<string, unknown> {
+  return running.backend === "headless"
+    ? { backend: "headless", pid: running.pid }
+    : { paneId: running.paneId };
 }
 
 // ── tool parameter schema (ported, minus Claude-only resumeSessionId) ───────
@@ -438,8 +598,9 @@ const SubagentParams = Type.Object({
 });
 
 const SUBAGENT_DESCRIPTION =
-  "Spawn a sub-agent in a dedicated herdr pane. " +
-  "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
+  "Spawn a sub-agent in a herdr pane, or as a background process outside herdr. " +
+  "In interactive sessions it is fire-and-forget: the call returns immediately with only an acknowledgement; " +
+  "in one-shot (-p) runs it waits and returns the result. " +
   "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
   "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
   "DO NOT fabricate, assume, or summarize results after calling this tool. " +
@@ -457,14 +618,7 @@ function errorResult(text: string, error: string) {
 async function executeSubagentSpawn(
   pi: ExtensionAPI,
   params: Static<typeof SubagentParams>,
-  ctx: {
-    cwd: string;
-    sessionManager: {
-      getSessionFile(): string | null;
-      getSessionId(): string;
-      getSessionDir(): string;
-    };
-  },
+  ctx: LaunchCtx,
 ) {
   try {
     assertSafeLabel(params.name);
@@ -482,15 +636,16 @@ async function executeSubagentSpawn(
     );
   }
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const lookup = agentLookup(pi, ctx);
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent, lookup) : null;
   if (params.agent && !agentDefs) {
-    const projectPath = join(process.cwd(), ".pi", "agents", `${params.agent}.md`);
-    const globalPath = join(getAgentConfigDir(), "agents", `${params.agent}.md`);
+    const searched = agentSearchDirs(lookup).map(({ path }) => join(path, `${params.agent}.md`));
     return errorResult(
-      `Agent "${params.agent}" not found. Searched ${projectPath} and ${globalPath}.`,
+      `Agent "${params.agent}" not found. Searched ${searched.join(", ")}.`,
       "agent not found",
     );
   }
+  const headless = !isInsideHerdr();
 
   const parentSessionFile = ctx.sessionManager.getSessionFile();
   if (!parentSessionFile) {
@@ -500,17 +655,19 @@ async function executeSubagentSpawn(
     );
   }
 
-  let setupError: string | null;
-  try {
-    setupError = await ensureHerdrCapability();
-  } catch (error: any) {
-    setupError = `capability check failed: ${error?.message ?? String(error)}`;
-  }
-  if (setupError) {
-    return errorResult(
-      `Cannot start subagent: ${setupError}`,
-      "herdr setup incomplete",
-    );
+  if (!headless) {
+    let setupError: string | null;
+    try {
+      setupError = await ensureHerdrCapability();
+    } catch (error: any) {
+      setupError = `capability check failed: ${error?.message ?? String(error)}`;
+    }
+    if (setupError) {
+      return errorResult(
+        `Cannot start subagent: ${setupError}`,
+        "herdr setup incomplete",
+      );
+    }
   }
 
   let plan;
@@ -521,27 +678,28 @@ async function executeSubagentSpawn(
       parentSessionFile,
       parentCwd: ctx.cwd,
       env: process.env,
+      headless,
+      toolCeiling: toolCeiling(pi),
     });
   } catch (error: any) {
     const message = error?.message ?? String(error);
     return errorResult(`Failed to plan subagent launch: ${message}`, message);
   }
 
-  // Execute the plan: write artifacts, seed the child session, start the pane.
+  if (headless && plan.interactive) {
+    return errorResult(HEADLESS_INTERACTIVE_REFUSAL, "interactive needs herdr");
+  }
+
+  // Execute the plan: write artifacts, seed the child session, start the child.
   writePlanFiles(plan.files);
   if (plan.seedSession) {
     seedSubagentSessionFile(plan.seedSession);
   }
+  rmSync(`${plan.sessionFile}.heartbeat`, { force: true });
+  const entryOffset = plan.seedSession ? safeGetNewEntries(plan.sessionFile, 0).length : 0;
 
-  let started;
-  try {
-    started = await deps.client.paneStart(plan.paneStart);
-  } catch (error: any) {
-    const message = error?.message ?? String(error);
-    return errorResult(`Failed to start herdr pane for "${params.name}": ${message}`, message);
-  }
-  // Best-effort sidebar label; the pane is already running the subagent.
-  await deps.client.paneRename(started.paneId, params.name).catch(() => {});
+  const started = await startRun(plan, headless, entryOffset);
+  if ("error" in started) return errorResult(started.error, started.error);
 
   const running: RunningSubagent = {
     id: plan.id,
@@ -554,8 +712,12 @@ async function executeSubagentSpawn(
     launchScriptFile: plan.launchScriptFile,
     interactive: plan.interactive,
     autoExit: plan.autoExit,
+    backend: headless ? "headless" : "herdr",
+    ...(started.pid !== undefined ? { pid: started.pid } : {}),
   };
-  armWatcher(pi, running);
+  const oneShot = isOneShotInvocation();
+  const outcome = armWatcher(pi, running, started.backend, { deliver: !oneShot });
+  if (oneShot) return inlineOutcome(await outcome, running);
 
   return {
     content: [
@@ -573,7 +735,7 @@ async function executeSubagentSpawn(
       name: params.name,
       task: params.task,
       agent: params.agent,
-      paneId: running.paneId,
+      ...runDetails(running),
       sessionFile: running.sessionFile,
       launchScriptFile: running.launchScriptFile,
       status: "started",
@@ -706,14 +868,7 @@ const RESUME_DESCRIPTION =
 async function executeSubagentResume(
   pi: ExtensionAPI,
   params: { sessionPath: string; name?: string; message?: string; autoExit?: boolean },
-  ctx: {
-    cwd: string;
-    sessionManager: {
-      getSessionFile(): string | null;
-      getSessionId(): string;
-      getSessionDir(): string;
-    };
-  },
+  ctx: LaunchCtx,
 ) {
   if (params.name !== undefined) {
     try {
@@ -730,17 +885,20 @@ async function executeSubagentResume(
     );
   }
 
-  let setupError: string | null;
-  try {
-    setupError = await ensureHerdrCapability();
-  } catch (error: any) {
-    setupError = `capability check failed: ${error?.message ?? String(error)}`;
-  }
-  if (setupError) {
-    return errorResult(
-      `Cannot resume subagent: ${setupError}`,
-      "herdr setup incomplete",
-    );
+  const headless = !isInsideHerdr();
+  if (!headless) {
+    let setupError: string | null;
+    try {
+      setupError = await ensureHerdrCapability();
+    } catch (error: any) {
+      setupError = `capability check failed: ${error?.message ?? String(error)}`;
+    }
+    if (setupError) {
+      return errorResult(
+        `Cannot resume subagent: ${setupError}`,
+        "herdr setup incomplete",
+      );
+    }
   }
 
   // Record entry count before resuming so we can extract only new messages.
@@ -754,29 +912,29 @@ async function executeSubagentResume(
       parentSessionFile: ctx.sessionManager.getSessionFile() ?? "",
       parentCwd: ctx.cwd,
       env: process.env,
+      headless,
+      toolCeiling: toolCeiling(pi),
     });
   } catch (error: any) {
     const message = error?.message ?? String(error);
     return errorResult(`Failed to plan resume launch: ${message}`, message);
   }
 
+  if (headless && plan.interactive) {
+    return errorResult(HEADLESS_INTERACTIVE_REFUSAL, "interactive needs herdr");
+  }
+
   // Stale-sidecar belt & braces: completion signals from the previous run
   // would resolve the new watcher instantly.
   rmSync(`${params.sessionPath}.exit`, { force: true });
   rmSync(`${params.sessionPath}.exitcode`, { force: true });
+  rmSync(`${params.sessionPath}.heartbeat`, { force: true });
   rmSync(contextUsagePath(params.sessionPath), { force: true });
 
   writePlanFiles(plan.files);
 
-  let started;
-  try {
-    started = await deps.client.paneStart(plan.paneStart);
-  } catch (error: any) {
-    const message = error?.message ?? String(error);
-    return errorResult(`Failed to start herdr pane for "${plan.name}": ${message}`, message);
-  }
-  // Best-effort sidebar label; the pane is already running the subagent.
-  await deps.client.paneRename(started.paneId, plan.name).catch(() => {});
+  const started = await startRun(plan, headless, entryCountBefore);
+  if ("error" in started) return errorResult(started.error, started.error);
 
   const running: RunningSubagent = {
     id: plan.id,
@@ -788,17 +946,22 @@ async function executeSubagentResume(
     launchScriptFile: plan.launchScriptFile,
     interactive: plan.interactive,
     autoExit: plan.autoExit,
+    backend: headless ? "headless" : "herdr",
+    ...(started.pid !== undefined ? { pid: started.pid } : {}),
   };
-  armWatcher(pi, running, (outcome) =>
-    resolveResumeOutcome(outcome, params.sessionPath, entryCountBefore),
-  );
+  const oneShot = isOneShotInvocation();
+  const outcome = armWatcher(pi, running, started.backend, {
+    mapOutcome: (o) => resolveResumeOutcome(o, params.sessionPath, entryCountBefore),
+    deliver: !oneShot,
+  });
+  if (oneShot) return inlineOutcome(await outcome, running);
 
   return {
     content: [{ type: "text" as const, text: `Session "${plan.name}" resumed.` }],
     details: {
       id: running.id,
       name: plan.name,
-      paneId: running.paneId,
+      ...runDetails(running),
       sessionPath: params.sessionPath,
       launchScriptFile: plan.launchScriptFile,
       status: "started",
@@ -901,6 +1064,16 @@ async function handleSubagentInterrupt(params: { id?: string; name?: string }) {
   }
 
   const running = resolved.running;
+  if (running.backend === "headless") {
+    // SIGINT to the process group: pi aborts its running tools.
+    interruptTree(running.pid ?? -1);
+    return {
+      content: [
+        { type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` },
+      ],
+      details: { id: running.id, name: running.name, status: "interrupt_requested" },
+    };
+  }
   try {
     // "esc" is herdr key-combo syntax (src/input/parse.rs maps it to KeyCode::Esc).
     await deps.client.paneSendKeys(running.paneId, ["esc"]);
@@ -978,8 +1151,8 @@ function registerInterruptTool(pi: ExtensionAPI): void {
 
 const LIST_DESCRIPTION =
   "List all available subagent definitions. " +
-  "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-  "Project-local agents override global ones with the same name.";
+  "Scans package agent dirs (pi-light, pi-light-kit), global ~/.pi/agent/agents/ and, in trusted projects, .pi/agents/. " +
+  "Later sources override earlier ones with the same name (project > global > package).";
 
 function registerListTool(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -989,8 +1162,10 @@ function registerListTool(pi: ExtensionAPI): void {
     promptSnippet: LIST_DESCRIPTION,
     parameters: Type.Object({}),
 
-    async execute() {
-      const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const list = discoverAgentDefinitions(agentLookup(pi, ctx)).filter(
+        (agent) => !agent.disableModelInvocation,
+      );
 
       if (list.length === 0) {
         return {
@@ -1000,7 +1175,7 @@ function registerListTool(pi: ExtensionAPI): void {
       }
 
       const lines = list.map((a) => {
-        const badge = a.source === "project" ? " (project)" : "";
+        const badge = a.source === "global" ? "" : ` (${a.source})`;
         const desc = a.description ? ` — ${a.description}` : "";
         const model = a.model ? ` [${a.model}]` : "";
         return `• ${a.name}${badge}${model}${desc}`;
@@ -1019,7 +1194,7 @@ function registerListTool(pi: ExtensionAPI): void {
         return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
       }
       const lines = agents.map((a: any) => {
-        const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
+        const badge = a.source === "global" ? "" : theme.fg("accent", ` (${a.source})`);
         const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
         const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
         return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
@@ -1144,6 +1319,26 @@ function registerCommands(pi: ExtensionAPI): void {
   });
 }
 
+/** Kill every running headless child and report it as cancelled. */
+function shutdownHeadlessChildren(pi: ExtensionAPI): void {
+  for (const running of runningSubagents.values()) {
+    if (running.backend !== "headless") continue;
+    void killTree(running.pid ?? -1).catch(() => {});
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" cancelled (controller shut down).`,
+          display: true,
+          details: { id: running.id, name: running.name, error: "cancelled (controller shut down)" },
+        },
+        { triggerTurn: false },
+      );
+    } catch {}
+  }
+  headlessChildren.clear();
+}
+
 // ── extension entry ─────────────────────────────────────────────────────────
 
 export default function herdrSubagents(pi: ExtensionAPI) {
@@ -1158,13 +1353,12 @@ export default function herdrSubagents(pi: ExtensionAPI) {
   );
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
-  if (inHerdr) {
-    if (shouldRegister("subagent")) registerSubagentTool(pi);
-    if (shouldRegister("subagent_resume")) registerResumeTool(pi);
-    if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
-    if (shouldRegister("subagents_list")) registerListTool(pi);
-    registerCommands(pi);
-  }
+  // Always registered: per call, herdr when inside herdr, otherwise headless.
+  if (shouldRegister("subagent")) registerSubagentTool(pi);
+  if (shouldRegister("subagent_resume")) registerResumeTool(pi);
+  if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
+  if (shouldRegister("subagents_list")) registerListTool(pi);
+  registerCommands(pi);
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -1202,6 +1396,8 @@ export default function herdrSubagents(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     stopWidgetRefresh();
+    // Owned process trees never outlive their controller (shutdown and /reload).
+    shutdownHeadlessChildren(pi);
     for (const running of runningSubagents.values()) {
       running.abortController?.abort();
       markSubagentInactive(running.id);
@@ -1244,6 +1440,7 @@ export const __test__ = {
       markSubagentInactive(running.id);
     }
     runningSubagents.clear();
+    headlessChildren.clear();
     latestAgentStatuses.clear();
     latestCtx = null;
     stopWidgetRefresh();
