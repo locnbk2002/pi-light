@@ -194,7 +194,7 @@ describe("buildOutcomeMessage", () => {
   });
 
   it("crashed without summary falls back honestly", () => {
-    const msg = build({ kind: "crashed", exitCode: 137, summary: null });
+    const msg = build({ kind: "crashed", exitCode: 137, summary: null, paneOutput: null });
     assert.ok(msg);
     assert.match(msg.content, /exit code 137/);
     assert.match(msg.content, /Session: /);

@@ -58,7 +58,7 @@ function envInsideHerdr(): void {
 
 function createFakePi() {
   const registeredTools: any[] = [];
-  const commands: Array<{ name: string; handler: Function }> = [];
+  const commands: Array<{ name: string; handler: Function; getArgumentCompletions?: Function }> = [];
   const handlers = new Map<string, Function[]>();
   const sent: Array<{ message: any; options: any }> = [];
   const sentUser: string[] = [];
@@ -731,7 +731,7 @@ describe("index tools: commands", () => {
 
   it("/subagents-init autocomplete has exact labels and prefix filtering", () => {
     const fake = registerAll();
-    const complete = fake.findCommand("subagents-init")!.getArgumentCompletions;
+    const complete = fake.findCommand("subagents-init")!.getArgumentCompletions!;
     const expected = [
       {
         value: "global",

@@ -25,9 +25,9 @@
  *
  * Keep this file dependency-light: it loads into EVERY child.
  */
-import type { ContextUsage, ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ContextUsage, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 
 import { writeContextUsageSidecar } from "./src/context-usage.ts";
@@ -266,7 +266,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
+  pi.registerShortcut("ctrl+alt+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;

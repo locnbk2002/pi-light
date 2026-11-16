@@ -4,23 +4,17 @@
  * Extension entry: activation guard, tool registration, outcome→steer wiring,
  * slim widget, /subagent + /iterate commands.
  *
- * Activation strategy (PLAN.md Key Decision #3 — tool names collide with
- * pi-interactive-subagents by design, and pi resolves duplicates
- * first-loaded-extension-wins, silently):
- *   - inside herdr (HERDR_ENV=1 + pane id + socket path): register real tools
- *     at load; `session_start` pings the socket and warns visibly if this
- *     extension lost the registry race to another `subagent` provider.
- *   - outside herdr: register nothing at load; on `session_start`, register
- *     setup-hint stubs only when no other extension provides `subagent`.
+ * Merged into pi-light from pi-herdr-subagents@2489019 (MIT); pi-light is the
+ * only `subagent` provider.
  *
  * Tool skeletons, descriptions/promptSnippets, self-spawn block, and command
  * handlers ported from pi-interactive-subagents (MIT, HazAT)
  * pi-extension/subagents/index.ts @ fix/launch-verify-retry, adapted for herdr
  * (argv launch via src/launch.ts + herdr client, no mux/screen-scrape code).
  */
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type, type Static } from "typebox";
 import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,7 +56,7 @@ import {
   type WatcherDeps,
 } from "./src/watcher.ts";
 
-/** Absolute path of this module — used to detect losing the tool-registry race. */
+/** Absolute path of this module (locates the bundled herdr-plugin and agent templates). */
 const MODULE_PATH = fileURLToPath(import.meta.url);
 const HERDR_PLUGIN_DIR = join(dirname(MODULE_PATH), "herdr-plugin");
 
@@ -450,35 +444,6 @@ const SUBAGENT_DESCRIPTION =
   "DO NOT fabricate, assume, or summarize results after calling this tool. " +
   "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.";
 
-// ── setup-hint stubs (outside herdr, no other subagent provider) ────────────
-
-const SETUP_HINT =
-  `Subagents require herdr >= ${MIN_HERDR_VERSION} and the bundled Herdr plugin. ` +
-  `Link it with: herdr plugin link "${HERDR_PLUGIN_DIR}" --enabled; ` +
-  `then run: herdr plugin enable ${HERDR_PLUGIN_ID}. ` +
-  "Start herdr, open a pane, and run pi there — herdr injects HERDR_ENV, HERDR_PANE_ID, " +
-  "and HERDR_SOCKET_PATH, which this extension needs to launch and observe subagents.";
-
-const SPAWN_TOOL_NAMES = ["subagent", "subagent_resume", "subagent_interrupt", "subagents_list"];
-
-function registerSetupHintStubs(pi: ExtensionAPI, shouldRegister: (name: string) => boolean): void {
-  for (const name of SPAWN_TOOL_NAMES) {
-    if (!shouldRegister(name)) continue;
-    pi.registerTool({
-      name,
-      label: "Subagents (setup required)",
-      description: SETUP_HINT,
-      parameters: Type.Object({}, { additionalProperties: true }),
-      async execute() {
-        return {
-          content: [{ type: "text", text: SETUP_HINT }],
-          details: { error: "not in herdr" },
-        };
-      },
-    });
-  }
-}
-
 // ── subagent spawn ──────────────────────────────────────────────────────────
 
 function errorResult(text: string, error: string) {
@@ -490,7 +455,7 @@ function errorResult(text: string, error: string) {
 
 async function executeSubagentSpawn(
   pi: ExtensionAPI,
-  params: typeof SubagentParams.static,
+  params: Static<typeof SubagentParams>,
   ctx: {
     cwd: string;
     sessionManager: {
@@ -675,7 +640,8 @@ function registerSubagentTool(pi: ExtensionAPI): void {
         );
       }
 
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const first = result.content[0];
+      const text = first?.type === "text" ? first.text : "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
   });
@@ -877,7 +843,8 @@ function registerResumeTool(pi: ExtensionAPI): void {
         );
       }
 
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const first = result.content[0];
+      const text = first?.type === "text" ? first.text : "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
   });
@@ -956,7 +923,7 @@ function registerInterruptTool(pi: ExtensionAPI): void {
       name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
     }),
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
       return handleSubagentInterrupt(params);
     },
 
@@ -985,7 +952,8 @@ function registerInterruptTool(pi: ExtensionAPI): void {
         );
       }
 
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const first = result.content[0];
+      const text = first?.type === "text" ? first.text : "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
   });
@@ -1175,40 +1143,29 @@ export default function herdrSubagents(pi: ExtensionAPI) {
   );
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
-  let registeredRealTools = false;
   if (inHerdr) {
     if (shouldRegister("subagent")) registerSubagentTool(pi);
     if (shouldRegister("subagent_resume")) registerResumeTool(pi);
     if (shouldRegister("subagent_interrupt")) registerInterruptTool(pi);
     if (shouldRegister("subagents_list")) registerListTool(pi);
     registerCommands(pi);
-    registeredRealTools = true;
   }
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
 
-    if (!inHerdr) {
-      // Defer: only provide setup-hint stubs when nothing else provides
-      // `subagent` (i.e. pi-interactive-subagents is not loaded).
-      const hasSubagent = pi.getAllTools().some((tool) => tool.name === "subagent");
-      if (!hasSubagent) registerSetupHintStubs(pi, shouldRegister);
-      return;
+    // A leftover pi-herdr-subagents package would register the same tools.
+    const duplicate = pi
+      .getAllTools()
+      .some((tool) => tool.sourceInfo?.path?.includes("/pi-herdr-subagents/"));
+    if (duplicate) {
+      ctx.ui.notify(
+        "pi-light: remove the pi-herdr-subagents package; it duplicates extensions/subagents",
+        "warning",
+      );
     }
 
-    // Inside herdr but lost the registry race (loaded after another provider):
-    // warn visibly — never fail silently (PLAN.md Key Decision #3).
-    if (registeredRealTools && shouldRegister("subagent")) {
-      const winner = pi.getAllTools().find((tool) => tool.name === "subagent");
-      if (winner?.sourceInfo?.path && winner.sourceInfo.path !== MODULE_PATH) {
-        ctx.ui.notify(
-          `pi-herdr-subagents: another extension's "subagent" tool won the registry race ` +
-            `(${winner.sourceInfo.path}). List pi-herdr-subagents BEFORE pi-interactive-subagents ` +
-            `in your packages to use the herdr-native tools.`,
-          "warning",
-        );
-      }
-    }
+    if (!inHerdr) return;
 
     // Cheap, asynchronous readiness check. Import stays side-effect free; tool
     // execution awaits the same promise so setup failures stop before artifacts

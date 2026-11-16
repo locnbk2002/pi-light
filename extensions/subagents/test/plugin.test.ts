@@ -2,10 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-const pluginDir = resolve("herdr-plugin");
+const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "herdr-plugin");
 const dispatcher = join(pluginDir, "dispatch.sh");
 
 describe("Herdr plugin dispatcher", () => {

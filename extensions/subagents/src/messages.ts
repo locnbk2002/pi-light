@@ -16,8 +16,7 @@
 //       the orchestrator can resume.
 //
 // Tool descriptions/promptSnippets are NOT here (Task 10) — outcome→message only.
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
 
 import type { ContextUsageSnapshot } from "./context-usage.ts";
 import type { RunningSubagent, SubagentOutcome } from "./watcher.ts";
@@ -247,14 +246,18 @@ type Theme = {
   bg(color: string, text: string): string;
   bold(text: string): string;
 };
-type RenderOptions = { expanded: boolean };
-type RenderedMessage = { render(width: number): string[] } | undefined;
+type RenderOptions = {
+  expanded: boolean;
+  keyHint?: (keybinding: "app.tools.expand", description: string) => string;
+};
+type RenderedMessage = { render(width: number): string[]; invalidate(): void } | undefined;
 type SteerLike = { content?: unknown; details?: unknown };
 
-/** keyHint needs pi's initialized theme; fall back to plain text headless (unit tests). */
-function expandHint(): string {
+/** options.keyHint needs pi's initialized theme; fall back to plain text headless (unit tests). */
+function expandHint(options: RenderOptions): string {
   try {
-    return keyHint("app.tools.expand", "to expand");
+    if (!options.keyHint) return "expand for more";
+    return options.keyHint("app.tools.expand", "to expand");
   } catch {
     return "expand for more";
   }
@@ -287,6 +290,7 @@ export function renderSubagentResult(
   if (!details) return undefined;
 
   return {
+    invalidate() {},
     render(width: number): string[] {
       const name = details.name ?? "subagent";
       const exitCode = typeof details.exitCode === "number" ? details.exitCode : 1;
@@ -352,7 +356,7 @@ export function renderSubagentResult(
             contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
           }
         }
-        contentLines.push(theme.fg("muted", expandHint()));
+        contentLines.push(theme.fg("muted", expandHint(options)));
       }
 
       const box = new Box(1, 1, bgFn);
@@ -372,6 +376,7 @@ export function renderSubagentPing(
   if (!details) return undefined;
 
   return {
+    invalidate() {},
     render(width: number): string[] {
       const name = details.name ?? "subagent";
       const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
@@ -394,7 +399,7 @@ export function renderSubagentPing(
       } else {
         const preview = (details.message ?? "").split("\n")[0].slice(0, width - 10);
         contentLines.push(theme.fg("dim", preview));
-        contentLines.push(theme.fg("muted", expandHint()));
+        contentLines.push(theme.fg("muted", expandHint(options)));
       }
 
       const box = new Box(1, 1, bgFn);

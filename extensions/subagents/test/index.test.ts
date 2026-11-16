@@ -233,25 +233,8 @@ describe("index: activation guard", () => {
     assert.ok(fake.toolNames().includes("subagent"));
   });
 
-  it("outside herdr: session_start registers setup-hint stubs when no subagent tool exists", async () => {
+  it("outside herdr: session_start registers no stubs and stays silent", () => {
     const fake = createFakePi({ allTools: [] });
-    herdrSubagents(fake.api);
-    assert.deepEqual(fake.toolNames(), []);
-
-    const { ctx } = makeFakeCtx();
-    fake.fire("session_start", {}, ctx);
-
-    const stub = fake.findTool("subagent");
-    assert.ok(stub, "expected a subagent setup-hint stub");
-    const result = await stub.execute("t1", { name: "X", task: "y" }, undefined, undefined, ctx);
-    assert.match(result.content[0].text, /herdr/i);
-    assert.equal(result.details.error, "not in herdr");
-  });
-
-  it("outside herdr: stays silent when another extension already provides subagent", () => {
-    const fake = createFakePi({
-      allTools: [{ name: "subagent", sourceInfo: { path: "/other/pi-interactive-subagents/index.ts" } }],
-    });
     herdrSubagents(fake.api);
     const { ctx, notifications } = makeFakeCtx();
     fake.fire("session_start", {}, ctx);
@@ -271,25 +254,22 @@ describe("index: activation guard", () => {
     assert.ok(fake.toolNames().includes("subagents_list"));
   });
 
-  it("inside herdr but lost the registry race → visible session_start warning", () => {
-    envInsideHerdr();
-    __test__.setDeps({ client: makeFakeClient() });
-    const fake = createFakePi();
+  it("leftover pi-herdr-subagents package → visible duplicate warning", () => {
+    const fake = createFakePi({
+      allTools: [
+        { name: "subagent", sourceInfo: { path: "/x/git/github.com/modem-dev/pi-herdr-subagents/index.ts" } },
+      ],
+    });
     herdrSubagents(fake.api);
-
-    fake.setAllTools([
-      { name: "subagent", sourceInfo: { path: "/other/pi-interactive-subagents/index.ts" } },
-    ]);
     const { ctx, notifications } = makeFakeCtx();
     fake.fire("session_start", {}, ctx);
 
     const warning = notifications.find((n) => n.type === "warning");
     assert.ok(warning, "expected a visible warning notify");
-    assert.match(warning.message, /pi-herdr-subagents/);
-    assert.match(warning.message, /before/i);
+    assert.match(warning.message, /remove the pi-herdr-subagents package/);
   });
 
-  it("inside herdr and won the race → no warning", () => {
+  it("only pi-light provides subagent → no duplicate warning", () => {
     envInsideHerdr();
     __test__.setDeps({ client: makeFakeClient() });
     const fake = createFakePi();
