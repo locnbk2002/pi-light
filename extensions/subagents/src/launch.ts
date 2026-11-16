@@ -116,6 +116,28 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_HOLD_OPEN_SECS = 15;
 
 /** Ported from pi-interactive-subagents cmux.ts — the only thing taken from cmux.ts. */
+/** Longest accepted display name for a subagent (pane title, wrapper header, env). */
+export const MAX_LABEL_LENGTH = 120;
+
+/**
+ * Reject display names that could break out of a wrapper-script comment or
+ * pane title: any C0 control character (U+0000-U+001F), DEL (U+007F), or a
+ * name longer than MAX_LABEL_LENGTH.
+ */
+export function assertSafeLabel(value: string, field = "name"): void {
+  if (value.length > MAX_LABEL_LENGTH) {
+    throw new Error(`${field} is longer than ${MAX_LABEL_LENGTH} characters`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`${field} must not contain control characters (newline, tab, escape, ...)`);
+  }
+}
+
+/** Header comments are defence in depth: replace anything outside printable ASCII. */
+function commentSafe(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "?");
+}
+
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
@@ -268,7 +290,7 @@ function buildWrapperScript(opts: {
     "# Ignore SIGTSTP — argv-launched panes have no parent interactive shell",
     "# to resume from, so Ctrl+Z would leave the pane permanently stuck.",
     "trap '' TSTP",
-    ...opts.headerLines,
+    ...opts.headerLines.map(commentSafe),
     ...opts.exports,
     `cd ${shellEscape(opts.cwd)}`,
     piCommand,
@@ -305,6 +327,7 @@ export function buildLaunchPlan(
     );
   }
 
+  assertSafeLabel(params.name);
   const env = ctx.env;
   const now = ctx.now ?? new Date();
   const id = ctx.id ?? Math.random().toString(16).slice(2, 10);
@@ -317,7 +340,7 @@ export function buildLaunchPlan(
   const autoExit = agentDefs?.autoExit ?? false;
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(
     params,
     agentDefs,
   );
@@ -418,9 +441,8 @@ export function buildLaunchPlan(
   // ── Curated env exports (never a full env dump) ──
   const exports: string[] = [];
   if (env.PATH) exports.push(`export PATH=${shellEscape(env.PATH)}`);
-  if (localAgentDir && existsSync(localAgentDir)) {
-    exports.push(`export PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
-  } else if (env.PI_CODING_AGENT_DIR) {
+  // Never switch profile by cwd: a repo-local .pi/agent is not trusted.
+  if (env.PI_CODING_AGENT_DIR) {
     exports.push(`export PI_CODING_AGENT_DIR=${shellEscape(env.PI_CODING_AGENT_DIR)}`);
   }
   const denySet = resolveDenyTools(agentDefs);
@@ -544,6 +566,7 @@ export function buildResumeLaunchPlan(
   const now = ctx.now ?? new Date();
   const id = ctx.id ?? Math.random().toString(16).slice(2, 10);
   const displayName = params.name ?? "Resume";
+  assertSafeLabel(displayName);
   const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
 
   const artifactDir = getArtifactDir(ctx.sessionDir, ctx.sessionId);

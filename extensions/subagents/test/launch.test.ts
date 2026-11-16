@@ -208,12 +208,13 @@ describe("launch plan: curated env exports", () => {
     assert.ok(!script.includes("PI_SUBAGENT_AGENT="));
   });
 
-  it("local .pi/agent wins for PI_CODING_AGENT_DIR", () => {
+  it("a cwd-local .pi/agent never replaces the parent's PI_CODING_AGENT_DIR", () => {
     const fx = makeFixture();
     const localAgentDir = join(fx.cwd, ".pi", "agent");
     mkdirSync(localAgentDir, { recursive: true });
     const script = scriptOf(plan(fx, { cwd: fx.cwd }));
-    assert.ok(script.includes(`export PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`));
+    assert.ok(!script.includes(`export PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`));
+    assert.ok(script.includes(`export PI_CODING_AGENT_DIR=${shellEscape(fx.agentDir)}`));
   });
 
   it("inherits env PI_CODING_AGENT_DIR when no local .pi/agent", () => {

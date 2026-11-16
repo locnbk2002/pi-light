@@ -179,7 +179,7 @@ export function discoverAgentDefinitions(): ListedAgentDefinition[] {
 export function resolveSubagentPaths(
   params: SubagentSpawnParams,
   agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
+): { effectiveCwd: string | null; effectiveAgentDir: string } {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
@@ -188,10 +188,9 @@ export function resolveSubagentPaths(
       ? rawCwd
       : join(cwdBase, rawCwd)
     : null;
-  const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
-  const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
+  // The child always uses the parent's profile; a cwd-local .pi/agent is
+  // never inferred (an untrusted repo could otherwise swap the profile).
+  return { effectiveCwd, effectiveAgentDir: getAgentConfigDir() };
 }
 
 export function getDefaultSessionDirFor(cwd: string, agentDir: string): string {

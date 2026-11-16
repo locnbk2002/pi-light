@@ -33,6 +33,7 @@ import {
 import { createHerdrEventStream } from "./src/herdr/events.ts";
 import { consumeContextUsageSidecar, contextUsagePath } from "./src/context-usage.ts";
 import {
+  assertSafeLabel,
   buildLaunchPlan,
   buildResumeLaunchPlan,
   resolveResumeLaunchBehavior,
@@ -465,6 +466,12 @@ async function executeSubagentSpawn(
     };
   },
 ) {
+  try {
+    assertSafeLabel(params.name);
+  } catch (error: any) {
+    return errorResult(`Error: invalid subagent name: ${error?.message ?? String(error)}`, "invalid name");
+  }
+
   // Prevent self-spawning (e.g. planner spawning another planner)
   const currentAgent = process.env.PI_SUBAGENT_AGENT;
   if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -708,6 +715,14 @@ async function executeSubagentResume(
     };
   },
 ) {
+  if (params.name !== undefined) {
+    try {
+      assertSafeLabel(params.name);
+    } catch (error: any) {
+      return errorResult(`Error: invalid subagent name: ${error?.message ?? String(error)}`, "invalid name");
+    }
+  }
+
   if (!existsSync(params.sessionPath)) {
     return errorResult(
       `Error: session file not found: ${params.sessionPath}`,
