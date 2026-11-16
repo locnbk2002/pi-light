@@ -59,6 +59,14 @@ Or load only the browser bridge, without the workflow skill:
 
 Extensions never import each other; shared state goes over `pi.events`. The model chains are machine-local: see Models below.
 
+## Subagents
+
+Inside herdr, `subagent` opens a pane; outside it, the child runs as a background `pi -p` process. A child never gets more than its parent: it inherits the parent's active tools as `--tools`, and an untrusted parent (`--no-approve`) starts it with `--no-approve`.
+
+A background child runs in its own systemd user scope (`pi-subagent-<run id>.scope`) when `systemd-run --user --scope` works. When the child exits or is stopped, the whole scope is killed, so processes it started in the background do not outlive it. Without systemd user scopes, pi-light tracks the child's processes itself, which is best effort; the tool result shows `containment: "best-effort"`. A tool that itself calls `systemd-run --user` leaves the scope. If cleanup cannot confirm that a child's processes are gone, pi-light reports the unit (or pid) and retries at the next release or shutdown.
+
+Each spawn writes `<session>.launch.json` next to the child's session. `subagent_resume` reapplies the agent, denied tools and tool list recorded there and ignores values passed by the model. Sessions spawned before this record existed have none, so they cannot be resumed: resume refuses them by design (fail closed). Spawn a new subagent instead.
+
 ## Browser tool
 
 The `browser` tool takes named actions; there is no raw DevTools endpoint.
