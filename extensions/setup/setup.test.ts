@@ -188,3 +188,22 @@ test("buildBrowserAddon writes a loadable unpacked directory", async t => {
   assert.throws(() => buildBrowserAddon(" "), /required/);
   assert.throws(() => buildBrowserAddon(ADDON_SOURCE.pathname), /differ/);
 });
+
+test('every package extension loads through Pi and /pi-light setup is registered (fix 9)', async () => {
+  const { discoverAndLoadExtensions } = await import('@earendil-works/pi-coding-agent');
+  const dir = mkdtempSync(join(tmpdir(), 'pi-light-load-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  try {
+    const extensionsDir = join(PI_LIGHT_ROOT, 'extensions');
+    const entries = (await readdir(extensionsDir)).map(name => join(extensionsDir, name, 'index.ts')).filter(path => existsSync(path));
+    assert.ok(entries.includes(join(extensionsDir, 'setup', 'index.ts')));
+    const result = await discoverAndLoadExtensions(entries, dir, dir);
+    assert.deepEqual(result.errors, []);
+    const setup = result.extensions.find(extension => extension.path.endsWith('/setup/index.ts'));
+    assert.ok(setup?.commands.has('pi-light'), 'the /pi-light command is registered');
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
