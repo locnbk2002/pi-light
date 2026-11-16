@@ -238,22 +238,59 @@ async function stopOwnedTree(id: string): Promise<void> {
   await child.tree.stop(deps.limits.escalateMs);
 }
 
+/** Runs whose failed cleanup was already reported (one warning per run). */
+const cleanupWarned = new Set<string>();
+
+/**
+ * Stop an owned tree and drop the ownership entry only when stop() confirms
+ * everything is gone. Otherwise the entry stays (retried at the next release
+ * or shutdown) and the failure is reported once, naming the unit or pid.
+ */
+async function stopAndRelease(pi: ExtensionAPI, id: string, child: HeadlessChild, letExit: boolean): Promise<boolean> {
+  let gone = false;
+  try {
+    if (letExit && child.exitCode() === null) await child.waitExit(deps.limits.escalateMs);
+    gone = await child.tree.stop(deps.limits.escalateMs);
+  } catch {
+    gone = false;
+  }
+  if (gone) {
+    if (headlessChildren.get(id) === child) headlessChildren.delete(id);
+    cleanupWarned.delete(id);
+    return true;
+  }
+  if (!cleanupWarned.has(id)) {
+    cleanupWarned.add(id);
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent-cleanup",
+          content:
+            `Sub-agent run ${id}: cleanup could not confirm its processes are gone (${child.tree.describe()}). ` +
+            "pi-light keeps ownership and retries at the next release or shutdown.",
+          display: true,
+          details: { id, target: child.tree.describe() },
+        },
+        { triggerTurn: false },
+      );
+    } catch {}
+  }
+  return false;
+}
+
 /**
  * Release a finished run's process ownership: let a still-exiting child end
- * on its own (bounded), then stop anything it recorded that is still alive,
- * e.g. tool processes captured before an interrupt. Cancelled runs (shutdown,
- * /reload) are stopped at once.
+ * on its own (bounded), then stop anything still alive (its scope, or tool
+ * processes recorded before an interrupt). Cancelled runs (shutdown, /reload)
+ * are stopped at once. Earlier runs whose cleanup failed are retried too.
  */
-async function releaseOwnership(id: string, cancelled: boolean): Promise<void> {
+async function releaseOwnership(pi: ExtensionAPI, id: string, cancelled: boolean): Promise<void> {
   const child = headlessChildren.get(id);
-  if (!child) return;
-  try {
-    if (!cancelled && child.exitCode() === null) await child.waitExit(deps.limits.escalateMs);
-    await child.tree.stop(deps.limits.escalateMs);
-  } catch {
-    // best-effort: the result is still delivered
+  if (child) await stopAndRelease(pi, id, child, !cancelled);
+  for (const [otherId, other] of [...headlessChildren]) {
+    // Retained entries only: a running run's tree is not ours to stop here.
+    if (otherId !== id && !runningSubagents.has(otherId)) await stopAndRelease(pi, otherId, other, false);
   }
-  if (headlessChildren.get(id) === child) headlessChildren.delete(id);
 }
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
@@ -479,7 +516,7 @@ function armWatcher(
 
   // Process ownership is released (tree confirmed gone) before the run is forgotten.
   const settle = async (cancelled: boolean) => {
-    await releaseOwnership(running.id, cancelled);
+    await releaseOwnership(pi, running.id, cancelled);
     runningSubagents.delete(running.id);
     markSubagentInactive(running.id);
     updateWidget();
@@ -591,7 +628,11 @@ async function startRun(
   entryOffset: number,
 ): Promise<{ paneId: string; pid?: number; backend: WatcherBackend } | { error: string }> {
   if (headless) {
-    const child = startHeadless({ launchScriptFile: plan.launchScriptFile, sessionFile: plan.sessionFile });
+    const child = startHeadless({
+      launchScriptFile: plan.launchScriptFile,
+      sessionFile: plan.sessionFile,
+      runId: plan.id,
+    });
     if (child.pid <= 0) return { error: "failed to spawn the headless subagent process" };
     headlessChildren.set(plan.id, child);
     const paneId = `headless:${plan.id}`;
@@ -624,7 +665,12 @@ function inlineOutcome(message: SubagentSteerMessage | null, running: RunningSub
 /** Tool-result run details: headless runs carry `pid`, never `paneId` (herdr-layout keys on it). */
 function runDetails(running: RunningSubagent): Record<string, unknown> {
   return running.backend === "headless"
-    ? { backend: "headless", pid: running.pid }
+    ? {
+        backend: "headless",
+        pid: running.pid,
+        // "best-effort": no systemd user scope, descendants are tracked by recording only.
+        containment: headlessChildren.get(running.id)?.containment ?? "best-effort",
+      }
     : { paneId: running.paneId };
 }
 
@@ -1444,16 +1490,7 @@ async function shutdownHeadlessChildren(pi: ExtensionAPI): Promise<void> {
     } catch {}
   }
   const owned = [...headlessChildren];
-  await Promise.all(
-    owned.map(([id, child]) =>
-      child.tree
-        .stop(deps.limits.escalateMs)
-        .catch(() => false)
-        .then(() => {
-          if (headlessChildren.get(id) === child) headlessChildren.delete(id);
-        }),
-    ),
-  );
+  await Promise.all(owned.map(([id, child]) => stopAndRelease(pi, id, child, false)));
 }
 
 // ── extension entry ─────────────────────────────────────────────────────────
@@ -1543,6 +1580,7 @@ export default function herdrSubagents(pi: ExtensionAPI) {
 export const __test__ = {
   isInsideHerdr,
   runningSubagents,
+  headlessChildren,
   renderSubagentWidgetLines,
   resolveInterruptTarget,
   resolveResumeLaunchBehavior,
@@ -1559,6 +1597,7 @@ export const __test__ = {
     }
     runningSubagents.clear();
     headlessChildren.clear();
+    cleanupWarned.clear();
     latestAgentStatuses.clear();
     latestCtx = null;
     stopWidgetRefresh();
