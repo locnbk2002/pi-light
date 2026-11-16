@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // pi-light machine setup: installs what pi-light needs so a new machine matches the reference one.
 // Plain JS (no build step) so bootstrap.sh can run it with `node extensions/setup/setup.mjs` before Pi loads anything.
-// Never touches credentials (auth.json, AgentKit login, claude-bridge config) or the default model.
+// Never touches credentials (auth.json, claude-bridge config) or the default model.
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -9,6 +9,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PACKAGE_DIR = fileURLToPath(new URL('.', import.meta.url));
+/** pi-light package root (extensions/setup -> package). */
+export const PI_LIGHT_ROOT = resolve(PACKAGE_DIR, '..', '..');
 export const MANIFEST = JSON.parse(readFileSync(join(PACKAGE_DIR, 'setup.json'), 'utf8'));
 
 export function agentDir(env = process.env) {
@@ -35,10 +37,9 @@ export function installedPackages(dir) {
   } catch { return []; }
 }
 
-export function agentkitStatus(dir, skills = MANIFEST.agentkit.skills) {
-  const missingSkills = skills.filter(s => !existsSync(join(dir, 'skills', s, 'SKILL.md')));
-  const agentTool = existsSync(join(dir, 'extensions', 'agentkit-agent'));
-  return { missingSkills, agentTool, installed: agentTool && missingSkills.length < skills.length };
+/** Manifest package entry: a source string, or { source, optional, failNote } for best-effort installs. */
+export function packageEntry(entry) {
+  return typeof entry === 'string' ? { source: entry, optional: false } : { optional: false, ...entry };
 }
 
 /** Concrete host aliases from ssh_config text (`Host` lines; wildcard and negated patterns skipped). */
@@ -107,20 +108,13 @@ export function planSetup({ env = process.env, platform = process.platform, has 
   const steps = []; const notes = [];
   for (const tool of ['pi', 'git']) if (!has(tool)) notes.push(`Missing required tool: ${tool}. Install it first.`);
 
-  const ak = MANIFEST.agentkit;
-  const akState = agentkitStatus(dir);
-  if (!akState.installed) {
-    if (!has('ak')) notes.push('AgentKit CLI `ak` is missing: install it and run `ak login`, then rerun setup.');
-    else steps.push({ label: `AgentKit ${ak.kit} ${ak.version} Pi adapter (${ak.skills.length} skills)`, cmd: 'ak',
-      args: ['kit', 'install', ak.kit, '--global', '--target', ak.target, '--version', ak.version, '--skills', ak.skills.join(','), '--yes'] });
-  } else if (akState.missingSkills.length) {
-    notes.push(`AgentKit is installed without: ${akState.missingSkills.join(', ')} (left as is).`);
-  }
-
   const have = installedPackages(dir);
-  for (const source of MANIFEST.packages) {
+  for (const { source, optional, failNote } of MANIFEST.packages.map(packageEntry)) {
     const current = have.find(p => sourceKey(p) === sourceKey(source));
-    if (!current) steps.push({ label: `Pi package ${source}`, cmd: 'pi', args: ['install', source] });
+    if (!current) {
+      steps.push({ label: `Pi package ${source}${optional ? ' (optional)' : ''}`, cmd: 'pi', args: ['install', source],
+        ...(optional ? { optional: true, failNote: failNote ?? `${source} not installed` } : {}) });
+    }
     else if (current !== source && source !== sourceKey(source)) notes.push(`${current} differs from pinned ${source} (left as is).`);
   }
 
@@ -139,7 +133,7 @@ export function planSetup({ env = process.env, platform = process.platform, has 
     if (!new RegExp(`^${herdr.integration}: current`, 'm').test(status)) {
       steps.push({ label: `herdr ${herdr.integration} integration`, cmd: 'herdr', args: ['integration', 'install', herdr.integration] });
     }
-    const pluginPath = join(gitCheckout(dir, herdr.plugin.package), herdr.plugin.dir);
+    const pluginPath = join(PI_LIGHT_ROOT, herdr.plugin.dir);
     const list = run('herdr', ['plugin', 'list']).out;
     const line = list.split('\n').find(l => l.trim().startsWith(`- ${herdr.plugin.id} `));
     if (!line || !line.includes(`local:${pluginPath}]`) || !/\benabled\b/.test(line)) {
@@ -155,7 +149,7 @@ export function planSetup({ env = process.env, platform = process.platform, has 
   steps.push({ label: `browser add-on builds in ${out}`, fn: () => buildBrowserAddons(out) });
   for (const b of found) notes.push(`${b.name}: ${b.page} > Developer mode > Load unpacked > ${join(out, 'chromium')} (stays installed; reload it there after updates).`);
   if (!found.length) notes.push(`No Chromium-family browser (Brave, Chromium, Chrome, Edge) found; the add-on build is in ${join(out, 'chromium')}.`);
-  notes.push('Not touched: credentials (`pi` /login, `ak login`, claude-bridge config) and the default model.');
+  notes.push('Not touched: credentials (`pi` /login, claude-bridge config) and the default model.');
   return { dir, steps, notes };
 }
 
@@ -188,7 +182,8 @@ export function describePlan(plan) {
 
 /**
  * Runs steps in order and stops at the first failure so later steps never run on a broken base.
- * @param {{ steps: Array<{ label: string, cmd?: string, args?: string[], fn?: () => void }> }} plan
+ * An optional step (e.g. the private pi-light-kit) that fails only logs its note and setup continues.
+ * @param {{ steps: Array<{ label: string, cmd?: string, args?: string[], fn?: () => void, optional?: boolean, failNote?: string }> }} plan
  * @param {(cmd: string, args: string[]) => { ok: boolean, out: string } | Promise<{ ok: boolean, out: string }>} [run]
  * @param {(line: string) => void} [log]
  */
@@ -197,6 +192,7 @@ export async function applyPlan(plan, run = defaultRun, log = console.log) {
     if (step.fn) { try { step.fn(); log(`ok   ${step.label}`); continue; } catch (e) { log(`FAIL ${step.label}: ${e.message}`); return false; } }
     log(`...  ${step.label}`);
     const r = await run(step.cmd, step.args);
+    if (!r.ok && step.optional) { log(`skip ${step.label}\nNote: ${step.failNote}`); continue; }
     log(`${r.ok ? 'ok  ' : 'FAIL'} ${step.label}${r.ok ? '' : `\n${r.out.split('\n').slice(-15).join('\n')}`}`);
     if (!r.ok) return false;
   }

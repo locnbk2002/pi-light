@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { readdir, readFile, mkdtemp, rm } from 'node:fs/promises';
-import { agentkitStatus, applyPlan, BROWSER_ADDON_FILES, buildBrowserAddon, buildBrowserAddons, buildPermissionConfig, MANIFEST, planSetup, sourceKey, sshHosts } from './setup.mjs';
+import { applyPlan, BROWSER_ADDON_FILES, buildBrowserAddon, buildBrowserAddons, buildPermissionConfig, MANIFEST, packageEntry, PI_LIGHT_ROOT, planSetup, sourceKey, sshHosts } from './setup.mjs';
 
 // setup.mjs builds the add-on from the browser-bridge extension's source folder.
 const ADDON_SOURCE = new URL('../browser-bridge/browser-addon/', import.meta.url);
@@ -17,54 +17,71 @@ test('sourceKey strips pins but keeps scoped npm names', () => {
   assert.equal(sourceKey('npm:@scope/pkg@1.0.0'), 'npm:@scope/pkg');
 });
 
-function agentHome(packages: string[], skills: string[] = [], agentTool = false) {
+function agentHome(packages: string[]) {
   const dir = mkdtempSync(join(tmpdir(), 'pi-light-setup-'));
   writeFileSync(join(dir, 'settings.json'), JSON.stringify({ packages }));
-  for (const s of skills) { mkdirSync(join(dir, 'skills', s), { recursive: true }); writeFileSync(join(dir, 'skills', s, 'SKILL.md'), 'x'); }
-  if (agentTool) mkdirSync(join(dir, 'extensions', 'agentkit-agent'), { recursive: true });
   return dir;
 }
 const pluginLine = (path: string) => `1 plugin installed:\n- pi-herdr-subagents (Pi Herdr Subagents) enabled [local:${path}]`;
+const SOURCES: string[] = MANIFEST.packages.map((entry: unknown) => packageEntry(entry).source);
+const KIT = 'git:github.com/locnbk2002/pi-light-kit';
+const VENDORED_PLUGIN = join(PI_LIGHT_ROOT, 'extensions/subagents/herdr-plugin');
 
-test('fresh machine: installs AgentKit, every package, herdr integration and plugin; never credentials', () => {
+test('fresh machine: every package, the optional kit, herdr integration and the vendored plugin; never ak or credentials', () => {
   const dir = agentHome([]);
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: () => true,
     run: (cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: not installed (x)' : '', missing: false }) });
   const commands = plan.steps.filter((s: any) => s.cmd).map((s: any) => `${s.cmd} ${s.args.join(' ')}`);
-  assert.match(commands[0], /^ak kit install engineer --global --target pi --version 3\.1\.0-beta\.5 --skills ak-brainstorm,.*ak-security --yes$/);
-  for (const source of MANIFEST.packages) assert.ok(commands.includes(`pi install ${source}`), source);
+  assert.ok(!plan.steps.some((s: any) => s.cmd === 'ak'), 'setup never runs a kit-installer CLI');
+  for (const source of SOURCES) assert.ok(commands.includes(`pi install ${source}`), source);
+  assert.ok(!commands.some(c => c.includes('pi-herdr-subagents@')), 'pi-herdr-subagents is no longer a package');
   assert.ok(commands.includes('pi install npm:pi-effort') && commands.includes('pi install git:github.com/elidickinson/pi-claude-bridge'), 'latest, unpinned');
+  const kit = plan.steps.find((s: any) => s.cmd === 'pi' && s.args[1] === KIT);
+  assert.equal((kit as any)?.optional, true);
   assert.ok(commands.includes('herdr integration install pi'));
-  assert.ok(commands.includes(`herdr plugin link ${join(dir, 'git/github.com/modem-dev/pi-herdr-subagents/herdr-plugin')} --enabled`));
+  assert.ok(commands.includes(`herdr plugin link ${VENDORED_PLUGIN} --enabled`));
   assert.ok(!commands.some(c => /login|auth|unlink/.test(c)));
   assert.ok(plan.notes.some((n: string) => /Not touched: credentials/.test(n)));
 });
 
-test('configured machine: nothing to install; pin drift and removed skills are reported, not reverted', () => {
-  const skills = MANIFEST.agentkit.skills.filter((s: string) => s !== 'ak-security');
-  const dir = agentHome(['npm:pi-effort', 'git:github.com/elidickinson/pi-claude-bridge@old', 'git:github.com/modem-dev/pi-herdr-subagents@other', 'npm:@gotgenes/pi-permission-system'], skills, true);
-  const plugin = join(dir, 'git/github.com/modem-dev/pi-herdr-subagents/herdr-plugin');
+test('configured machine: nothing to install; pin drift is reported, not reverted', () => {
+  const dir = agentHome(['npm:pi-effort@old', 'git:github.com/elidickinson/pi-claude-bridge@old', 'npm:@gotgenes/pi-permission-system', KIT]);
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => !t.startsWith('microsoft'),
-    run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current (v9) (x)' : pluginLine(plugin), missing: false }) });
+    run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current (v9) (x)' : pluginLine(VENDORED_PLUGIN), missing: false }) });
   assert.deepEqual(plan.steps.filter((s: any) => s.cmd), []);
-  assert.ok(plan.notes.some((n: string) => n.includes('without: ak-security')));
-  assert.ok(plan.notes.some((n: string) => n.includes('@other differs from pinned')));
   assert.ok(!plan.notes.some((n: string) => n.includes('pi-claude-bridge@old')), 'unpinned packages accept any installed ref');
-  assert.equal(agentkitStatus(dir).installed, true);
 });
 
-test('a plugin linked from another checkout (the old fork) is relinked to upstream', () => {
-  const dir = agentHome(MANIFEST.packages, MANIFEST.agentkit.skills, true);
+test('a plugin linked from the old pi-herdr-subagents checkout is relinked to the vendored copy', () => {
+  const dir = agentHome(SOURCES);
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: () => true,
-    run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current' : pluginLine('/x/locnbk2002/pi-herdr-subagents/herdr-plugin'), missing: false }) });
-  assert.deepEqual(plan.steps.filter((s: any) => s.cmd).map((s: any) => s.args.slice(0, 2).join(' ')), ['plugin unlink', 'plugin link']);
+    run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current' : pluginLine('/x/modem-dev/pi-herdr-subagents/herdr-plugin'), missing: false }) });
+  const herdr = plan.steps.filter((s: any) => s.cmd === 'herdr');
+  assert.deepEqual(herdr.map((s: any) => s.args.slice(0, 2).join(' ')), ['plugin unlink', 'plugin link']);
+  assert.equal((herdr[1] as any).args[2], VENDORED_PLUGIN);
 });
 
-test('missing ak and herdr become instructions instead of failing steps', () => {
+test('missing herdr becomes an instruction instead of a failing step', () => {
   const dir = agentHome([]);
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => t === 'pi' || t === 'git', run: () => ({ ok: true, out: '', missing: false }) });
   assert.ok(!plan.steps.some((s: any) => s.cmd === 'ak' || s.cmd === 'herdr'));
-  assert.ok(plan.notes.some((n: string) => n.includes('`ak` is missing')) && plan.notes.some((n: string) => n.includes('herdr is not installed')));
+  assert.ok(plan.notes.some((n: string) => n.includes('herdr is not installed')));
+});
+
+test('a failing optional pi-light-kit install adds its note and later steps still run', async () => {
+  const dir = agentHome([]);
+  const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => t === 'pi' || t === 'git', run: () => ({ ok: true, out: '', missing: false }) });
+  const ran: string[] = []; const log: string[] = [];
+  const ok = await applyPlan({ steps: plan.steps.filter((s: any) => s.cmd) },
+    async (_c: string, args: string[]) => { ran.push(args[1]); return { ok: args[1] !== KIT, out: 'fatal: could not read from remote repository' }; },
+    (l: string) => log.push(l));
+  assert.equal(ok, true);
+  const kitIndex = ran.indexOf(KIT);
+  assert.ok(kitIndex >= 0);
+  assert.ok(log.some(l => l.includes('pi-light-kit not installed (no access or offline); stage skills unavailable')));
+  assert.ok(!log.some(l => l.startsWith('FAIL')));
+  // Steps after the kit still ran (the kit is the last package; the browser step is a fn, run separately here).
+  assert.deepEqual(ran, SOURCES);
 });
 
 test('applyPlan stops at the first failed step', async () => {

@@ -1,6 +1,6 @@
 # pi-light
 
-A personal workflow package for the [Pi](https://github.com/earendil-works/pi) coding agent. It needs AgentKit's Pi adapter.
+A personal workflow package for the [Pi](https://github.com/earendil-works/pi) coding agent: Opus-controlled Pi workflow with stage routing, model fallback, herdr subagents (headless fallback), browser bridge and setup. Stage skills come from the optional private `pi-light-kit` package.
 
 The package root is the workflow core. Each feature is its own extension under `extensions/`, and every one loads by default:
 
@@ -11,9 +11,9 @@ The package root is the workflow core. Each feature is its own extension under `
 | `extensions/browser-bridge` | The `browser` tool, the shared local browser relay, `/browser-connect`, `/browser-status` and the Chromium add-on |
 | `extensions/herdr-layout` | herdr subagent pane layout |
 | `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
-| `extensions/setup` | `/pi-light setup` and the missing-AgentKit warning |
+| `extensions/setup` | `/pi-light setup` |
 
-- **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to an AgentKit skill. The agent only edits files when you ask for an implementation.
+- **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to a stage skill (from `pi-light-kit`). The agent only edits files when you ask for an implementation.
 - **Advisors.** Advice comes from subagents: spawn `counsel` for autonomous counsel and `advisor` for an interactive interview (herdr only). A cross-family review is a `subagent` call on the other-family model. Both agent definitions ship in `agents/` (`counsel.md`, `advisor.md`) and use `claude-fable-5-2`.
 - **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol.
@@ -27,11 +27,11 @@ The package root is the workflow core. Each feature is its own extension under `
 bash <(curl -fsSL https://raw.githubusercontent.com/locnbk2002/pi-light/main/bootstrap.sh)
 ```
 
-You need `pi`, `git` and `node`. For the full setup, also install the AgentKit CLI (`ak`, logged in) and herdr. The bootstrap installs this package (or updates a pre-0.5 checkout) and then runs `extensions/setup/setup.mjs`. Setup shows its plan and asks before it changes anything. It installs:
+You need `pi`, `git` and `node`. For the full setup, also install herdr. The bootstrap installs this package (or updates a pre-0.5 checkout) and then runs `extensions/setup/setup.mjs`. Setup shows its plan and asks before it changes anything. It installs:
 
-- the AgentKit `engineer` Pi adapter (pinned version in `extensions/setup/setup.json`; needs a matching `ak`, e.g. `ak self-update --beta --yes`) with the skill list in `setup.json`;
-- the latest `pi-effort` and `pi-claude-bridge`, and a pinned upstream `pi-herdr-subagents`;
-- herdr's Pi integration and the subagents plugin link;
+- the latest `pi-effort` and `pi-claude-bridge`;
+- the private `pi-light-kit` (stage skills) when your git login can reach it; otherwise setup notes "pi-light-kit not installed (no access or offline); stage skills unavailable" and continues;
+- herdr's Pi integration and a link to the bundled subagents plugin (`extensions/subagents/herdr-plugin`);
 - a loadable browser add-on folder in `~/.pi/agent/pi-light/browser/chromium/`;
 - the latest `@gotgenes/pi-permission-system` and, if none exists yet, its rule file (see Permissions below).
 

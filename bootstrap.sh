@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up pi-light on a new machine:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/locnbk2002/pi-light/main/bootstrap.sh) [--dry-run|--yes]
-# Needs pi, git and node. AgentKit (`ak`, logged in) and herdr are set up by extensions/setup/setup.mjs when present.
+# Needs pi, git and node. herdr and the optional private pi-light-kit are set up by extensions/setup/setup.mjs when present.
 # Credentials and the default model are never touched.
 set -euo pipefail
 for tool in pi git node; do
