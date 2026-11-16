@@ -65,6 +65,10 @@ test('account failure classification: quota and auth are per account; overload i
   assert.equal(accountFailureKind('error', 'Claude quota exceeded — rate limit (five_hour)'), 'limit');
   assert.equal(accountFailureKind('error', '429 rate_limit_error'), 'limit');
   assert.equal(accountFailureKind('error', 'Failed to authenticate. API Error: 401 OAuth access token is invalid.'), 'auth');
+  assert.equal(accountFailureKind('error', 'Failed to authenticate. API Error: 403 Attention Required! | Cloudflare'), undefined);
+  assert.equal(accountFailureKind('error', 'API Error: 403 <title>Just a moment...</title>'), undefined);
+  assert.equal(accountFailureKind('error', '401 OAuth access token is invalid (cloudflare cf-ray abc123)'), 'auth');
+  assert.equal(accountFailureKind('error', '<html>429 rate_limit_error</html> via cloudflare'), 'limit');
   assert.equal(accountFailureKind('error', '529 overloaded_error: Overloaded'), undefined);
   assert.equal(accountFailureKind('error', 'invalid_request_error: bad field'), undefined);
   assert.equal(accountFailureKind('stop', 'quota'), undefined);

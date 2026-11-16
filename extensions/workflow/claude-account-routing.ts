@@ -22,12 +22,17 @@ export function accountsDir(agentDir: string): string { return join(agentDir, 'p
 // so they keep the model-level fallback.
 const ACCOUNT_LIMIT = /quota|usage.?limit|rate.?limit|too many requests|(?<![a-z0-9])429(?![a-z0-9])|usage_not_included|subscription_sharing_usage|resource.?exhausted/i;
 const NOT_ACCOUNT_LIMIT = /overloaded|(?<![a-z0-9])529(?![a-z0-9])|at capacity|server_busy/i;
+// An edge/WAF challenge page (Cloudflare "Attention Required", "Just a moment") blocks the network path,
+// not the token: Claude Code wraps it as "Failed to authenticate", but banning the token would be wrong.
+// Match only challenge-page titles: a real 401/429 that merely mentions Cloudflare keeps its classification.
+const EDGE_BLOCK = /attention required|just a moment/i;
 const AUTH = /(?<![a-z0-9])401(?![a-z0-9])|authentication_error|failed to authenticate|oauth (?:access )?token (?:is )?(?:invalid|expired|revoked)|invalid (?:oauth|bearer|access) token|token (?:has )?(?:expired|been revoked)/i;
 
 export type AccountFailure = 'limit' | 'auth';
 /** Account-specific failure kind of a failed claude-bridge response, if any. */
 export function accountFailureKind(stopReason: unknown, errorMessage: unknown): AccountFailure | undefined {
   if (stopReason !== 'error' || typeof errorMessage !== 'string') return undefined;
+  if (EDGE_BLOCK.test(errorMessage)) return undefined;
   if (AUTH.test(errorMessage)) return 'auth';
   if (ACCOUNT_LIMIT.test(errorMessage) && !NOT_ACCOUNT_LIMIT.test(errorMessage)) return 'limit';
   return undefined;
