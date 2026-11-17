@@ -13,7 +13,7 @@ The package root is the workflow core. Each feature is its own extension under `
 | `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
 | `extensions/setup` | `/pi-light setup` |
 
-- **Stage routing (in `pi-light-kit`).** Opus is the controller. With the kit installed, each request is routed as advice, brainstorm, plan or implement and mapped to a stage skill; the agent only edits files when you ask for an implementation. The `route_task` tool, the request binding, the `locbt_workflow` prompt section and the `locbt-router` skill moved from pi-light to the kit.
+- **Stage routing (in `pi-light-kit`).** Opus is the controller by default; `/model` picks another for one session. With the kit installed, each request is routed as advice, brainstorm, plan or implement and mapped to a stage skill; the agent only edits files when you ask for an implementation. The `route_task` tool, the request binding and the `locbt_workflow` prompt section moved from pi-light to the kit.
 - **Advisors.** Advice comes from subagents: spawn `counsel` for autonomous counsel and `advisor` for an interactive interview (herdr only). A cross-family review is a `subagent` call on the other-family model. Both agent definitions ship in `agents/` (`counsel.md`, `advisor.md`) and use `claude-fable-5-2`.
 - **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol.
@@ -124,6 +124,8 @@ The defaults are the controller `anthropic/claude-opus-5-5` with fallback `opena
 ```
 
 You can also replace the whole list with the `controller` key. The retired `astra` and `fable` keys are ignored.
+
+To use another controller for one session, pick it with `/model` (or `Ctrl+P`), for example `openai-codex/gpt-6.1-sol` or `anthropic/claude-fable-5-2`. The pick leads the controller list for the rest of the session and the configured list stays behind it as fallback; the status line shows `controller: <model> (picked for this session)`. On the next prompt the session switches back to `pi-light/controller` ("Controller (fallback list)") so provider-limit fallback stays on. Picking `pi-light/controller` or the first configured model restores the configured order. The pick is never saved: a new or resumed session, a reload and a restart all start on the configured list. The kit's review rule follows the running model, so a GPT controller is reviewed by Opus. Subagents without a model still use the configured list.
 
 ## Effort judge
 

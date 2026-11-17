@@ -8,7 +8,7 @@ import { isProjectExplicitlyTrusted } from '../../lib/project-trust.ts';
 import { answerInputPreflightQueries, answerModelsQueries, inputPreflight } from './routing-events.ts';
 import { EFFORT_INSTRUCTION, EFFORT_SECTION, judgeEffort, judgeInput, registryJudgeCall, type JudgeResult } from './effort-judge.ts';
 import { innerExplicitLevel, planSubagentEffort, type SubagentEffortPlan } from './subagent-effort.ts';
-import { Cooldowns, isLimitOrCapacityError, loadModelChains, modelConfigPath, modelFamily, planCandidates, reviewerModel, routeController, splitModel,
+import { Cooldowns, isLimitOrCapacityError, loadModelChains, modelConfigPath, modelFamily, planCandidates, reviewerModel, routeController, sessionChain, splitModel,
   VIRTUAL_CONTROLLER, type ControllerRouteDecision, type ModelConfig } from './model-fallback.ts';
 import { ACCOUNT_PROVIDER, accountFailureKind, accountsDir, BRIDGE_PROVIDER, ClaudeAccountRouter, safeToReplay } from './claude-account-routing.ts';
 
@@ -37,12 +37,13 @@ export function hasModelFlag(argv = process.argv.slice(2)): boolean {
 // Worded without retry or limit keywords: Pi must not auto-retry it and the classifiers must not match it.
 const NO_ACCOUNT = 'no Claude account is available (each is blocked, rejected or holding its 10% reserve)';
 
-function registerControllerModel(pi: ExtensionAPI, chain: readonly string[], cooldowns: Cooldowns,
+function registerControllerModel(pi: ExtensionAPI, controllerChain: () => readonly string[], cooldowns: Cooldowns,
   onRoute?: (ctx: ExtensionContext, decision: ControllerRouteDecision) => void, accounts?: ClaudeAccountRouter): void {
   pi.registerVirtualModel({
     provider: VIRTUAL_CONTROLLER.provider, id: VIRTUAL_CONTROLLER.id, name: VIRTUAL_CONTROLLER.name,
     thinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     async route(request, ctx) {
+      const chain = controllerChain();
       const failed = request.failed && { model: modelRef(request.failed.model)!,
         stopReason: request.failed.message.stopReason, errorMessage: request.failed.message.errorMessage };
       const isAvailable = (model: string) => modelAvailable(ctx, model);
@@ -113,13 +114,14 @@ function registerControllerModel(pi: ExtensionAPI, chain: readonly string[], coo
  * continues once per candidate, but only if that attempt showed no text and called no tool.
  * Shared by the main controller and by herdr/one-shot children.
  */
-function createSettleFailover(chain: readonly string[], cooldowns: Cooldowns, accounts?: ClaudeAccountRouter) {
+function createSettleFailover(controllerChain: () => readonly string[], cooldowns: Cooldowns, accounts?: ClaudeAccountRouter) {
   let fallbackContinuations = 0;
   let accountContinuations = 0;
   return {
     reset(): void { fallbackContinuations = 0; accountContinuations = 0; },
     async beforeSettle(event: AgentBeforeSettleEvent, ctx: ExtensionContext): Promise<AgentBeforeSettleEventResult | undefined> {
       if (event.outcome !== 'error' || !isVirtualController(ctx.model)) return;
+      const chain = controllerChain();
       const entries = event.context.contextEntries;
       let index = entries.length - 1;
       for (; index >= 0; index--) if (entries[index].messages.some(message => message.role === 'assistant')) break;
@@ -212,9 +214,9 @@ export default function piLight(pi: ExtensionAPI): void {
     const config = loadModelChains();
     const childAccounts = createAccounts(config);
     const childCooldowns = new Cooldowns();
-    registerControllerModel(pi, config.chains.controller, childCooldowns, undefined, childAccounts);
+    registerControllerModel(pi, () => config.chains.controller, childCooldowns, undefined, childAccounts);
     // Children get the same settle-time failover (accounts, then models) as the main controller.
-    const childFailover = createSettleFailover(config.chains.controller, childCooldowns, childAccounts);
+    const childFailover = createSettleFailover(() => config.chains.controller, childCooldowns, childAccounts);
     pi.on('agent_before_settle', (event, ctx) => childFailover.beforeSettle(event, ctx));
     pi.on('agent_settled', () => childFailover.reset());
     if (childAccounts || herdrChild) {
@@ -245,15 +247,24 @@ export default function piLight(pi: ExtensionAPI): void {
   const judgeCooldowns = new Cooldowns();
   const cooldowns = new Cooldowns();
   let controllerModel: string | undefined;
+  // A concrete model picked with /model (or Ctrl+P) for this session only; it leads the controller list.
+  let sessionPick: string | undefined;
+  // Set while pi-light itself selects a model, so its own model_select events are not taken as picks.
+  let selfSelecting = false;
+  const controllerChain = () => sessionChain(models.chains.controller, sessionPick);
   let nativeFallbackWarned = false;
-  const failover = createSettleFailover(models.chains.controller, cooldowns, accounts);
+  const failover = createSettleFailover(controllerChain, cooldowns, accounts);
+  async function selectModel(model: Parameters<ExtensionAPI['setModel']>[0]): Promise<boolean> {
+    selfSelecting = true;
+    try { return await pi.setModel(model); } finally { selfSelecting = false; }
+  }
 
   const available = modelAvailable;
   function showControllerModel(ctx: ExtensionContext, model: string): void {
     controllerModel = model;
-    const preferred = models.chains.controller[0];
-    ctx.ui.setStatus('pi-light-model', model === preferred ? undefined
-      : `controller fallback: ${model} (${preferred} limited or unavailable)`);
+    const preferred = controllerChain()[0];
+    ctx.ui.setStatus('pi-light-model', model !== preferred ? `controller fallback: ${model} (${preferred} limited or unavailable)`
+      : sessionPick ? `controller: ${model} (picked for this session)` : undefined);
   }
   function noteControllerRoute(ctx: ExtensionContext, decision: ControllerRouteDecision): void {
     if (decision.cooled && decision.cooled.model !== decision.model) {
@@ -272,25 +283,38 @@ export default function piLight(pi: ExtensionAPI): void {
   async function ensureController(ctx: ExtensionContext): Promise<boolean> {
     if (isVirtualController(ctx.model)) return true;
     const virtual = ctx.modelRegistry.find(VIRTUAL_CONTROLLER.provider, VIRTUAL_CONTROLLER.id);
-    if (virtual && await pi.setModel(virtual)) return true;
-    // Without the virtual model the native Opus controller still works, but without fallback.
+    if (virtual && await selectModel(virtual)) return true;
+    // The preferred controller (first entry of this session's list; provider renames applied) still works
+    // natively without the virtual model, but without fallback.
+    const preferred = controllerChain()[0];
     if (!nativeFallbackWarned) {
       nativeFallbackWarned = true;
-      ctx.ui.notify('Controller fallback model is unavailable; using native Opus without provider-limit fallback.', 'warning');
+      ctx.ui.notify(`Controller fallback model is unavailable; using ${preferred} without provider-limit fallback.`, 'warning');
     }
-    // The preferred controller (first chain entry; provider renames applied) is used natively without fallback.
-    const preferred = models.chains.controller[0];
     if (isModelRef(ctx.model, preferred)) return true;
     const { provider, id } = splitModel(preferred);
     const model = ctx.modelRegistry.find(provider, id);
-    if (!model || !await pi.setModel(model)) {
-      ctx.ui.notify('Opus controller is unavailable. No controller prompt will be sent.', 'error');
+    if (!model || !await selectModel(model)) {
+      ctx.ui.notify(`Controller ${preferred} is unavailable. No controller prompt will be sent.`, 'error');
       return false;
     }
     return true;
   }
   // Controller fallback: one selectable model that routes each request along the controller list.
-  registerControllerModel(pi, models.chains.controller, cooldowns, (ctx, decision) => noteControllerRoute(ctx, decision), accounts);
+  registerControllerModel(pi, controllerChain, cooldowns, (ctx, decision) => noteControllerRoute(ctx, decision), accounts);
+  // A model picked with /model or Ctrl+P leads the controller list for this session; the next prompt
+  // switches back to the virtual controller so provider-limit fallback stays on. Picking the virtual
+  // controller itself restores the configured order. Nothing is saved.
+  pi.on('model_select', (event, ctx) => {
+    if (selfSelecting) return;
+    const picked = modelRef(event.model)!;
+    sessionPick = isVirtualController(event.model) || picked === models.chains.controller[0] ? undefined : picked;
+    if (accounts?.serving && sessionPick) {
+      const notice = installAccounts(pi, accounts, controllerChain(), ctx);
+      if (notice) ctx.ui.notify(notice, 'warning');
+    }
+    showControllerModel(ctx, controllerChain()[0]);
+  });
   pi.registerCommand('claude-accounts', {
     description: 'Claude account rotation status (no secrets); "reload" re-reads the account files',
     handler: async (args, ctx) => {
@@ -323,7 +347,7 @@ export default function piLight(pi: ExtensionAPI): void {
       }
     } catch {
       preflight.handled();
-      ctx.ui.notify('Could not select Opus. Input was not sent.', 'error');
+      ctx.ui.notify('Could not select the controller model. Input was not sent.', 'error');
       return { action: 'handled' };
     }
     preflight.accepted();
@@ -383,7 +407,7 @@ export default function piLight(pi: ExtensionAPI): void {
     if (event.toolName === 'subagent') await applySubagentEffort(event.toolCallId, event.input as Record<string, unknown>, ctx);
   });
   pi.on('before_agent_start', (event, ctx) => {
-    if (!(isVirtualController(ctx.model) || isModelRef(ctx.model, models.chains.controller[0]))) {
+    if (!(isVirtualController(ctx.model) || isModelRef(ctx.model, controllerChain()[0]))) {
       ctx.abort();
       throw new Error('Controller run blocked: incorrect main model.');
     }
@@ -399,6 +423,10 @@ export default function piLight(pi: ExtensionAPI): void {
     pendingJudgments.clear();
   });
   pi.on('session_start', async (_event, ctx) => {
+    // A pick belongs to one session: a new or resumed session starts on the configured order.
+    sessionPick = undefined;
+    controllerModel = undefined;
+    ctx.ui.setStatus('pi-light-model', undefined);
     if (modelNotice) {
       ctx.ui.notify(modelNotice, 'warning');
       modelNotice = undefined;
@@ -416,6 +444,6 @@ export default function piLight(pi: ExtensionAPI): void {
       if (notice) ctx.ui.notify(notice, 'warning');
     }
     try { await ensureController(ctx); }
-    catch { ctx.ui.notify('Opus could not be selected; controller prompts will be blocked.', 'error'); }
+    catch { ctx.ui.notify('The controller model could not be selected; controller prompts will be blocked.', 'error'); }
   });
 }

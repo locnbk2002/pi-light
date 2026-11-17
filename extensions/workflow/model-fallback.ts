@@ -11,7 +11,7 @@ export type ModelChains = Readonly<Record<FallbackRole, readonly string[]>>;
 export const ROLES: readonly FallbackRole[] = ['controller'];
 /** Retired advisor roles: silently ignored in old override files. */
 const LEGACY_ROLES = ['astra', 'fable'];
-export const VIRTUAL_CONTROLLER = { provider: 'pi-light', id: 'controller', name: 'Opus (fallback)' } as const;
+export const VIRTUAL_CONTROLLER = { provider: 'pi-light', id: 'controller', name: 'Controller (fallback list)' } as const;
 export const DEFAULT_COOLDOWN_MS = 10 * 60_000;
 
 const ref = (model: { provider: string; model: string }) => `${model.provider}/${model.model}`;
@@ -19,6 +19,14 @@ const SOL = 'openai-codex/gpt-6.1-sol';
 export const DEFAULT_CHAINS: ModelChains = Object.freeze({
   controller: Object.freeze([ref(MAIN_MODEL), SOL]),
 });
+
+/**
+ * The controller list for this session: a model picked with /model leads and the configured list stays
+ * behind it as fallback. The pick lives in memory only, so a restart restores the configured order.
+ */
+export function sessionChain(configured: readonly string[], pick: string | undefined): readonly string[] {
+  return pick ? [pick, ...configured.filter(model => model !== pick)] : configured;
+}
 
 export function splitModel(model: string): { provider: string; id: string } {
   const slash = model.indexOf('/');

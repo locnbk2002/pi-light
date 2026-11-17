@@ -121,7 +121,14 @@ function extensionHarness() {
     setActiveTools(names: string[]) { activeTools = names; },
     sendMessage(message: unknown, options: unknown) { sent++; sentRecords.push({ message, options }); }, appendEntry() {},
     registerVirtualModel(definition: Parameters<ExtensionAPI['registerVirtualModel']>[0]) { virtualModel = definition; },
-    async setModel(model: { provider: string; id: string }) { selected.push(model); (ctx as { model: unknown }).model = model; return true; },
+    async setModel(model: { provider: string; id: string }) {
+      selected.push(model);
+      const previousModel = (ctx as { model?: { provider: string; id: string } }).model;
+      (ctx as { model: unknown }).model = model;
+      // Like Pi, a real change fires model_select from inside setModel.
+      if (previousModel?.provider !== model.provider || previousModel?.id !== model.id) await events.get('model_select')?.({ model, previousModel, source: 'set' }, ctx);
+      return true;
+    },
   } as unknown as ExtensionAPI;
   // Catalog stub: every model exists; `unavailable` simulates providers without credentials.
   const unavailable = new Set<string>();
@@ -188,10 +195,10 @@ const OPUS_REF = DEFAULT_CHAINS.controller[0];
 const SOL_REF = DEFAULT_CHAINS.controller[1];
 const physical = (ref: string) => { const [provider, ...id] = ref.split('/'); return { provider, id: id.join('/') }; };
 
-test('controller selects the fallback virtual model; the model gate accepts virtual or native Opus only', async () => {
+test('controller selects the fallback virtual model; the model gate accepts virtual or the preferred native model only', async () => {
   const harness = extensionHarness();
   const definition = harness.virtualModel();
-  assert.deepEqual([definition.provider, definition.id, definition.name], ['pi-light', 'controller', 'Opus (fallback)']);
+  assert.deepEqual([definition.provider, definition.id, definition.name], ['pi-light', 'controller', 'Controller (fallback list)']);
   (harness.ctx as { model: unknown }).model = { provider: MAIN_MODEL.provider, id: MAIN_MODEL.model };
   harness.ctx.mode = 'rpc';
   await harness.event('session_start', { reason: 'startup' });
@@ -328,10 +335,10 @@ test('input preflight: a dropped input is announced as handled, for a refused an
   const registry = harness.ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown };
   registry.find = () => undefined;
   assert.deepEqual(await harness.event('input', { text: 'B', source: 'interactive' }), { action: 'handled' });
-  assert.ok(harness.notifications.includes('Opus controller is unavailable. No controller prompt will be sent.'));
+  assert.ok(harness.notifications.includes(`Controller ${OPUS_REF} is unavailable. No controller prompt will be sent.`));
   registry.find = () => { throw new Error('registry failed'); };
   assert.deepEqual(await harness.event('input', { text: 'C', source: 'extension' }), { action: 'handled' });
-  assert.ok(harness.notifications.includes('Could not select Opus. Input was not sent.'));
+  assert.ok(harness.notifications.includes('Could not select the controller model. Input was not sent.'));
   assert.deepEqual(seen, ['received:interactive:B:-', 'handled:interactive:B:-', 'received:extension:C:-', 'handled:extension:C:-']);
   const [b1, b2, c1, c2] = ids;
   assert.ok(b1 === b2 && c1 === c2, 'an outcome carries the id of its own received signal');
@@ -490,4 +497,49 @@ test('subagent effort: an untrusted project agent definition never sets the chil
     if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous.agentDir;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+const FABLE_REF = 'anthropic/claude-fable-5-2';
+const userRoute = (harness: ReturnType<typeof extensionHarness>) => harness.virtualModel().route({ reason: 'user', model: physical('pi-light/controller'),
+  thinkingLevel: 'high', messages: [] } as unknown as Parameters<ReturnType<typeof harness.virtualModel>['route']>[0], harness.ctx);
+
+test('a /model pick leads the controller list for this session, with the configured list as fallback', async () => {
+  const harness = extensionHarness();
+  await harness.event('model_select', { model: physical(SOL_REF), previousModel: physical('pi-light/controller'), source: 'set' });
+  assert.match(harness.statuses.get('pi-light-model')!, /controller: openai-codex\/gpt-6.1-sol \(picked for this session\)/);
+  assert.deepEqual(harness.models()[0], { controllerModel: SOL_REF, controllerFamily: 'openai', reviewerModel: OPUS_REF }, 'the kit sees the picked model before any route');
+  // The next prompt returns to the virtual controller (its own selection is not a new pick) and routes to the pick.
+  (harness.ctx as { model: unknown }).model = physical(SOL_REF);
+  assert.deepEqual(await harness.event('input', { text: 'go', source: 'interactive' }), { action: 'continue' });
+  assert.deepEqual(harness.selected.at(-1), { provider: 'pi-light', id: 'controller' });
+  assert.deepEqual((await userRoute(harness)).model, physical(SOL_REF), 'pi-light\'s own switch back is not a new pick');
+  await harness.event('model_select', { model: physical('pi-light/controller'), previousModel: physical(SOL_REF), source: 'set' });
+  assert.deepEqual((await userRoute(harness)).model, physical(OPUS_REF), 'picking the virtual controller restores the configured order');
+  await harness.event('model_select', { model: physical(FABLE_REF), previousModel: physical('pi-light/controller'), source: 'cycle' });
+  assert.deepEqual((await userRoute(harness)).model, physical(FABLE_REF));
+  assert.deepEqual(harness.models()[0], { controllerModel: FABLE_REF, controllerFamily: 'anthropic', reviewerModel: SOL_REF });
+  // The configured list stays behind the pick: a limit on the pick falls back to the first configured model.
+  const definition = harness.virtualModel();
+  const retry = await definition.route({ reason: 'retry', model: physical('pi-light/controller'), thinkingLevel: 'high', messages: [],
+    failed: { model: physical(FABLE_REF), thinkingLevel: 'high', message: { role: 'assistant', stopReason: 'error', errorMessage: '429 rate_limit_error' } } } as unknown as Parameters<typeof definition.route>[0], harness.ctx);
+  assert.deepEqual(retry.model, physical(OPUS_REF));
+  // The model gate accepts the pick when it runs natively.
+  (harness.ctx as { model: unknown }).model = physical(FABLE_REF);
+  await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' });
+});
+
+test('a pick is not saved: a new session starts on the configured order, and selecting the first configured model clears it', async () => {
+  const harness = extensionHarness();
+  await harness.event('model_select', { model: physical(SOL_REF), previousModel: physical('pi-light/controller'), source: 'set' });
+  await harness.event('session_start', { reason: 'new' });
+  assert.equal(harness.statuses.get('pi-light-model'), undefined);
+  assert.deepEqual((await userRoute(harness)).model, physical(OPUS_REF));
+  assert.equal(harness.models()[0].controllerModel, OPUS_REF);
+  await harness.event('model_select', { model: physical(SOL_REF), previousModel: physical('pi-light/controller'), source: 'set' });
+  await harness.event('model_select', { model: physical(OPUS_REF), previousModel: physical(SOL_REF), source: 'set' });
+  assert.deepEqual((await userRoute(harness)).model, physical(OPUS_REF));
+  (harness.ctx as { model: unknown }).model = physical(SOL_REF);
+  (harness.ctx as { abort: () => void }).abort = () => {};
+  await assert.rejects(Promise.resolve().then(() => harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' })), /incorrect main model/,
+    'without a pick a native non-preferred model is still refused');
 });

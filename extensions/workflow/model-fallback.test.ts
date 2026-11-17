@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Cooldowns, DEFAULT_CHAINS, DEFAULT_EFFORT, isLimitOrCapacityError, loadModelChains, modelFamily, parseEffortSettings, parseModelChains, planCandidates,
+import { Cooldowns, DEFAULT_CHAINS, sessionChain, DEFAULT_EFFORT, isLimitOrCapacityError, loadModelChains, modelFamily, parseEffortSettings, parseModelChains, planCandidates,
   reviewerModel, routeController } from './model-fallback.ts';
 
 const OPUS = 'anthropic/claude-opus-5-5';
@@ -206,4 +206,11 @@ test('the judge chain never feeds the reviewer or controller chains', () => {
   assert.equal('judge' in chains, false);
   assert.equal(reviewerModel(chains, 'openai-codex/gpt-6.1-sol', m => m !== 'anthropic/claude-opus-5-5' && m !== 'anthropic/claude-fable-5-2'), undefined,
     'no judge model is offered as a reviewer');
+});
+
+test('sessionChain puts a session pick first and keeps the configured list behind it once', () => {
+  const configured = ['anthropic/claude-opus-5-5', 'openai-codex/gpt-6.1-sol'];
+  assert.equal(sessionChain(configured, undefined), configured);
+  assert.deepEqual(sessionChain(configured, 'openai-codex/gpt-6.1-sol'), ['openai-codex/gpt-6.1-sol', 'anthropic/claude-opus-5-5']);
+  assert.deepEqual(sessionChain(configured, 'anthropic/claude-fable-5-2'), ['anthropic/claude-fable-5-2', ...configured]);
 });
