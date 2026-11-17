@@ -291,19 +291,22 @@ test('effort judge guidance: pi-light emits it in its own section while the judg
 /** Record the input preflight signals in emission order, with what the controller model was at the time. */
 function recordSignals(harness: ReturnType<typeof extensionHarness>) {
   const seen: string[] = [];
+  const ids: string[] = [];
   for (const [name, channel] of [['received', INPUT_RECEIVED], ['accepted', INPUT_ACCEPTED], ['handled', INPUT_HANDLED]] as const) {
     harness.bus.on(channel, data => {
-      const signal = data as { text: string; source: string; streamingBehavior?: string; ctx: unknown };
+      const signal = data as { dispatchId: string; text: string; source: string; streamingBehavior?: string; ctx: unknown };
       assert.equal(signal.ctx, harness.ctx);
+      assert.match(signal.dispatchId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'an unguessable random id');
+      ids.push(signal.dispatchId);
       seen.push(`${name}:${signal.source}:${signal.text}:${signal.streamingBehavior ?? '-'}`);
     });
   }
-  return seen;
+  return { seen, ids };
 }
 
 test('input preflight: every input is announced before controller selection, then accepted', async () => {
   const harness = extensionHarness();
-  const seen = recordSignals(harness);
+  const { seen, ids } = recordSignals(harness);
   let replies = 0;
   harness.bus.emit(INPUT_PREFLIGHT_QUERY, { reply(value: unknown) { assert.equal(value, true); replies++; } });
   assert.equal(replies, 1, 'pi-light announces that it drives the input preflight');
@@ -315,11 +318,12 @@ test('input preflight: every input is announced before controller selection, the
   resolveSelection(true);
   assert.deepEqual(await pending, { action: 'continue' });
   assert.deepEqual(seen, ['received:rpc:Implement hello.txt.:steer', 'accepted:rpc:Implement hello.txt.:steer']);
+  assert.equal(ids[0], ids[1], 'the acceptance carries the id of its own received signal');
 });
 
 test('input preflight: a dropped input is announced as handled, for a refused and for a throwing selection', async () => {
   const harness = extensionHarness();
-  const seen = recordSignals(harness);
+  const { seen, ids } = recordSignals(harness);
   (harness.ctx as { model: unknown }).model = { provider: 'openai-codex', id: 'gpt-6-astra' };
   const registry = harness.ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown };
   registry.find = () => undefined;
@@ -329,6 +333,9 @@ test('input preflight: a dropped input is announced as handled, for a refused an
   assert.deepEqual(await harness.event('input', { text: 'C', source: 'extension' }), { action: 'handled' });
   assert.ok(harness.notifications.includes('Could not select Opus. Input was not sent.'));
   assert.deepEqual(seen, ['received:interactive:B:-', 'handled:interactive:B:-', 'received:extension:C:-', 'handled:extension:C:-']);
+  const [b1, b2, c1, c2] = ids;
+  assert.ok(b1 === b2 && c1 === c2, 'an outcome carries the id of its own received signal');
+  assert.notEqual(b1, c1, 'every dispatch gets a fresh id');
 });
 
 test('models query: pi-light names the controller and its other-family reviewer', async () => {

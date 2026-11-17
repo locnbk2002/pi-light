@@ -2,6 +2,7 @@
 // neither package imports the other. Pi's bus is a node EventEmitter: emit() runs listeners
 // synchronously up to their first await, so the synchronous replies and revocations below take
 // effect before emit() returns.
+import { randomUUID } from 'node:crypto';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 interface EventBus {
@@ -44,13 +45,17 @@ export function answerModelsQueries(events: EventBus, answer: (ctx: ExtensionCon
 // cannot. Pi stops calling later input handlers once one returns `handled`, so a routing workflow
 // cannot see a dropped input itself. pi-light therefore announces each input: `received` before the
 // asynchronous controller selection (a newer human input revokes earlier authority at once), then
-// exactly one of `accepted` or `handled` (dropped: nothing may stay bound to it).
+// exactly one of `accepted` or `handled` (dropped: nothing may stay bound to it). Inputs can overlap
+// while their selections are pending, so every signal of one dispatch carries the same opaque,
+// unguessable dispatch id, and an outcome applies only to the input with that id.
 export const INPUT_PREFLIGHT_QUERY = 'pi-light:input:query';
 export const INPUT_RECEIVED = 'pi-light:input:received';
 export const INPUT_ACCEPTED = 'pi-light:input:accepted';
 export const INPUT_HANDLED = 'pi-light:input:handled';
 
 export interface InputSignal {
+  /** Opaque id shared by the received signal and the outcome of one input dispatch. */
+  dispatchId: string;
   text: string;
   source: string;
   streamingBehavior?: string;
@@ -71,8 +76,9 @@ export function answerInputPreflightQueries(events: EventBus): void {
   });
 }
 
-/** Signals for one input dispatch; every signal carries the same payload. */
-export function inputPreflight(events: EventBus, signal: InputSignal): InputPreflight {
+/** Signals for one input dispatch; every signal carries the same payload and a fresh dispatch id. */
+export function inputPreflight(events: EventBus, input: Omit<InputSignal, 'dispatchId'>): InputPreflight {
+  const signal: InputSignal = { ...input, dispatchId: randomUUID() };
   return {
     received: () => events.emit(INPUT_RECEIVED, signal),
     accepted: () => events.emit(INPUT_ACCEPTED, signal),
