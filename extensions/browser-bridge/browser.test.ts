@@ -536,6 +536,8 @@ async function loadAddon(options: { enabled?: boolean; pairing?: string | null; 
               page.evaluatedIn = documents.get(tabId)!.origin;
               if (params.expression === "location.origin") return { result: { type: "string", value: documents.get(tabId)!.origin } };
             }
+            // Every evaluation that actually runs, with the origin of the document it ran in.
+            (page.runs ??= []).push({ expression: params.expression, origin: documents.get(tabId)?.origin });
             return evaluateIn(params.expression);
           case "Input.insertText": page.document.activeElement.value = params.text; return {};
           case "Page.getLayoutMetrics": return { cssVisualViewport: { clientWidth: 1200, clientHeight: 800, pageX: 0, pageY: 0 }, cssContentSize: { width: 3200, height: 20000 } };
@@ -1194,7 +1196,8 @@ test("bound-tab pin: a document replaced between the check and the dispatch fail
   // evaluate: pinned by context, so the replaced document never runs the code.
   replaceAfterCheck(1);
   await assert.rejects(request({ action: "evaluate", code: "document.title" }), /document changed/);
-  assert.equal(addon.calls.some(c => c.method === "Runtime.evaluate" && c.params.expression === "document.title" && addon.page.evaluatedIn !== origin), false);
+  assert.deepEqual((addon.page.runs ?? []).filter((run: { expression: string; origin: string }) => run.expression === "document.title" && run.origin !== origin), [],
+    "the model's code never ran in the replacing document");
   // A same-origin reload that Chrome reports gives a new pin, and actions run again.
   addon.page.onCommand = undefined;
   addon.replaceDocument(7, `${origin}/inbox`);

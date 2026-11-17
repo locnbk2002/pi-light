@@ -95,8 +95,8 @@ export function validateAction(value: unknown, target?: ControlledTab): BrowserA
 export function needsTab(action: BrowserAction): boolean { return !TABLESS.has(action.action); }
 export function isMutation(action: BrowserAction): boolean { return MUTATIONS.has(action.action); }
 /**
- * Local confirmation policy: opening a Pi-owned tab runs without a prompt; actions on the user's bound tab
- * ask for mutations and console text; Pi-owned tabs run without prompts. Read-only mode is separate.
+ * Local confirmation policy: opening a Pi-owned tab and every action in it run without a prompt; actions on
+ * the user's bound tab ask for mutations and console text (an unattended allowlist exempts its mutations).
  */
 export function needsConfirmation(action: BrowserAction, target?: ControlledTab, unattended: ReadonlySet<string> = new Set()): boolean {
   if (action.action === "open") return false;
