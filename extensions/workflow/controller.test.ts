@@ -1,14 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RpcClient, createEventBus, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { createEventBus, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import piLight, { hasModelFlag } from './index.ts';
 import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
-import { MAIN_MODEL, ControllerPolicy } from './controller-policy.ts';
-import { DEFAULT_CHAINS, VIRTUAL_CONTROLLER } from './model-fallback.ts';
+import { DEFAULT_CHAINS, MAIN_MODEL, VIRTUAL_CONTROLLER } from './model-fallback.ts';
+import { EFFORT_INSTRUCTION, MODELS_QUERY, type ModelsQuery, type PiLightModels } from './models-query.ts';
 // package.json lists test files explicitly; run the fallback module's unit tests with this suite.
 import './model-fallback.test.ts';
 
@@ -16,7 +15,7 @@ import './model-fallback.test.ts';
 const RETIRED_TOOL = ['consult', 'advisor'].join('_');
 const RETIRED_COMMANDS = ['advisor', 'back', ['cancel', 'advisor'].join('-'), 'consult'];
 
-const available = ['read', 'grep', 'find', 'ls', 'bash', 'powershell', 'edit', 'write', 'browser_click', 'browser_read', 'mcp__shell', 'codemode', 'browser', 'route_task'];
+const available = ['read', 'grep', 'find', 'ls', 'bash', 'powershell', 'edit', 'write', 'browser_click', 'browser_read', 'mcp__shell', 'codemode', 'browser'];
 
 test('native package leaves one-shot Pi child jobs untouched', () => {
   assert.equal(isOneShotInvocation(['--mode', 'json', '-p', '--no-session']), true);
@@ -94,16 +93,6 @@ test('controller uses native Anthropic Opus', () => {
   assert.deepEqual(MAIN_MODEL, { provider: 'anthropic', model: 'claude-opus-5-5' });
 });
 
-test('work requires current request routing, not a mode command', () => {
-  const policy = new ControllerPolicy();
-  assert.throws(() => policy.setMode('work'));
-  assert.equal(policy.mode, 'auto');
-  policy.captureInput('Implement the API.', 'interactive');
-  policy.routeTask({ intent: 'implement', requestId: policy.request!.id, requestQuote: 'Implement the API.', scope: 'API only' });
-  assert.equal(policy.mode, 'work');
-  assert.throws(() => policy.setMode('work'));
-});
-
 function extensionHarness() {
   const commands = new Map<string, Parameters<ExtensionAPI['registerCommand']>[1]>();
   const tools = new Map<string, Parameters<ExtensionAPI['registerTool']>[0]>();
@@ -160,213 +149,14 @@ function extensionHarness() {
       const event = name === 'before_agent_start' ? { systemPromptOptions: { sections: {} }, ...(value as object) } : value;
       return events.get(name)!(event, ctx);
     },
-    async route(params: { intent: string; requestId: string; requestQuote: string; scope: string }) {
-      const tool = tools.get('route_task')!;
-      return tool.execute('test-route', params, undefined, undefined, ctx as Parameters<typeof tool.execute>[4]);
+    /** Ask pi-light for its model facts the way the optional routing workflow does. */
+    models(queryCtx: unknown = ctx): PiLightModels[] {
+      const answers: PiLightModels[] = [];
+      bus.emit(MODELS_QUERY, { ctx: queryCtx, reply(answer: PiLightModels) { answers.push(answer); } } satisfies ModelsQuery);
+      return answers;
     },
   };
 }
-
-const status = (harness: ReturnType<typeof extensionHarness>) => harness.statuses.get('pi-light');
-
-const UNROUTED = 'controller | unrouted | no stage skill';
-const routeText = (result: unknown) => (result as { content: { text: string }[] }).content[0].text;
-
-async function currentRoute(harness: ReturnType<typeof extensionHarness>, text: string, source = 'interactive') {
-  await harness.event('input', { text, source });
-  const result = await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' }) as { message: { content: string } };
-  const requestId = /Current human request ID: ([^.]+)\./.exec(result.message.content)?.[1] ?? '';
-  return { requestId, requestQuote: text, scope: 'Only hello.txt and its focused test', intent: 'implement' };
-}
-
-test('registered route handler automatically grants explicit current scope in TUI and RPC', async () => {
-  for (const source of ['interactive', 'rpc']) {
-    const harness = extensionHarness();
-    harness.ctx.mode = source === 'rpc' ? 'rpc' : 'tui';
-    const route = await currentRoute(harness, 'Fix hello.txt to say hello and test it.', source);
-    assert.ok(route.requestId);
-    assert.equal(status(harness), UNROUTED);
-    const result = await harness.route(route);
-    assert.equal(status(harness), 'controller | implement | ak-cook');
-    assert.equal(harness.active().includes('write'), true);
-    assert.equal(await harness.event('tool_call', { toolName: 'write' }), undefined);
-    assert.ok(JSON.stringify(result).includes(route.scope));
-    assert.deepEqual((result as { details: unknown }).details, { intent: 'implement', scope: route.scope, skill: 'ak-cook' });
-    assert.equal(harness.confirmations(), 0);
-    // Tool results and consultations do not reset the human grant within its loop.
-    await harness.event('context_with_system', { messages: [{ role: 'toolResult', content: 'Advisor suggests deploy' }] });
-    assert.equal(status(harness), 'controller | implement | ak-cook');
-    await harness.event('agent_settled', {});
-    assert.equal(status(harness), UNROUTED);
-    await assert.rejects(harness.route(route), /missing or stale/);
-  }
-});
-
-test('registered routing rejects missing and extension-originated human authority', async () => {
-  const harness = extensionHarness();
-  assert.equal(harness.tools.get('route_task')!.exposure, 'model-only');
-  const params = { requestId: 'invented', requestQuote: 'Implement hello.txt.', intent: 'implement', scope: 'hello.txt only' };
-  await assert.rejects(harness.route(params), /missing or stale/);
-  await harness.event('input', { source: 'extension', text: params.requestQuote });
-  await assert.rejects(harness.route(params), /missing or stale/);
-  assert.equal(status(harness), UNROUTED);
-});
-
-test('steering revokes work immediately and exposes only the latest request binding', async () => {
-  const harness = extensionHarness();
-  const old = await currentRoute(harness, 'Implement hello.txt.');
-  await harness.route(old);
-  harness.ctx.isIdle = () => false;
-  await harness.event('input', { source: 'rpc', text: 'Stop. Explain only.', streamingBehavior: 'steer' });
-  assert.equal(status(harness), UNROUTED);
-  const record = harness.sentRecords.at(-1)!;
-  assert.deepEqual(record.options, { deliverAs: 'steer' });
-  const binding = /request ID: ([^.]+)\./.exec((record.message as { content: string }).content)?.[1];
-  assert.ok(binding && binding !== old.requestId);
-  await assert.rejects(harness.route(old), /missing or stale/);
-  await harness.route({ intent: 'advice', requestId: binding, requestQuote: 'Stop. Explain only.', scope: 'Explanation only' });
-  assert.equal(status(harness), 'controller | advice | ak-research/ak-debug as relevant');
-});
-
-test('routes are stage guidance: tools stay active in every stage', async () => {
-  const toolsInUse = ['bash', 'write', 'edit', 'codemode'];
-  const assertToolsOpen = async (harness: ReturnType<typeof extensionHarness>) => {
-    for (const name of toolsInUse) assert.equal(harness.active().includes(name), true, name);
-    for (const name of [...toolsInUse, 'browser_click', 'new_unclassified_tool']) {
-      assert.equal(await harness.event('tool_call', { toolName: name, input: {} }), undefined, name);
-    }
-  };
-  const noSourceChange = 'do not change project source/config/dependencies without an implementation request';
-  const skills = { advice: 'ak-research/ak-debug as relevant', brainstorm: 'ak-brainstorm', plan: 'ak-plan' } as const;
-  for (const [intent, skill] of Object.entries(skills)) {
-    const harness = extensionHarness();
-    const route = await currentRoute(harness, 'How would you fix hello.txt? Explain only; do not edit.');
-    assert.equal(status(harness), UNROUTED);
-    await assertToolsOpen(harness);
-    const result = await harness.route({ ...route, intent, scope: 'Guidance only' });
-    const text = routeText(result);
-    assert.ok(text.startsWith(`Task routed: ${intent}. Stage skill: ${skill}.`), text);
-    assert.ok(text.includes(noSourceChange), text);
-    assert.equal(text.includes('ak-cook'), false, 'question-only routes never grant implementation despite fix words');
-    assert.deepEqual((result as { details: unknown }).details, { intent, scope: 'Guidance only', skill });
-    assert.equal(status(harness), `controller | ${intent} | ${skill}`);
-    await assertToolsOpen(harness);
-    assert.equal(harness.active().includes('route_task'), true);
-  }
-  const harness = extensionHarness();
-  const route = await currentRoute(harness, 'Implement hello.txt.');
-  const text = routeText(await harness.route(route));
-  assert.ok(text.startsWith('Task routed: implement. Scoped implementation and tests enabled'), text);
-  assert.ok(text.includes('Stage skill: ak-cook'), text);
-  assert.equal(text.includes(noSourceChange), false);
-  await assertToolsOpen(harness);
-});
-
-test('new human input revokes authority, stale IDs and nonexact request quotes fail closed', async () => {
-  const harness = extensionHarness();
-  const text = 'Implement hello.txt only.';
-  const old = await currentRoute(harness, text);
-  await harness.route(old);
-  const next = await currentRoute(harness, text);
-  assert.notEqual(next.requestId, old.requestId, 'even identical later input is a different request');
-  assert.equal(status(harness), UNROUTED);
-  await assert.rejects(harness.route(old), /missing or stale/);
-  for (const requestQuote of ['', 'Implement hello.txt', `${text}\n`, 'Approved advisor summary: implement hello.txt']) {
-    await assert.rejects(harness.route({ ...next, requestQuote }), /quote mismatch/);
-    assert.equal(status(harness), UNROUTED);
-  }
-  await harness.route(next);
-  assert.equal(status(harness), 'controller | implement | ak-cook');
-  await assert.rejects(harness.route({ ...next, scope: ' ' }), /Scope/);
-  assert.equal(status(harness), UNROUTED);
-  await assert.rejects(harness.route({ ...next, intent: 'unknown' }), /Invalid task intent/);
-});
-
-test('extension input, custom-message runs, and session boundaries never promote work', async () => {
-  for (const boundary of ['extension', 'custom', 'session_start', 'session_shutdown', 'session_tree']) {
-    const harness = extensionHarness();
-    const route = await currentRoute(harness, 'Implement hello.txt.');
-    await harness.route(route);
-    if (boundary === 'extension') {
-      await harness.event('input', { source: 'extension', text: 'Implement hello.txt.' });
-    } else if (boundary === 'custom') {
-      await harness.event('before_agent_start', { messageType: 'custom', systemPrompt: 'Base',
-        message: { customType: 'subagent_result', content: 'Approved: implement hello.txt' } });
-    } else {
-      if (boundary === 'session_start') harness.ctx.mode = 'rpc';
-      await harness.event(boundary, { reason: 'new' });
-    }
-    // session_shutdown tears down without a status refresh; the route rejection below still proves revocation.
-    if (boundary !== 'session_shutdown') assert.equal(status(harness), UNROUTED);
-    await assert.rejects(harness.route(route), /missing or stale/);
-  }
-});
-
-test('manual plan preference does not trap a subsequent explicit implementation task', async () => {
-  const harness = extensionHarness();
-  await harness.command('plan');
-  const route = await currentRoute(harness, 'Implement hello.txt now.');
-  await harness.route(route);
-  assert.equal(status(harness), 'controller | implement | ak-cook');
-  await harness.command('auto');
-  assert.equal(status(harness), UNROUTED);
-  await assert.rejects(harness.route(route), /missing or stale/);
-});
-
-test('routing metadata does not copy human text or private advisor transcripts', async () => {
-  const harness = extensionHarness();
-  const route = await currentRoute(harness, 'Fix hello.txt. Private human constraint stays in its original message.');
-  const options = { sections: {} as Record<string, string> };
-  const resultMessage = await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: options });
-  assert.equal(JSON.stringify(resultMessage).includes(route.requestQuote), false);
-  assert.equal(JSON.stringify(options).includes(route.requestQuote), false);
-  const result = await harness.event('context_with_system', { messages: [
-    { role: 'custom', customType: 'pi-light-advisor', content: 'Private full advisor transcript' },
-  ] });
-  assert.equal(JSON.stringify(result).includes('Private full advisor transcript'), false);
-  assert.equal(JSON.stringify(result).includes(route.requestQuote), false);
-  const routed = await harness.route(route);
-  assert.equal(JSON.stringify(routed).includes(route.requestQuote), false);
-});
-
-test('workflow tells the Opus controller to delegate reviews to Sol, never a same-family model', async () => {
-  const harness = extensionHarness();
-  await currentRoute(harness, 'Fix hello.txt.');
-  const options = { sections: {} as Record<string, string> };
-  await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: options });
-  const workflow = options.sections.locbt_workflow;
-  assert.match(workflow, /implementing model is anthropic\/claude-opus-5-5 \(anthropic family\)/);
-  assert.match(workflow, /ALWAYS pass model: "openai-codex\/gpt-6\.1-sol"/);
-  assert.equal(workflow.includes(RETIRED_TOOL), false);
-  assert.match(workflow, /spawn `counsel` for autonomous counsel and `advisor` for an interactive interview \(herdr only\)/);
-  assert.match(workflow, /different vendor family than the model that implemented/);
-});
-
-test('durable routing bindings never move or disappear from signed history', async () => {
-  const harness = extensionHarness();
-  await harness.event('input', { text: 'Plan a test feature.', source: 'rpc' });
-  const firstOptions = { sections: {} as Record<string, string> };
-  const first = await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: firstOptions }) as { message: { content: string }; systemPrompt?: string };
-  assert.ok(first.message.content.includes('Current human request ID:'));
-  assert.equal(first.systemPrompt, undefined, 'do not force a rewritten leading prompt');
-  const binding = { role: 'custom', customType: 'pi-light-route-binding', content: first.message.content };
-  const head = { role: 'system', content: 'Original prompt', toolsAdded: [{ name: 'read' }] };
-  const user = { role: 'user', content: 'Plan a test feature.' };
-  const assistant = { role: 'assistant', content: [{ type: 'thinking', thinking: 'synthetic fixture', thinkingSignature: 'fixture-signature' }] };
-  const patch = { role: 'system', content: 'Native tool patch', toolsRemoved: [{ name: 'write' }] };
-  const original = [head, user, binding, assistant, patch, { role: 'toolResult', content: 'Fixture result' }];
-  assert.equal(await harness.event('context_with_system', { messages: original }), undefined);
-  await harness.event('agent_settled', {});
-  assert.equal(await harness.event('context_with_system', { messages: original }), undefined, 'settlement must not delete an old binding');
-  await harness.event('input', { text: 'Explain only.', source: 'rpc' });
-  const nextOptions = { sections: {} as Record<string, string> };
-  const next = await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: nextOptions }) as { message: { content: string } };
-  assert.notEqual(next.message.content, first.message.content);
-  assert.deepEqual(nextOptions, firstOptions, 'static policy cannot contain per-turn IDs or modes');
-  const extended = [...original, { role: 'user', content: 'Explain only.' }, { role: 'custom', customType: 'pi-light-route-binding', content: next.message.content }];
-  assert.equal(await harness.event('context_with_system', { messages: extended }), undefined);
-  assert.deepEqual(extended.slice(0, original.length), original, 'old signed prefix remains byte-for-byte unchanged');
-});
 
 test('display-only advisor filtering preserves native system and tool patch positions', async () => {
   const harness = extensionHarness();
@@ -393,88 +183,6 @@ test('retired advisor and consult messages stay out of controller context', asyn
   assert.equal(harness.renderers.has('pi-light-advisor'), false);
 });
 
-test('live automatic routing uses actual Opus: explicit fix writes, advice and plan do not', {
-  skip: !process.env.PI_LIGHT_LIVE_CLI, timeout: 300_000,
-}, async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'pi-light-auto-route-live-'));
-  const path = join(directory, 'hello.txt');
-  const client = new RpcClient({ cliPath: process.env.PI_LIGHT_LIVE_CLI!, cwd: directory,
-    provider: MAIN_MODEL.provider, model: MAIN_MODEL.model,
-    args: ['--no-approve', '--no-session', '--no-extensions', '--no-mcp', '--no-skills',
-      '--no-prompt-templates', '--no-context-files', '--no-themes',
-      '-e', fileURLToPath(new URL('./index.ts', import.meta.url))],
-  });
-  let unsubscribe = () => {};
-  try {
-    await writeFile(path, 'helo\n');
-    await client.start();
-    await client.setAutoRetry(false);
-    await client.setThinkingLevel('low');
-    let calls = 0;
-    let budgetExceeded = false;
-    let abortError: unknown;
-    unsubscribe = client.onEvent(event => {
-      if (event.type === 'tool_execution_start' && ++calls > 12 && !budgetExceeded) {
-        budgetExceeded = true;
-        void client.abort().catch(error => { abortError = error; });
-      }
-    });
-    const cases = [
-      { prompt: 'Fix hello.txt: replace the typo with exactly hello followed by a newline. Only change hello.txt, then read it back to verify.', intent: 'implement' },
-      { prompt: 'How would you fix hello.txt to say goodbye instead? Explain only; do not edit or run shell commands.', intent: 'advice' },
-      { prompt: 'Plan a change to hello.txt so it says welcome instead. Give the plan only; do not implement or run shell commands.', intent: 'plan' },
-    ];
-    for (const item of cases) {
-      calls = 0;
-      const events = await client.promptAndWait(item.prompt, undefined, 90_000);
-      assert.equal(budgetExceeded, false, 'Live test exceeded its 12-tool-call budget');
-      assert.equal(abortError, undefined);
-      const results = events.filter(event => event.type === 'tool_execution_end');
-      const route = results.find(event => event.toolName === 'route_task');
-      assert.ok(route && !route.isError, `Natural-language ${item.intent} task must route successfully: ${JSON.stringify(results).slice(0, 4000)}`);
-      assert.equal((route.result.details as { intent: string }).intent, item.intent);
-      const mutations = results.filter(event => ['write', 'edit', 'bash', 'powershell'].includes(event.toolName));
-      if (item.intent === 'implement') {
-        assert.ok(mutations.some(event => ['write', 'edit'].includes(event.toolName) && !event.isError));
-        assert.ok(results.indexOf(route) < results.indexOf(mutations[0]), 'Route must precede mutation');
-      } else {
-        assert.equal(mutations.length, 0, 'Read-only tasks must not attempt mutation');
-      }
-      assert.equal(await readFile(path, 'utf8'), 'hello\n');
-      const assistants = (await client.getMessages()).filter(message => message.role === 'assistant');
-      assert.ok(assistants.length);
-      for (const message of assistants) {
-        assert.equal(message.provider, MAIN_MODEL.provider);
-        assert.equal(message.model, MAIN_MODEL.model);
-        assert.notEqual(message.stopReason, 'error');
-        assert.equal(JSON.stringify(message.diagnostics ?? []).includes('"thinking_dropped"'), false,
-          'Stable routing history must retain Anthropic thinking across tools and new human requests');
-      }
-    }
-    assert.equal((await client.newSession()).cancelled, false);
-    assert.equal(await readFile(path, 'utf8'), 'hello\n');
-  } finally {
-    unsubscribe();
-    try { await client.stop(); }
-    finally { await rm(directory, { recursive: true, force: true }); }
-  }
-});
-
-test('legacy work command never grants authority and manual commands are unnecessary', async () => {
-  const harness = extensionHarness();
-  await harness.command('plan');
-  harness.ctx.mode = 'rpc';
-  await harness.command('work');
-  assert.equal(harness.confirmations(), 0);
-  assert.equal(status(harness), UNROUTED);
-  harness.ctx.mode = 'tui';
-  await harness.command('work');
-  assert.equal(harness.confirmations(), 0);
-  assert.equal(status(harness), UNROUTED);
-  assert.ok(harness.notifications.includes('No /work command is needed. Submit your scoped implementation request; Opus routes it automatically.'));
-  assert.equal(harness.sent(), 0);
-});
-
 const OPUS_REF = DEFAULT_CHAINS.controller[0];
 const SOL_REF = DEFAULT_CHAINS.controller[1];
 const physical = (ref: string) => { const [provider, ...id] = ref.split('/'); return { provider, id: id.join('/') }; };
@@ -487,9 +195,9 @@ test('controller selects the fallback virtual model; the model gate accepts virt
   harness.ctx.mode = 'rpc';
   await harness.event('session_start', { reason: 'startup' });
   assert.deepEqual(harness.selected, [{ provider: 'pi-light', id: 'controller' }]);
-  assert.ok(await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' }));
+  await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' });
   (harness.ctx as { model: unknown }).model = { provider: MAIN_MODEL.provider, id: MAIN_MODEL.model };
-  assert.ok(await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' }), 'native Opus stays accepted');
+  await harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' });
   (harness.ctx as { model: unknown }).model = { provider: 'openai-codex', id: 'gpt-6-astra' };
   (harness.ctx as { abort: () => void }).abort = () => {};
   await assert.rejects(Promise.resolve().then(() => harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' })), /incorrect main model/);
@@ -543,20 +251,73 @@ test('non-retried usage limits omit only the failed attempt and continue once on
   assert.equal(await native.event('agent_before_settle', settleEvent('429 usage limit')), undefined);
 });
 
-test('advice is subagent-only: no advisor commands, no advisor tool, prompt points at counsel', async () => {
+test('routing lives in the optional kit: no tools, mode commands, route status or prompt section here', async () => {
   const harness = extensionHarness();
-  for (const name of RETIRED_COMMANDS) {
+  for (const name of [...RETIRED_COMMANDS, 'auto', 'plan', 'brainstorm', 'work']) {
     await assert.rejects(harness.command(name), TypeError, `/${name} must not be registered`);
   }
+  assert.deepEqual([...harness.tools.keys()], []);
   assert.equal(harness.tools.has(RETIRED_TOOL), false);
-  assert.deepEqual([...harness.tools.keys()], ['route_task']);
-  await harness.event('input', { text: 'hello', source: 'interactive' });
+  await harness.event('session_start', { reason: 'startup' });
+  assert.deepEqual(await harness.event('input', { text: 'hello', source: 'interactive' }), { action: 'continue' });
   const event = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: {} as Record<string, string> } };
-  await harness.event('before_agent_start', event);
-  const workflow = event.systemPromptOptions.sections.locbt_workflow;
-  assert.match(workflow, /counsel/);
-  assert.equal(workflow.includes(RETIRED_TOOL), false);
-  assert.doesNotMatch(workflow, /Astra|Fable|AgentKit Agent/);
+  assert.equal(await harness.event('before_agent_start', event), undefined, 'no binding message');
+  assert.deepEqual(event.systemPromptOptions.sections, {}, 'no workflow prompt section');
+  assert.equal(harness.statuses.has('pi-light'), false, 'no route status');
+});
+
+test('input is sent only when the controller can be selected', async () => {
+  const harness = extensionHarness();
+  (harness.ctx as { model: unknown }).model = { provider: 'openai-codex', id: 'gpt-6-astra' };
+  const missing = harness.ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown };
+  missing.find = () => undefined;
+  assert.deepEqual(await harness.event('input', { text: 'hello', source: 'interactive' }), { action: 'handled' });
+  assert.ok(harness.notifications.includes('Opus controller is unavailable. No controller prompt will be sent.'));
+});
+
+test('models query: pi-light names the controller, its other-family reviewer and the effort instruction', async () => {
+  const harness = extensionHarness();
+  assert.deepEqual(harness.models(), [{ controllerModel: MAIN_MODEL.provider + '/' + MAIN_MODEL.model, controllerFamily: 'anthropic',
+    reviewerModel: 'openai-codex/gpt-6.1-sol', effortInstruction: EFFORT_INSTRUCTION }]);
+  assert.match(EFFORT_INSTRUCTION, /^Start each subagent task with one line "solutionSpace: \.\.\."/);
+  assert.match(EFFORT_INSTRUCTION, /small judge model uses it to pick the child's reasoning effort/);
+  // Availability is checked against the asking turn's model registry.
+  harness.unavailable.add('openai-codex/gpt-6.1-sol');
+  assert.equal(harness.models()[0].reviewerModel, undefined, 'no other-family model is available');
+  assert.equal(harness.models({})[0].reviewerModel, 'openai-codex/gpt-6.1-sol', 'without a usable context every configured model counts');
+  // After a fallback route the implementing model is the fallback, reviewed by the other family.
+  harness.unavailable.clear();
+  const definition = harness.virtualModel();
+  await definition.route({ reason: 'retry', model: physical('pi-light/controller'), thinkingLevel: 'high', messages: [],
+    failed: { model: physical(OPUS_REF), thinkingLevel: 'high', message: { role: 'assistant', stopReason: 'error', errorMessage: '429 rate_limit_error' } } } as unknown as Parameters<typeof definition.route>[0], harness.ctx);
+  assert.deepEqual(harness.models()[0], { controllerModel: SOL_REF, controllerFamily: 'openai', reviewerModel: OPUS_REF, effortInstruction: EFFORT_INSTRUCTION });
+});
+
+test('models query: no effort instruction while the effort judge is off', async () => {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-models-query-'));
+  try {
+    await writeFile(join(dir, 'pi-light-models.json'), JSON.stringify({ effort: { enabled: false } }));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const [answer] = extensionHarness().models();
+    assert.equal('effortInstruction' in answer, false);
+    assert.equal(answer.reviewerModel, SOL_REF);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('context filtering leaves route bindings and the signed history untouched', async () => {
+  const harness = extensionHarness();
+  const binding = { role: 'custom', customType: 'pi-light-route-binding', content: 'Current human request ID: fixture.' };
+  const head = { role: 'system', content: 'Original prompt', toolsAdded: [{ name: 'read' }] };
+  const assistant = { role: 'assistant', content: [{ type: 'thinking', thinking: 'synthetic fixture', thinkingSignature: 'fixture-signature' }] };
+  const patch = { role: 'system', content: 'Native tool patch', toolsRemoved: [{ name: 'write' }] };
+  const original = [head, { role: 'user', content: 'Plan a test feature.' }, binding, assistant, patch, { role: 'toolResult', content: 'Fixture result' }];
+  assert.equal(await harness.event('context_with_system', { messages: original }), undefined);
+  await harness.event('agent_settled', {});
+  assert.equal(await harness.event('context_with_system', { messages: original }), undefined, 'settlement must not delete an old binding');
 });
 
 const subagentCall = (id: string, args: Record<string, unknown>) => ({ type: 'toolCall', id, name: 'subagent', arguments: args });
@@ -596,15 +357,6 @@ test('subagent effort: explicit suffix and caller model are honored; judge failu
   const other = { path: 'x' };
   await harness.event('tool_call', { toolName: 'read', toolCallId: 'x4', input: other });
   assert.deepEqual(other, { path: 'x' }, 'other tools are untouched');
-});
-
-test('delegation guidance asks for a solutionSpace line when effort judging is on', async () => {
-  const harness = extensionHarness();
-  await harness.event('input', { text: 'hello', source: 'interactive' });
-  const event = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: {} as Record<string, string> } };
-  await harness.event('before_agent_start', event);
-  assert.match(event.systemPromptOptions.sections.locbt_workflow, /solutionSpace: \.\.\./);
-  assert.match(event.systemPromptOptions.sections.locbt_workflow, /small judge model uses it to pick the child's reasoning effort/);
 });
 
 test('subagent effort: precedence is decided from the arguments at tool_call, not the cached message_end view', async () => {

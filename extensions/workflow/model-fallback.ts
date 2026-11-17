@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
-import { MAIN_MODEL } from './controller-policy.ts';
+
+/** The preferred controller: native Anthropic Opus. */
+export const MAIN_MODEL = { provider: 'anthropic', model: 'claude-opus-5-5' } as const;
 
 /** Fallback chains are ordered 'provider/model' references; the first entry is preferred. */
 export type FallbackRole = 'controller';

@@ -2,7 +2,7 @@
   "name": "pi-light",
   "version": "0.6.1",
   "private": true,
-  "description": "Opus-controlled Pi workflow with stage routing, model fallback, herdr subagents (headless fallback), browser bridge and setup.",
+  "description": "Opus-controlled Pi workflow with controller model fallback, Claude account rotation, subagent effort judging, herdr subagents (headless fallback), browser bridge and setup.",
   "keywords": [
     "pi-package"
   ],
@@ -16,16 +16,11 @@
     "extensions": [
       "./extensions/*/index.ts"
     ],
-    "skills": [
-      "./skills/locbt-router"
-    ],
     "changelogPath": ""
   },
   "scripts": {
     "test": "tsx --test lib/project-trust.test.ts extensions/workflow/claude-accounts.test.ts extensions/workflow/claude-account-routing.test.ts extensions/workflow/effort-judge.test.ts extensions/workflow/subagent-effort.test.ts extensions/workflow/model-fallback.test.ts extensions/workflow/controller.test.ts extensions/browser-bridge/browser.test.ts extensions/herdr-layout/herdr-layout.test.ts extensions/herdr-permission-bridge/permission-bridge.test.ts extensions/setup/setup.test.ts extensions/subagents/test/agents.test.ts extensions/subagents/test/child-env.test.ts extensions/subagents/test/discovery.test.ts extensions/subagents/test/headless.test.ts extensions/subagents/test/heartbeat.test.ts extensions/subagents/test/herdr-client.test.ts extensions/subagents/test/herdr-events.test.ts extensions/subagents/test/index-tools.test.ts extensions/subagents/test/index.test.ts extensions/subagents/test/launch-boundaries.test.ts extensions/subagents/test/launch-security.test.ts extensions/subagents/test/launch.test.ts extensions/subagents/test/messages.test.ts extensions/subagents/test/plugin.test.ts extensions/subagents/test/process-containment.test.ts extensions/subagents/test/process-ownership.test.ts extensions/subagents/test/session.test.ts extensions/subagents/test/smoke.test.ts extensions/subagents/test/subagent-done.test.ts extensions/subagents/test/watcher.test.ts",
     "typecheck": "tsc --noEmit",
-    "test:live": "PI_LIGHT_LIVE_CLI=\"$PWD/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\" tsx --test extensions/workflow/controller.test.ts",
-    "smoke": "pnpm run test:live",
     "setup": "node extensions/setup/setup.mjs",
     "claude-accounts": "tsx extensions/workflow/claude-accounts-cli.ts"
   },

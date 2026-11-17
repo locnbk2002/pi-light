@@ -1,23 +1,23 @@
 # pi-light
 
-A personal workflow package for the [Pi](https://github.com/earendil-works/pi) coding agent: Opus-controlled Pi workflow with stage routing, model fallback, herdr subagents (headless fallback), browser bridge and setup. Stage skills come from the optional private `pi-light-kit` package.
+A personal workflow package for the [Pi](https://github.com/earendil-works/pi) coding agent: Opus-controlled Pi workflow with controller model fallback, herdr subagents (headless fallback), browser bridge and setup. Stage routing and the stage skills come from the optional private `pi-light-kit` package; without it pi-light runs with no routing policy.
 
 The package root is the workflow core. Each feature is its own extension under `extensions/`, and every one loads by default:
 
 | Extension | Provides |
 |---|---|
-| `extensions/workflow` | Stage routing, model fallback, cross-family review, the `locbt-router` skill policy |
+| `extensions/workflow` | Controller model fallback, Claude account rotation, the subagent effort judge, and the model facts (reviewer model, effort instruction) the kit's routing reads over `pi.events` (`pi-light:models:query`) |
 | `extensions/subagents` | The `subagent` tools: herdr panes inside herdr, background `pi -p` processes outside it |
 | `extensions/browser-bridge` | The `browser` tool, the shared local browser relay, `/browser-connect`, `/browser-status` and the Chromium add-on |
 | `extensions/herdr-layout` | herdr subagent pane layout |
 | `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
 | `extensions/setup` | `/pi-light setup` |
 
-- **Stage routing.** Opus is the controller. Each request is routed as advice, brainstorm, plan or implement and mapped to a stage skill (from `pi-light-kit`). The agent only edits files when you ask for an implementation.
+- **Stage routing (in `pi-light-kit`).** Opus is the controller. With the kit installed, each request is routed as advice, brainstorm, plan or implement and mapped to a stage skill; the agent only edits files when you ask for an implementation. The `route_task` tool, the request binding, the `locbt_workflow` prompt section and the `locbt-router` skill moved from pi-light to the kit.
 - **Advisors.** Advice comes from subagents: spawn `counsel` for autonomous counsel and `advisor` for an interactive interview (herdr only). A cross-family review is a `subagent` call on the other-family model. Both agent definitions ship in `agents/` (`counsel.md`, `advisor.md`) and use `claude-fable-5-2`.
 - **Effort judge.** A small model picks the reasoning effort (low to xhigh) for each subagent spawn, judging how open-ended the task is. The controller's own effort stays with `/effort`. See Effort judge below.
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol.
-- **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). The controller passes that model explicitly when it delegates a review subagent.
+- **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). pi-light names that model to the kit's routing policy, which tells the controller to pass it explicitly when it delegates a review subagent.
 - **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets every running Pi session open and drive its own tabs in your signed-in browser at the same time, and use a tab you bind with the toolbar button. You pair each browser profile once; there is no per-session token. Opening a tab always asks you first. On the tab you bound, clicks, typing, key presses, navigation, scripts and console reads ask each time; on tabs Pi opened, later actions run without asking (see Browser tool below).
 - **herdr subagent layout.** Up to 3 subagents stack beside your pane. When a 4th starts, all of them move to their own tabs. `PI_HERDR_MAX_SPLIT` changes the limit, and `PI_HERDR_LAYOUT=tab|split` changes the mode.
 
