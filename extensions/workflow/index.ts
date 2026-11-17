@@ -276,7 +276,8 @@ export default function piLight(pi: ExtensionAPI): void {
   // other-family reviewer.
   answerModelsQueries(pi.events, ctx => {
     const implementer = controllerModel ?? models.chains.controller[0];
-    const reviewer = reviewerModel(models.chains, implementer, model => ctx ? available(ctx, model) : true);
+    // Reviewer candidates are this session's controller list, so a picked model can review a fallback's work.
+    const reviewer = reviewerModel({ ...models.chains, controller: controllerChain() }, implementer, model => ctx ? available(ctx, model) : true);
     return { controllerModel: implementer, controllerFamily: modelFamily(implementer), ...(reviewer ? { reviewerModel: reviewer } : {}) };
   });
   answerInputPreflightQueries(pi.events);
@@ -323,7 +324,7 @@ export default function piLight(pi: ExtensionAPI): void {
         return;
       }
       if (args.trim() && args.trim() !== 'reload') { ctx.ui.notify('Usage: /claude-accounts [reload]', 'warning'); return; }
-      const notice = args.trim() === 'reload' ? installAccounts(pi, accounts, models.chains.controller, ctx) : undefined;
+      const notice = args.trim() === 'reload' ? installAccounts(pi, accounts, controllerChain(), ctx) : undefined;
       ctx.ui.notify([...accounts.describe(), ...(notice ? [notice] : [])].join('\n'), notice ? 'warning' : 'info');
     },
   });
@@ -440,7 +441,7 @@ export default function piLight(pi: ExtensionAPI): void {
       accountsNotice = undefined;
     }
     if (accounts) {
-      const notice = installAccounts(pi, accounts, models.chains.controller, ctx);
+      const notice = installAccounts(pi, accounts, controllerChain(), ctx);
       if (notice) ctx.ui.notify(notice, 'warning');
     }
     try { await ensureController(ctx); }

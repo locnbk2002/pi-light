@@ -543,3 +543,43 @@ test('a pick is not saved: a new session starts on the configured order, and sel
   await assert.rejects(Promise.resolve().then(() => harness.event('before_agent_start', { messageType: 'user', systemPrompt: 'Base' })), /incorrect main model/,
     'without a pick a native non-preferred model is still refused');
 });
+
+test('reset after a prompt: picking the first configured model restores the order; re-selecting the virtual model is not reported by Pi', async () => {
+  const harness = extensionHarness();
+  await harness.event('model_select', { model: physical(SOL_REF), previousModel: physical('pi-light/controller'), source: 'set' });
+  (harness.ctx as { model: unknown }).model = physical(SOL_REF);
+  await harness.event('input', { text: 'go', source: 'interactive' });
+  // The session is back on the virtual controller; selecting it again changes nothing, so Pi emits no event.
+  assert.deepEqual(harness.ctx.model, physical('pi-light/controller'));
+  assert.deepEqual((await userRoute(harness)).model, physical(SOL_REF));
+  await harness.pi.setModel(physical('pi-light/controller') as never);
+  assert.deepEqual((await userRoute(harness)).model, physical(SOL_REF), 'documented: the virtual controller does not clear a pick after a prompt');
+  // Picking the first configured model is a real change, so it clears the pick; the next prompt returns to the virtual model.
+  (harness.ctx as { model: unknown }).model = physical(OPUS_REF);
+  await harness.event('model_select', { model: physical(OPUS_REF), previousModel: physical('pi-light/controller'), source: 'set' });
+  assert.equal(harness.statuses.get('pi-light-model'), undefined);
+  await harness.event('input', { text: 'again', source: 'interactive' });
+  assert.deepEqual(harness.ctx.model, physical('pi-light/controller'));
+  assert.deepEqual((await userRoute(harness)).model, physical(OPUS_REF));
+});
+
+test('reviewer: a picked model outside a single-family configured list reviews the fallback\'s work', async () => {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-reviewer-'));
+  try {
+    await writeFile(join(dir, 'pi-light-models.json'), JSON.stringify({ controller: [OPUS_REF], effort: { enabled: false } }));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const harness = extensionHarness();
+    assert.deepEqual(harness.models()[0], { controllerModel: OPUS_REF, controllerFamily: 'anthropic' }, 'no other family configured');
+    await harness.event('model_select', { model: physical(SOL_REF), previousModel: physical('pi-light/controller'), source: 'set' });
+    assert.deepEqual(harness.models()[0], { controllerModel: SOL_REF, controllerFamily: 'openai', reviewerModel: OPUS_REF });
+    const definition = harness.virtualModel();
+    const retry = await definition.route({ reason: 'retry', model: physical('pi-light/controller'), thinkingLevel: 'high', messages: [],
+      failed: { model: physical(SOL_REF), thinkingLevel: 'high', message: { role: 'assistant', stopReason: 'error', errorMessage: '429 rate_limit_error' } } } as unknown as Parameters<typeof definition.route>[0], harness.ctx);
+    assert.deepEqual(retry.model, physical(OPUS_REF));
+    assert.deepEqual(harness.models()[0], { controllerModel: OPUS_REF, controllerFamily: 'anthropic', reviewerModel: SOL_REF });
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

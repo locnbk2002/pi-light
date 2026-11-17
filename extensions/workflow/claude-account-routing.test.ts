@@ -214,12 +214,13 @@ async function accountHarness(options: { chain?: string[]; child?: boolean } = {
   const events = new Map<string, ((event: unknown, ctx: ExtensionContext) => unknown)[]>();
   const providers = new Map<string, Parameters<ExtensionAPI['registerProvider']>[1]>();
   const notifications: string[] = [];
+  const commands = new Map<string, Parameters<ExtensionAPI['registerCommand']>[1]>();
   let virtual: Parameters<ExtensionAPI['registerVirtualModel']>[0] | undefined;
   const { registry, streams } = fakeRegistry();
   const pi = {
     events: createEventBus(),
     on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(name, [...events.get(name) ?? [], handler]); return () => {}; },
-    registerCommand() {}, registerTool() {}, registerFlag() {}, registerEntryRenderer() {}, registerMessageRenderer() {},
+    registerCommand(name: string, command: Parameters<ExtensionAPI['registerCommand']>[1]) { commands.set(name, command); }, registerTool() {}, registerFlag() {}, registerEntryRenderer() {}, registerMessageRenderer() {},
     getAllTools: () => [], setActiveTools() {}, sendMessage() {}, appendEntry() {}, setThinkingLevel() {},
     registerVirtualModel(definition: typeof virtual) { virtual = definition; },
     registerProvider(name: string, config: Parameters<ExtensionAPI['registerProvider']>[1]) { providers.set(name, config); },
@@ -257,7 +258,8 @@ async function accountHarness(options: { chain?: string[]; child?: boolean } = {
   });
   const failedRetry = (errorMessage: string, content: unknown[] = []) => ({ reason: 'retry', failed: { model: { provider: BRIDGE_PROVIDER, id: OPUS }, thinkingLevel: 'medium',
     message: { role: 'assistant', stopReason: 'error', errorMessage, content } } });
-  return { route, stream, settle, failedRetry, streams, notifications, dir, providers };
+  const command = (name: string, args = '') => commands.get(name)!.handler(args, ctx as never);
+  return { route, stream, settle, failedRetry, streams, notifications, dir, providers, emit, command };
 }
 
 test('controller: the route serves Claude through the account wrapper and keeps the account for continuations', async () => {
@@ -654,4 +656,17 @@ test('state store: a window with a non-numeric reset or negative use is corrupt 
     store.addUsage('personal', reserveSample(NOW + 2, 0.2));
     assert.equal(store.read().accounts.personal.unreadable, undefined, 'a valid newer report recovers it');
   }
+});
+
+test('controller: a picked Claude model outside the configured list keeps its account wrapper across /claude-accounts reload', async () => {
+  const harness = await accountHarness({ chain: [`anthropic/${OPUS}`, SOL] });
+  const fable = 'claude-fable-5-2';
+  // registerProvider replaces the provider (and its model list) as Pi does; the harness keeps only the latest config.
+  const wrapperIds = () => (harness.providers.get(ACCOUNT_PROVIDER)!.models ?? []).map(model => model.id);
+  assert.deepEqual(wrapperIds(), [OPUS]);
+  await harness.emit('model_select', { model: { provider: BRIDGE_PROVIDER, id: fable }, previousModel: { provider: 'pi-light', id: 'controller' }, source: 'set' });
+  assert.deepEqual(wrapperIds().sort(), [fable, OPUS].sort());
+  await harness.command('claude-accounts', 'reload');
+  assert.deepEqual(wrapperIds().sort(), [fable, OPUS].sort(), 'reload installs wrappers for this session\'s list');
+  assert.equal(await harness.route({ reason: 'user' }), `${ACCOUNT_PROVIDER}/${fable}`);
 });
