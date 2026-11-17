@@ -39,11 +39,9 @@ test('child fix-up finds the explicit level only in a double suffix', () => {
   assert.equal(innerExplicitLevel(['@task.md']), undefined);
 });
 
-test('the upstream launch format this relies on is unchanged at the pinned commit', async t => {
-  // pi-herdr-subagents src/launch.ts @ 2489019: `--model ${model}:${thinking}`, only when a model is set.
-  const launch = join(process.env.HOME ?? '', '.pi/agent/git/github.com/modem-dev/pi-herdr-subagents/src/launch.ts');
-  const source = await readFile(launch, 'utf8').catch(() => undefined);
-  if (source === undefined) { t.skip('pi-herdr-subagents is not installed on this machine'); return; }
+test('the subagent launch format this relies on is unchanged', async () => {
+  // extensions/subagents/src/launch.ts: `--model ${model}:${thinking}`, only when a model is set.
+  const source = await readFile(join(import.meta.dirname, '..', 'subagents', 'src', 'launch.ts'), 'utf8');
   assert.match(source, /const effectiveModel = params\.model \?\? agentDefs\?\.model;/);
   assert.match(source, /const effectiveThinking = agentDefs\?\.thinking;/);
   assert.match(source, /if \(effectiveModel\) \{\s*piArgv\.push\("--model", effectiveThinking \? `\$\{effectiveModel\}:\$\{effectiveThinking\}` : effectiveModel\);/);
