@@ -107,13 +107,17 @@ export function needsConfirmation(action: BrowserAction, target?: ControlledTab,
   return isMutation(action) || SENSITIVE_READS.has(action.action);
 }
 export const UNATTENDED_ENV = "PI_LIGHT_BROWSER_UNATTENDED_ORIGINS";
-/** Parses the comma-separated origin allowlist set by an unattended job (e.g. a launchd schedule). */
+/**
+ * Parses the comma-separated origin allowlist set by an unattended job (e.g. a launchd schedule). Entries are
+ * bare HTTP(S) origins (no credentials, path, query or fragment); case, a default port and Unicode host names
+ * are normalized to the origin the browser reports.
+ */
 export function unattendedOrigins(env: NodeJS.ProcessEnv = process.env): Set<string> {
   const raw = env[UNATTENDED_ENV];
   if (!raw) return new Set();
   return new Set(raw.split(",").map(s => s.trim()).filter(Boolean).map(s => {
     const origin = webOrigin(s);
-    if (origin !== s.replace(/\/$/, "")) throw new Error(`${UNATTENDED_ENV} entries must be bare origins`);
+    if (new URL(s).pathname !== "/" || !/^[a-z][a-z0-9+.-]*:\/\/[^/?#]+\/?$/i.test(s)) throw new Error(`${UNATTENDED_ENV} entries must be bare origins`);
     return origin;
   }));
 }

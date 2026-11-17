@@ -14,7 +14,7 @@ const URL_TEXT = 300;
 const MAX_SCREENSHOT_CHARS = 2.5 * 1024 * 1024;
 const MAX_SHOT_WIDTH = 1600;
 const MAX_SHOT_HEIGHT = 8000;
-// tabId -> { console: [], network: [], requests: Map }
+// tabId -> { console: [], network: [], requests: Map, contexts: Map<uniqueId, { frameId, origin, isDefault }> }
 const sessions = new Map();
 
 function cdp(tabId, method, params = {}) {
@@ -33,7 +33,7 @@ async function attachOnce(tabId) {
   await chrome.debugger.detach({ tabId }).catch(() => {});
   try { await chrome.debugger.attach({ tabId }, "1.3"); }
   catch { throw new Error("Cannot debug this tab (another debugger or a protected page)"); }
-  sessions.set(tabId, { console: [], network: [], requests: new Map() });
+  sessions.set(tabId, { console: [], network: [], requests: new Map(), contexts: new Map() });
   for (const method of ["Page.enable", "Runtime.enable", "Log.enable", "Network.enable"]) await cdp(tabId, method);
 }
 function detachDebugger(tabId) {
@@ -65,7 +65,17 @@ function remoteText(arg) {
 function onCdpEvent(source, method, params) {
   const s = sessions.get(source.tabId);
   if (!s || !params) return;
-  if (method === "Runtime.consoleAPICalled") push(s.console, { level: String(params.type).slice(0, 20), text: logText((params.args || []).slice(0, 20).map(remoteText).join(" ").slice(0, LOG_TEXT * 4)) });
+  if (method === "Runtime.executionContextCreated") {
+    const c = params.context;
+    if (c && typeof c.uniqueId === "string") {
+      const entry = { frameId: c.auxData?.frameId, origin: c.origin, isDefault: c.auxData?.isDefault === true };
+      // A frame has one page context at a time: a new one supersedes any whose destruction was not reported yet.
+      if (entry.isDefault) for (const [id, old] of s.contexts) if (old.isDefault && old.frameId === entry.frameId) s.contexts.delete(id);
+      s.contexts.set(c.uniqueId, entry);
+    }
+  } else if (method === "Runtime.executionContextDestroyed") s.contexts.delete(params.executionContextUniqueId);
+  else if (method === "Runtime.executionContextsCleared") s.contexts.clear();
+  else if (method === "Runtime.consoleAPICalled") push(s.console, { level: String(params.type).slice(0, 20), text: logText((params.args || []).slice(0, 20).map(remoteText).join(" ").slice(0, LOG_TEXT * 4)) });
   else if (method === "Runtime.exceptionThrown") push(s.console, { level: "exception", text: logText(params.exceptionDetails?.exception?.description || params.exceptionDetails?.text || "") });
   else if (method === "Log.entryAdded") push(s.console, { level: String(params.entry?.level).slice(0, 20), source: String(params.entry?.source || "").slice(0, 20), text: logText(params.entry?.text || ""), ...(params.entry?.url ? { url: safeUrl(params.entry.url) } : {}) });
   else if (method === "Network.requestWillBeSent") {
@@ -161,19 +171,46 @@ async function inPage(tabId, fn, arg) {
   return r.result.value;
 }
 
+// ---- Document pin: bound-tab actions act only on the document whose origin was checked. ----
+// A pin is the main frame's page (default) execution context. Chromium destroys it when the document is
+// replaced, so a pinned evaluation cannot run in a later document. Native input is tab-level in CDP, so it
+// is checked against the pin right before and right after dispatch and fails closed if the document changed.
+const DOCUMENT_CHANGED = "Bound tab document changed; the action was stopped";
+async function pinDocument(tabId, origin) {
+  const { frameTree } = await cdp(tabId, "Page.getFrameTree");
+  const frameId = frameTree.frame.id;
+  const context = [...sessions.get(tabId).contexts].find(([, c]) => c.frameId === frameId && c.isDefault);
+  if (!context || context[1].origin !== origin) throw new Error(DOCUMENT_CHANGED);
+  const pin = { uniqueId: context[0], origin };
+  await confirmPin(tabId, pin);
+  return pin;
+}
+/** The pinned document still exists and is on its origin (the evaluation runs inside that document). */
+async function confirmPin(tabId, pin) {
+  if (!pin) return;
+  let r;
+  try { r = await cdp(tabId, "Runtime.evaluate", { expression: "location.origin", uniqueContextId: pin.uniqueId, returnByValue: true }); }
+  catch { throw new Error(DOCUMENT_CHANGED); }
+  if (r.exceptionDetails || r.result?.value !== pin.origin) throw new Error(DOCUMENT_CHANGED);
+}
+
 async function mouse(tabId, type, x, y, extra = {}) {
   await cdp(tabId, "Input.dispatchMouseEvent", { type, x, y, button: "none", ...extra });
 }
-async function click(tabId, selector) {
+async function click(tabId, selector, pin) {
   const { x, y } = await inPage(tabId, pageLocate, { selector });
+  await confirmPin(tabId, pin);
   await mouse(tabId, "mouseMoved", x, y);
   await mouse(tabId, "mousePressed", x, y, { button: "left", clickCount: 1 });
   await mouse(tabId, "mouseReleased", x, y, { button: "left", clickCount: 1 });
+  await confirmPin(tabId, pin);
   return { dispatched: true };
 }
-async function hover(tabId, selector) {
+async function hover(tabId, selector, pin) {
   const { x, y } = await inPage(tabId, pageLocate, { selector });
+  await confirmPin(tabId, pin);
   await mouse(tabId, "mouseMoved", x, y);
+  await confirmPin(tabId, pin);
   return { dispatched: true };
 }
 
@@ -191,25 +228,31 @@ function keyDef(key) {
   const code = /[A-Z]/.test(upper) ? `Key${upper}` : /[0-9]/.test(key) ? `Digit${key}` : "";
   return { key, code, vk: /[A-Z0-9]/.test(upper) ? upper.charCodeAt(0) : 0, text: key };
 }
-async function press(tabId, key) {
+async function press(tabId, key, pin) {
   const d = keyDef(key);
+  await confirmPin(tabId, pin);
   const base = { key: d.key, code: d.code, windowsVirtualKeyCode: d.vk, nativeVirtualKeyCode: d.vk };
   await cdp(tabId, "Input.dispatchKeyEvent", { type: d.text ? "keyDown" : "rawKeyDown", ...base, ...(d.text ? { text: d.text, unmodifiedText: d.text } : {}) });
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  await confirmPin(tabId, pin);
   return { dispatched: true };
 }
-async function fill(tabId, selector, text) {
+async function fill(tabId, selector, text, pin) {
   await inPage(tabId, pagePrepareFill, { selector });
+  await confirmPin(tabId, pin);
   // Native text input replaces the selection, so framework-controlled inputs see real input events.
   if (text) await cdp(tabId, "Input.insertText", { text });
   else await press(tabId, "Delete");
+  await confirmPin(tabId, pin);
   const { matches } = await inPage(tabId, pageFilledValue, { selector, text });
   if (!matches) throw new Error("Field value differs after typing (masked or controlled input)");
   return { dispatched: true };
 }
-async function scroll(tabId, dy) {
+async function scroll(tabId, dy, pin) {
   const { width, height } = await inPage(tabId, pageViewport);
+  await confirmPin(tabId, pin);
   await mouse(tabId, "mouseWheel", Math.floor(width / 2), Math.floor(height / 2), { deltaX: 0, deltaY: dy });
+  await confirmPin(tabId, pin);
   return { dispatched: true };
 }
 async function waitFor(tabId, request, deadline) {
@@ -226,9 +269,11 @@ async function navigate(tabId, url) {
   if (r.errorText) throw new Error(`Navigation failed: ${String(r.errorText).replace(/[^\w .:-]/g, "").slice(0, 80)}`);
   return { dispatched: true, note: "Navigation started; use waitFor before reading the page." };
 }
-async function evaluate(tabId, code, deadline) {
+async function evaluate(tabId, code, deadline, pin) {
   const timeout = Math.max(500, deadline - Date.now() - 500);
-  const evaluation = cdp(tabId, "Runtime.evaluate", { expression: code, replMode: true, awaitPromise: true, returnByValue: true, userGesture: true, timeout });
+  // Pinned: the code runs only in the checked document; a replaced document fails the call instead.
+  const evaluation = cdp(tabId, "Runtime.evaluate", { expression: code, replMode: true, awaitPromise: true, returnByValue: true, userGesture: true, timeout, ...(pin ? { uniqueContextId: pin.uniqueId } : {}) })
+    .catch(error => { throw pin ? new Error(DOCUMENT_CHANGED) : error; });
   const r = await Promise.race([evaluation, new Promise((_, reject) => setTimeout(() => reject(new Error("Evaluation timed out (it may still be running)")), timeout))]);
   if (r.exceptionDetails) return { exception: String(r.exceptionDetails.exception?.description || r.exceptionDetails.text || "Exception").slice(0, 2000) };
   const value = r.result.value;

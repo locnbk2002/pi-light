@@ -260,7 +260,10 @@ async function checkOrigin(t) {
   if (t.kind === "bound" && origin !== t.origin) { release(t, "Origin changed; click toolbar to rebind."); throw new Error("Bound tab origin changed"); }
 }
 
+// Bound-tab actions that act on the page run pinned to the document whose origin was checked (cdp.js).
+const PINNED = new Set(["click", "hover", "fill", "press", "scroll", "evaluate"]);
 async function perform(m, t) {
+  const pin = t?.kind === "bound" && PINNED.has(m.action) ? await pinDocument(t.tabId, t.origin) : undefined;
   switch (m.action) {
     case "tabs": return listTabs(m.session);
     case "open": return openTab(m);
@@ -270,15 +273,15 @@ async function perform(m, t) {
       return { closed: t.name };
     case "snapshot": return m.mode === "ax" ? axSnapshot(t.tabId) : inPage(t.tabId, pageSnapshot);
     case "screenshot": return screenshot(t.tabId, m.fullPage === true);
-    case "click": return click(t.tabId, m.selector);
-    case "hover": return hover(t.tabId, m.selector);
-    case "fill": return fill(t.tabId, m.selector, m.text);
-    case "press": return press(t.tabId, m.key);
-    case "scroll": return scroll(t.tabId, m.dy);
+    case "click": return click(t.tabId, m.selector, pin);
+    case "hover": return hover(t.tabId, m.selector, pin);
+    case "fill": return fill(t.tabId, m.selector, m.text, pin);
+    case "press": return press(t.tabId, m.key, pin);
+    case "scroll": return scroll(t.tabId, m.dy, pin);
     case "waitFor": return waitFor(t.tabId, m, m.deadline);
     case "console": return recentLogs(sessions.get(t.tabId)?.console ?? []);
     case "network": return recentLogs(sessions.get(t.tabId)?.network ?? []);
-    case "evaluate": return evaluate(t.tabId, m.code, m.deadline);
+    case "evaluate": return evaluate(t.tabId, m.code, m.deadline, pin);
     case "navigate":
       if (t.kind === "bound" && originOf(m.url) !== t.origin) throw new Error("Bound tab navigation must stay on its origin");
       originOf(m.url);

@@ -475,6 +475,23 @@ async function loadAddon(options: { enabled?: boolean; pairing?: string | null; 
   const removed: number[] = [];
   let nextId = 100;
   const logs: unknown[] = [];
+  // One main-world document per tab: its execution context id and origin. The tab URL Chrome reports can lag
+  // behind a replaced document (see replaceDocument).
+  const documents = new Map<number, { uniqueId: string; origin: string }>();
+  let nextDocument = 1;
+  const originOfUrl = (url: string) => { try { return new URL(url).origin; } catch { return "null"; } };
+  const announceDocument = (tabId: number) => fire("cdpEvent", { tabId }, "Runtime.executionContextCreated",
+    { context: { id: 1, uniqueId: documents.get(tabId)!.uniqueId, origin: documents.get(tabId)!.origin, auxData: { isDefault: true, frameId: "frame" } } });
+  /** Replace a tab's document; with announce false the URL update and context events are delayed (not sent). */
+  const replaceDocument = (tabId: number, url: string, announce = true) => {
+    const previous = documents.get(tabId);
+    documents.set(tabId, { uniqueId: `doc-${nextDocument++}`, origin: originOfUrl(url) });
+    if (!announce) return;
+    if (previous) fire("cdpEvent", { tabId }, "Runtime.executionContextDestroyed", { executionContextId: 1, executionContextUniqueId: previous.uniqueId });
+    announceDocument(tabId);
+    const tab = tabs.get(tabId);
+    if (tab) { tab.url = url; fire("updated", tabId, { url }, tab); }
+  };
   const evaluateIn = (expression: string) => {
     try { return { result: { type: "object", value: vm.runInContext(expression, page.context) } }; }
     catch (error) { return { exceptionDetails: { exception: { description: `Error: ${(error as Error).message}\n    at page` } } }; }
@@ -505,10 +522,21 @@ async function loadAddon(options: { enabled?: boolean; pairing?: string | null; 
       detach: async ({ tabId }: { tabId: number }) => { if (!attached.delete(tabId)) throw new Error("Not attached"); },
       sendCommand: async ({ tabId }: { tabId: number }, method: string, params: any) => {
         calls.push({ tabId, method, params });
+        page.onCommand?.(tabId, method, params);
         switch (method) {
           case "Page.getFrameTree": return { frameTree: { frame: { id: "frame" } } };
           case "Page.createIsolatedWorld": return { executionContextId: 9 };
-          case "Runtime.evaluate": return evaluateIn(params.expression);
+          case "Runtime.enable":
+            if (!documents.has(tabId)) documents.set(tabId, { uniqueId: `doc-${nextDocument++}`, origin: originOfUrl(tabs.get(tabId)?.url ?? "") });
+            announceDocument(tabId);
+            return {};
+          case "Runtime.evaluate":
+            if (params.uniqueContextId !== undefined) {
+              if (params.uniqueContextId !== documents.get(tabId)?.uniqueId) throw new Error("Cannot find context with specified id");
+              page.evaluatedIn = documents.get(tabId)!.origin;
+              if (params.expression === "location.origin") return { result: { type: "string", value: documents.get(tabId)!.origin } };
+            }
+            return evaluateIn(params.expression);
           case "Input.insertText": page.document.activeElement.value = params.text; return {};
           case "Page.getLayoutMetrics": return { cssVisualViewport: { clientWidth: 1200, clientHeight: 800, pageX: 0, pageY: 0 }, cssContentSize: { width: 3200, height: 20000 } };
           case "Page.captureScreenshot": return { data: "QUJD" };
@@ -532,7 +560,7 @@ async function loadAddon(options: { enabled?: boolean; pairing?: string | null; 
   });
   // The live Pi may own the production port; the test relay listens on 19347.
   vm.runInContext(background.replace('"ws://127.0.0.1:19339/ext"', JSON.stringify(options.url ?? "ws://127.0.0.1:19347/ext")), context);
-  const addon = { context, chrome, fire, stored, local, tabs, page, calls, attached, removed, logs, dispose: () => vm.runInContext("enabled = false; clearTimeout(reconnectTimer); if (socket) socket.close()", context) };
+  const addon = { context, chrome, fire, stored, local, tabs, page, calls, attached, removed, logs, replaceDocument, dispose: () => vm.runInContext("enabled = false; clearTimeout(reconnectTimer); if (socket) socket.close()", context) };
   addons.push(addon);
   return addon;
 }
@@ -767,6 +795,12 @@ test("unattended origins: allowlisted bound tab runs mutations unprompted outsid
   assert.deepEqual([...unattendedOrigins({})], []);
   assert.deepEqual([...unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "https://a.test, https://b.test/" })], ["https://a.test", "https://b.test"]);
   assert.throws(() => unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "https://a.test/path" }), /bare origins/);
+  for (const bad of ["https://a.test?x=1", "https://a.test/#f", "https://a.test#", "https://a.test//", "a.test", "https://user:pw@a.test"]) {
+    assert.throws(() => unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: bad }), /bare|HTTP|Invalid URL/, bad);
+  }
+  // Case, a default port and Unicode host names normalize to the origin the browser reports; other ports stay.
+  assert.deepEqual([...unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "HTTPS://A.TEST, https://a.test:443/, https://bücher.test, http://a.test:8080" })],
+    ["https://a.test", "https://xn--bcher-kva.test", "http://a.test:8080"]);
   assert.throws(() => unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "file:///x" }), /HTTP/);
   const allow = new Set([origin]);
   const boundTab = { name: "bound", generation: "g", kind: "bound" as const, origin };
@@ -1092,26 +1126,84 @@ test("one session ending during worker-restart re-adoption does not strand anoth
   assert.equal(vm.runInContext("pendingOwned.length", addon.context), 0);
 });
 
-test("browser extension: only a one-shot non-subagent run with an allowlist gets the browser outside an interactive session", async () => {
-  const { default: piLightBrowserBridge } = await import("./index.ts");
-  const saved = { argv: process.argv, origins: process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS, id: process.env.PI_SUBAGENT_ID };
-  const registered = (argv: string[], env: { origins?: string; id?: string }) => {
-    process.argv = ["node", "pi", ...argv];
-    if (env.origins === undefined) delete process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS; else process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS = env.origins;
-    if (env.id === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = env.id;
-    const tools: string[] = [];
-    piLightBrowserBridge({ registerCommand() {}, registerTool(tool: { name: string }) { tools.push(tool.name); }, on() {} } as never);
-    return tools.includes("browser");
+test("browser run policy: only a one-shot non-subagent job gets the allowlist; interactive sessions and children never do", async () => {
+  const { browserRunPolicy } = await import("./index.ts");
+  const ORIGINS = "PI_LIGHT_BROWSER_UNATTENDED_ORIGINS";
+  const policy = (argv: string[], vars: Record<string, string> = {}) => {
+    const result = browserRunPolicy(argv, vars as never);
+    return { register: result.register, unattended: [...result.unattended] };
   };
-  try {
-    assert.equal(registered([], {}), true, "interactive session");
-    assert.equal(registered(["-p", "job"], {}), false, "one-shot without an allowlist");
-    assert.equal(registered(["-p", "job"], { origins: "https://a.test" }), true, "scheduled job");
-    assert.equal(registered(["-p", "task"], { origins: "https://a.test", id: "child-1" }), false, "a subagent child never qualifies, even with an inherited allowlist");
-    assert.equal(registered([], { origins: "https://a.test", id: "child-2" }), false, "herdr pane child");
-  } finally {
-    process.argv = saved.argv;
-    if (saved.origins === undefined) delete process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS; else process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS = saved.origins;
-    if (saved.id === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = saved.id;
-  }
+  assert.deepEqual(policy([]), { register: true, unattended: [] }, "interactive session");
+  assert.deepEqual(policy([], { [ORIGINS]: "https://a.test" }), { register: true, unattended: [] }, "an interactive session with an inherited allowlist still asks");
+  assert.deepEqual(policy(["--mode", "rpc"], { [ORIGINS]: "https://a.test" }), { register: true, unattended: [] }, "RPC session still asks");
+  assert.deepEqual(policy(["-p", "job"]), { register: false, unattended: [] }, "one-shot without an allowlist");
+  assert.deepEqual(policy(["-p", "job"], { [ORIGINS]: "https://a.test" }), { register: true, unattended: ["https://a.test"] }, "scheduled job");
+  assert.deepEqual(policy(["-p", "task"], { [ORIGINS]: "https://a.test", PI_SUBAGENT_ID: "child-1" }), { register: false, unattended: [] }, "a subagent never qualifies");
+  assert.deepEqual(policy([], { [ORIGINS]: "https://a.test", PI_SUBAGENT_ID: "child-2" }), { register: false, unattended: [] }, "herdr pane child");
+  assert.deepEqual(policy(["-p", "job"], { [ORIGINS]: " , " }), { register: false, unattended: [] }, "a blank allowlist enables nothing");
+});
+
+test("bound-tab actions are pinned to the checked document: a replaced document stops evaluate and native input", { timeout: 8000 }, async t => {
+  const bridge = await joined(t);
+  const addon = await loadAddon({ tabs: [{ id: 7, url: `${origin}/inbox` }] });
+  await until(() => bridge.connected, "add-on connection");
+  addon.fire("click", { id: 7, url: `${origin}/inbox` });
+  await until(() => bridge.tabs.length === 1, "bound tab");
+  const raw = vm.runInContext("(m) => run({ ...m, incarnation: live.get(m.session) }, socket)", addon.context);
+  let n = 0;
+  const request = (action: Record<string, unknown>) => raw({ id: (++n).toString(16).padStart(32, "0"), session: bridge.session, deadline: Date.now() + 2000, tab: "bound", generation: bridge.resolveTab("bound")!.generation, ...action });
+  const inputs = () => addon.calls.filter(c => c.method.startsWith("Input."));
+  const userCode = () => addon.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression === "document.title");
+
+  // On the checked document, evaluate runs in that document's own context.
+  assert.deepEqual(await request({ action: "evaluate", code: "document.title" }), undefined);
+  assert.equal(userCode().at(-1)!.params.uniqueContextId, "doc-1");
+  assert.equal(addon.page.evaluatedIn, origin);
+
+  // The document is replaced by another origin before Chrome reports the new URL: nothing runs there.
+  const before = { inputs: inputs().length, code: userCode().length };
+  addon.replaceDocument(7, "https://not-allowed.test/", false);
+  await assert.rejects(request({ action: "evaluate", code: "document.title" }), /document changed/);
+  await assert.rejects(request({ action: "press", key: "Enter" }), /document changed/);
+  assert.equal(inputs().length, before.inputs, "no native input reached the replaced document");
+  assert.equal(userCode().length, before.code, "the model's code was never sent");
+  assert.equal(addon.page.evaluatedIn, origin);
+  // Once Chrome reports the URL, the binding is released.
+  addon.replaceDocument(7, "https://not-allowed.test/");
+  await until(() => !bridge.resolveTab("bound"), "bound release");
+});
+
+test("bound-tab pin: a document replaced between the check and the dispatch fails the action", { timeout: 8000 }, async t => {
+  const bridge = await joined(t);
+  const addon = await loadAddon({ tabs: [{ id: 7, url: `${origin}/inbox` }] });
+  await until(() => bridge.connected, "add-on connection");
+  addon.fire("click", { id: 7, url: `${origin}/inbox` });
+  await until(() => bridge.tabs.length === 1, "bound tab");
+  const raw = vm.runInContext("(m) => run({ ...m, incarnation: live.get(m.session) }, socket)", addon.context);
+  let n = 0;
+  const request = (action: Record<string, unknown>) => raw({ id: (++n).toString(16).padStart(32, "a"), session: bridge.session, deadline: Date.now() + 2000, tab: "bound", generation: bridge.resolveTab("bound")!.generation, ...action });
+  // Replace the document right after the pre-dispatch check confirmed it (the URL update is delayed).
+  const replaceAfterCheck = (count: number) => {
+    let checks = 0;
+    addon.page.onCommand = (_tabId: number, method: string, params: any) => {
+      if (method === "Runtime.evaluate" && params.expression === "location.origin" && ++checks === count) {
+        queueMicrotask(() => addon.replaceDocument(7, "https://not-allowed.test/", false));
+      }
+    };
+  };
+  // evaluate: pinned by context, so the replaced document never runs the code.
+  replaceAfterCheck(1);
+  await assert.rejects(request({ action: "evaluate", code: "document.title" }), /document changed/);
+  assert.equal(addon.calls.some(c => c.method === "Runtime.evaluate" && c.params.expression === "document.title" && addon.page.evaluatedIn !== origin), false);
+  // A same-origin reload that Chrome reports gives a new pin, and actions run again.
+  addon.page.onCommand = undefined;
+  addon.replaceDocument(7, `${origin}/inbox`);
+  await delay(20);
+  assert.ok(bridge.resolveTab("bound"), "same-origin reload keeps the binding");
+  await request({ action: "press", key: "Enter" });
+  // press: native input is tab-level, so a document replaced during dispatch is caught by the check right after.
+  addon.page.onCommand = (_tabId: number, method: string, params: any) => {
+    if (method === "Input.dispatchKeyEvent" && params.type === "keyDown") addon.replaceDocument(7, "https://not-allowed.test/", false);
+  };
+  await assert.rejects(request({ action: "press", key: "Enter" }), /document changed/);
 });
