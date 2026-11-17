@@ -5,8 +5,8 @@ import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts
 import { queryAgentDirs } from '../../lib/agent-dirs-events.ts';
 import { loadAgentDefaults } from '../subagents/src/agents.ts';
 import { isProjectExplicitlyTrusted } from '../../lib/project-trust.ts';
-import { answerModelsQueries, EFFORT_INSTRUCTION } from './models-query.ts';
-import { judgeEffort, judgeInput, registryJudgeCall, type JudgeResult } from './effort-judge.ts';
+import { answerInputPreflightQueries, answerModelsQueries, inputPreflight } from './routing-events.ts';
+import { EFFORT_INSTRUCTION, EFFORT_SECTION, judgeEffort, judgeInput, registryJudgeCall, type JudgeResult } from './effort-judge.ts';
 import { innerExplicitLevel, planSubagentEffort, type SubagentEffortPlan } from './subagent-effort.ts';
 import { Cooldowns, isLimitOrCapacityError, loadModelChains, modelConfigPath, modelFamily, planCandidates, reviewerModel, routeController, splitModel,
   VIRTUAL_CONTROLLER, type ControllerRouteDecision, type ModelConfig } from './model-fallback.ts';
@@ -261,15 +261,14 @@ export default function piLight(pi: ExtensionAPI): void {
     }
     showControllerModel(ctx, decision.model);
   }
-  // Model facts for an optional routing workflow (pi-light-kit): the implementing model, its
-  // other-family reviewer and, while the judge is on, the effort-judge delegation instruction.
+  // Model facts for an optional routing workflow (pi-light-kit): the implementing model and its
+  // other-family reviewer.
   answerModelsQueries(pi.events, ctx => {
     const implementer = controllerModel ?? models.chains.controller[0];
     const reviewer = reviewerModel(models.chains, implementer, model => ctx ? available(ctx, model) : true);
-    return { controllerModel: implementer, controllerFamily: modelFamily(implementer),
-      ...(reviewer ? { reviewerModel: reviewer } : {}),
-      ...(models.effort.enabled ? { effortInstruction: EFFORT_INSTRUCTION } : {}) };
+    return { controllerModel: implementer, controllerFamily: modelFamily(implementer), ...(reviewer ? { reviewerModel: reviewer } : {}) };
   });
+  answerInputPreflightQueries(pi.events);
   async function ensureController(ctx: ExtensionContext): Promise<boolean> {
     if (isVirtualController(ctx.model)) return true;
     const virtual = ctx.modelRegistry.find(VIRTUAL_CONTROLLER.provider, VIRTUAL_CONTROLLER.id);
@@ -311,14 +310,23 @@ export default function piLight(pi: ExtensionAPI): void {
     return messages.length === event.messages.length ? undefined : { messages };
   });
 
-  pi.on('input', async (_event, ctx) => {
-    // Every prompt runs on the controller; when it cannot be selected the input is not sent.
+  pi.on('input', async (event, ctx) => {
+    // Every prompt runs on the controller; when it cannot be selected the input is not sent. Each
+    // input is announced before the asynchronous selection and again with its outcome, because a
+    // routing workflow loaded later never sees an input this handler drops.
+    const preflight = inputPreflight(pi.events, { text: event.text, source: event.source, streamingBehavior: event.streamingBehavior, ctx });
+    preflight.received();
     try {
-      if (!await ensureController(ctx)) return { action: 'handled' };
+      if (!await ensureController(ctx)) {
+        preflight.handled();
+        return { action: 'handled' };
+      }
     } catch {
+      preflight.handled();
       ctx.ui.notify('Could not select Opus. Input was not sent.', 'error');
       return { action: 'handled' };
     }
+    preflight.accepted();
     return { action: 'continue' };
   });
   // Subagent effort. Pi preflights sibling tool calls one at a time, so every `subagent` call of an
@@ -374,10 +382,15 @@ export default function piLight(pi: ExtensionAPI): void {
   pi.on('tool_call', async (event, ctx) => {
     if (event.toolName === 'subagent') await applySubagentEffort(event.toolCallId, event.input as Record<string, unknown>, ctx);
   });
-  pi.on('before_agent_start', (_event, ctx) => {
+  pi.on('before_agent_start', (event, ctx) => {
     if (!(isVirtualController(ctx.model) || isModelRef(ctx.model, models.chains.controller[0]))) {
       ctx.abort();
       throw new Error('Controller run blocked: incorrect main model.');
+    }
+    // The effort judge's own guidance, with or without a routing workflow.
+    if (models.effort.enabled) {
+      event.systemPromptOptions.sections ??= {};
+      event.systemPromptOptions.sections[EFFORT_SECTION] = EFFORT_INSTRUCTION;
     }
   });
   pi.on('agent_before_settle', (event, ctx) => failover.beforeSettle(event, ctx));

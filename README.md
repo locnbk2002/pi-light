@@ -6,7 +6,7 @@ The package root is the workflow core. Each feature is its own extension under `
 
 | Extension | Provides |
 |---|---|
-| `extensions/workflow` | Controller model fallback, Claude account rotation, the subagent effort judge, and the model facts (reviewer model, effort instruction) the kit's routing reads over `pi.events` (`pi-light:models:query`) |
+| `extensions/workflow` | Controller model fallback, Claude account rotation, the subagent effort judge and its `solutionSpace` prompt guidance (its own `pi_light_effort` section), the model facts (controller and reviewer model, `pi-light:models:query`) and the input preflight signals (`pi-light:input:*`) the kit's routing follows over `pi.events` |
 | `extensions/subagents` | The `subagent` tools: herdr panes inside herdr, background `pi -p` processes outside it |
 | `extensions/browser-bridge` | The `browser` tool, the shared local browser relay, `/browser-connect`, `/browser-status` and the Chromium add-on |
 | `extensions/herdr-layout` | herdr subagent pane layout |

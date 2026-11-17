@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import piLight, { hasModelFlag } from './index.ts';
 import { isHerdrSubagentChild, isOneShotInvocation } from '../../lib/run-mode.ts';
 import { DEFAULT_CHAINS, MAIN_MODEL, VIRTUAL_CONTROLLER } from './model-fallback.ts';
-import { EFFORT_INSTRUCTION, MODELS_QUERY, type ModelsQuery, type PiLightModels } from './models-query.ts';
+import { EFFORT_INSTRUCTION, EFFORT_SECTION } from './effort-judge.ts';
+import { INPUT_ACCEPTED, INPUT_HANDLED, INPUT_PREFLIGHT_QUERY, INPUT_RECEIVED, MODELS_QUERY, type ModelsQuery, type PiLightModels } from './routing-events.ts';
 // package.json lists test files explicitly; run the fallback module's unit tests with this suite.
 import './model-fallback.test.ts';
 
@@ -142,7 +143,7 @@ function extensionHarness() {
   } as unknown as ExtensionContext;
   piLight(pi);
   return {
-    ctx, bus, notifications, statuses, selected, unavailable, judge, virtualModel: () => virtualModel!,
+    pi, ctx, bus, notifications, statuses, selected, unavailable, judge, virtualModel: () => virtualModel!,
     renderers, tools, sentRecords, active: () => activeTools, sent: () => sent, confirmations: () => confirmations,
     async command(name: string, args = '') { await commands.get(name)!.handler(args, ctx as Parameters<Parameters<ExtensionAPI['registerCommand']>[1]['handler']>[1]); },
     async event(name: string, value: unknown) {
@@ -251,7 +252,7 @@ test('non-retried usage limits omit only the failed attempt and continue once on
   assert.equal(await native.event('agent_before_settle', settleEvent('429 usage limit')), undefined);
 });
 
-test('routing lives in the optional kit: no tools, mode commands, route status or prompt section here', async () => {
+test('routing lives in the optional kit: no tools, mode commands, route status or workflow section here', async () => {
   const harness = extensionHarness();
   for (const name of [...RETIRED_COMMANDS, 'auto', 'plan', 'brainstorm', 'work']) {
     await assert.rejects(harness.command(name), TypeError, `/${name} must not be registered`);
@@ -262,50 +263,88 @@ test('routing lives in the optional kit: no tools, mode commands, route status o
   assert.deepEqual(await harness.event('input', { text: 'hello', source: 'interactive' }), { action: 'continue' });
   const event = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: {} as Record<string, string> } };
   assert.equal(await harness.event('before_agent_start', event), undefined, 'no binding message');
-  assert.deepEqual(event.systemPromptOptions.sections, {}, 'no workflow prompt section');
+  assert.deepEqual(Object.keys(event.systemPromptOptions.sections), [EFFORT_SECTION], 'only the effort judge section');
   assert.equal(harness.statuses.has('pi-light'), false, 'no route status');
 });
 
-test('input is sent only when the controller can be selected', async () => {
-  const harness = extensionHarness();
-  (harness.ctx as { model: unknown }).model = { provider: 'openai-codex', id: 'gpt-6-astra' };
-  const missing = harness.ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown };
-  missing.find = () => undefined;
-  assert.deepEqual(await harness.event('input', { text: 'hello', source: 'interactive' }), { action: 'handled' });
-  assert.ok(harness.notifications.includes('Opus controller is unavailable. No controller prompt will be sent.'));
-});
-
-test('models query: pi-light names the controller, its other-family reviewer and the effort instruction', async () => {
-  const harness = extensionHarness();
-  assert.deepEqual(harness.models(), [{ controllerModel: MAIN_MODEL.provider + '/' + MAIN_MODEL.model, controllerFamily: 'anthropic',
-    reviewerModel: 'openai-codex/gpt-6.1-sol', effortInstruction: EFFORT_INSTRUCTION }]);
+test('effort judge guidance: pi-light emits it in its own section while the judge is on', async () => {
   assert.match(EFFORT_INSTRUCTION, /^Start each subagent task with one line "solutionSpace: \.\.\."/);
   assert.match(EFFORT_INSTRUCTION, /small judge model uses it to pick the child's reasoning effort/);
+  const harness = extensionHarness();
+  const event = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: { other: 'kept' } as Record<string, string> } };
+  await harness.event('before_agent_start', event);
+  assert.deepEqual(event.systemPromptOptions.sections, { other: 'kept', [EFFORT_SECTION]: EFFORT_INSTRUCTION });
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-light-effort-section-'));
+  try {
+    await writeFile(join(dir, 'pi-light-models.json'), JSON.stringify({ effort: { enabled: false } }));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const off = { messageType: 'user', systemPrompt: 'Base', systemPromptOptions: { sections: {} as Record<string, string> } };
+    await extensionHarness().event('before_agent_start', off);
+    assert.deepEqual(off.systemPromptOptions.sections, {}, 'no effort guidance while the judge is off');
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** Record the input preflight signals in emission order, with what the controller model was at the time. */
+function recordSignals(harness: ReturnType<typeof extensionHarness>) {
+  const seen: string[] = [];
+  for (const [name, channel] of [['received', INPUT_RECEIVED], ['accepted', INPUT_ACCEPTED], ['handled', INPUT_HANDLED]] as const) {
+    harness.bus.on(channel, data => {
+      const signal = data as { text: string; source: string; streamingBehavior?: string; ctx: unknown };
+      assert.equal(signal.ctx, harness.ctx);
+      seen.push(`${name}:${signal.source}:${signal.text}:${signal.streamingBehavior ?? '-'}`);
+    });
+  }
+  return seen;
+}
+
+test('input preflight: every input is announced before controller selection, then accepted', async () => {
+  const harness = extensionHarness();
+  const seen = recordSignals(harness);
+  let replies = 0;
+  harness.bus.emit(INPUT_PREFLIGHT_QUERY, { reply(value: unknown) { assert.equal(value, true); replies++; } });
+  assert.equal(replies, 1, 'pi-light announces that it drives the input preflight');
+  (harness.ctx as { model: unknown }).model = { provider: 'openai-codex', id: 'gpt-6-astra' };
+  let resolveSelection!: (ok: boolean) => void;
+  (harness.pi as { setModel: unknown }).setModel = () => new Promise<boolean>(resolve => { resolveSelection = resolve; });
+  const pending = harness.event('input', { text: 'Implement hello.txt.', source: 'rpc', streamingBehavior: 'steer' }) as Promise<unknown>;
+  assert.deepEqual(seen, ['received:rpc:Implement hello.txt.:steer'], 'announced before the asynchronous selection finishes');
+  resolveSelection(true);
+  assert.deepEqual(await pending, { action: 'continue' });
+  assert.deepEqual(seen, ['received:rpc:Implement hello.txt.:steer', 'accepted:rpc:Implement hello.txt.:steer']);
+});
+
+test('input preflight: a dropped input is announced as handled, for a refused and for a throwing selection', async () => {
+  const harness = extensionHarness();
+  const seen = recordSignals(harness);
+  (harness.ctx as { model: unknown }).model = { provider: 'openai-codex', id: 'gpt-6-astra' };
+  const registry = harness.ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown };
+  registry.find = () => undefined;
+  assert.deepEqual(await harness.event('input', { text: 'B', source: 'interactive' }), { action: 'handled' });
+  assert.ok(harness.notifications.includes('Opus controller is unavailable. No controller prompt will be sent.'));
+  registry.find = () => { throw new Error('registry failed'); };
+  assert.deepEqual(await harness.event('input', { text: 'C', source: 'extension' }), { action: 'handled' });
+  assert.ok(harness.notifications.includes('Could not select Opus. Input was not sent.'));
+  assert.deepEqual(seen, ['received:interactive:B:-', 'handled:interactive:B:-', 'received:extension:C:-', 'handled:extension:C:-']);
+});
+
+test('models query: pi-light names the controller and its other-family reviewer', async () => {
+  const harness = extensionHarness();
+  assert.deepEqual(harness.models(), [{ controllerModel: MAIN_MODEL.provider + '/' + MAIN_MODEL.model, controllerFamily: 'anthropic',
+    reviewerModel: 'openai-codex/gpt-6.1-sol' }]);
   // Availability is checked against the asking turn's model registry.
   harness.unavailable.add('openai-codex/gpt-6.1-sol');
-  assert.equal(harness.models()[0].reviewerModel, undefined, 'no other-family model is available');
+  assert.deepEqual(harness.models()[0], { controllerModel: OPUS_REF, controllerFamily: 'anthropic' }, 'no other-family model is available');
   assert.equal(harness.models({})[0].reviewerModel, 'openai-codex/gpt-6.1-sol', 'without a usable context every configured model counts');
   // After a fallback route the implementing model is the fallback, reviewed by the other family.
   harness.unavailable.clear();
   const definition = harness.virtualModel();
   await definition.route({ reason: 'retry', model: physical('pi-light/controller'), thinkingLevel: 'high', messages: [],
     failed: { model: physical(OPUS_REF), thinkingLevel: 'high', message: { role: 'assistant', stopReason: 'error', errorMessage: '429 rate_limit_error' } } } as unknown as Parameters<typeof definition.route>[0], harness.ctx);
-  assert.deepEqual(harness.models()[0], { controllerModel: SOL_REF, controllerFamily: 'openai', reviewerModel: OPUS_REF, effortInstruction: EFFORT_INSTRUCTION });
-});
-
-test('models query: no effort instruction while the effort judge is off', async () => {
-  const previous = process.env.PI_CODING_AGENT_DIR;
-  const dir = await mkdtemp(join(tmpdir(), 'pi-light-models-query-'));
-  try {
-    await writeFile(join(dir, 'pi-light-models.json'), JSON.stringify({ effort: { enabled: false } }));
-    process.env.PI_CODING_AGENT_DIR = dir;
-    const [answer] = extensionHarness().models();
-    assert.equal('effortInstruction' in answer, false);
-    assert.equal(answer.reviewerModel, SOL_REF);
-  } finally {
-    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
-    await rm(dir, { recursive: true, force: true });
-  }
+  assert.deepEqual(harness.models()[0], { controllerModel: SOL_REF, controllerFamily: 'openai', reviewerModel: OPUS_REF });
 });
 
 test('context filtering leaves route bindings and the signed history untouched', async () => {

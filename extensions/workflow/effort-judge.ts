@@ -5,6 +5,11 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Cooldowns, isLimitOrCapacityError, JUDGE_LEVELS, planCandidates, splitModel, type EffortSettings,
   type JudgeLevel } from './model-fallback.ts';
 
+/** Controller guidance while the judge is on: the judge reads this line from each subagent task. */
+export const EFFORT_INSTRUCTION = 'Start each subagent task with one line "solutionSpace: ..." (at most 2,000 characters) saying how open-ended the problem is (fix given vs. open cause), not how much work it is; a small judge model uses it to pick the child\'s reasoning effort. Add a :level suffix to model only when the user asked for a specific effort.';
+/** System-prompt section that carries EFFORT_INSTRUCTION. */
+export const EFFORT_SECTION = 'pi_light_effort';
+
 /** Hard bound on what the judge reads, in code points, after the source is chosen. */
 export const JUDGE_INPUT_MAX = 2000;
 /** The judge answers with one short JSON object; the margin covers formatting, not thinking. */
