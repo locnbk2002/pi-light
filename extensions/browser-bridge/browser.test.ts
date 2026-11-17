@@ -715,7 +715,7 @@ test("add-on only allowlisted CDP methods and fixed page functions", async () =>
   assert.equal((background.match(/chrome\.debugger\.sendCommand/g) ?? []).length, 0);
 });
 
-test("browser tool: open always asks, bound-tab mutations and console ask, Pi-owned tabs run freely", async t => {
+test("browser tool: open and Pi-owned tabs run freely, bound-tab mutations and console ask", async t => {
   const tools: any[] = [];
   const pi = { registerCommand: () => {}, registerTool: (tool: any) => tools.push(tool), on: () => {} };
   const requests: Array<{ action: string }> = [];
@@ -735,12 +735,11 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
   assert.deepEqual(shot.content[1], { type: "image", data: "QUJD", mimeType: "image/jpeg" });
   assert.equal(confirms.length, 0, "reads need no confirmation");
 
-  // Opening a tab always asks.
+  // Opening a Pi-owned tab runs without a prompt, also outside the TUI.
   await run({ action: "open", url: `${origin}/` });
-  assert.match(confirms.at(-1)!, /new tab[\s\S]*"open"/);
-  answer = false;
-  await assert.rejects(run({ action: "open", url: `${origin}/` }), /declined/);
-  answer = true;
+  await run({ action: "open", url: `${origin}/` }, { ...ctx, mode: "rpc" });
+  assert.equal(confirms.length, 0, "open never prompts");
+  assert.equal(requests.filter(request => request.action === "open").length, 2);
 
   // Pi-owned tab: every action runs without a prompt, even outside the TUI.
   const owned0 = confirms.length;
@@ -764,7 +763,7 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
   t.diagnostic(`tool description length ${tool.description.length}`);
 });
 
-test("unattended origins: allowlisted bound tab runs mutations unprompted outside the TUI; open, console and other origins still ask", async () => {
+test("unattended origins: allowlisted bound tab runs mutations unprompted outside the TUI; console and other origins still ask", async () => {
   assert.deepEqual([...unattendedOrigins({})], []);
   assert.deepEqual([...unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "https://a.test, https://b.test/" })], ["https://a.test", "https://b.test"]);
   assert.throws(() => unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "https://a.test/path" }), /bare origins/);
@@ -775,7 +774,7 @@ test("unattended origins: allowlisted bound tab runs mutations unprompted outsid
   assert.equal(needsConfirmation({ action: "click", selector: "a" }, boundTab, allow), false);
   assert.equal(needsConfirmation({ action: "evaluate", code: "1" }, boundTab, allow), false);
   assert.equal(needsConfirmation({ action: "console" }, boundTab, allow), true);
-  assert.equal(needsConfirmation({ action: "open", url: `${origin}/` }, undefined, allow), true);
+  assert.equal(needsConfirmation({ action: "open", url: `${origin}/` }, undefined, allow), false);
   assert.equal(needsConfirmation({ action: "click", selector: "a" }, otherBound, allow), true);
   assert.equal(needsConfirmation({ action: "click", selector: "a" }, boundTab), true);
 
@@ -785,7 +784,7 @@ test("unattended origins: allowlisted bound tab runs mutations unprompted outsid
   registerBrowserTools(pi, { unattendedOrigins: new Set([bound.origin]) }, fake as unknown as BrowserBridge);
   const headless = { hasUI: false, mode: "print", ui: { confirm: async () => { throw new Error("must not prompt"); }, notify: () => {} } };
   await tools[0].execute("id", { action: "click", selector: "a" }, undefined, undefined, headless);
-  await assert.rejects(tools[0].execute("id", { action: "open", url: `${bound.origin}/` }, undefined, undefined, headless), /interactive confirmation/);
+  await tools[0].execute("id", { action: "open", url: `${bound.origin}/` }, undefined, undefined, headless);
   await assert.rejects(tools[0].execute("id", { action: "console" }, undefined, undefined, headless), /interactive confirmation/);
 });
 

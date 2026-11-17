@@ -95,11 +95,11 @@ export function validateAction(value: unknown, target?: ControlledTab): BrowserA
 export function needsTab(action: BrowserAction): boolean { return !TABLESS.has(action.action); }
 export function isMutation(action: BrowserAction): boolean { return MUTATIONS.has(action.action); }
 /**
- * Local confirmation policy (user decision 2026-11-08): opening a tab always asks; actions on the user's
- * bound tab ask for mutations and console text; Pi-owned tabs run without prompts. Read-only mode is separate.
+ * Local confirmation policy: opening a Pi-owned tab runs without a prompt; actions on the user's bound tab
+ * ask for mutations and console text; Pi-owned tabs run without prompts. Read-only mode is separate.
  */
 export function needsConfirmation(action: BrowserAction, target?: ControlledTab, unattended: ReadonlySet<string> = new Set()): boolean {
-  if (action.action === "open") return true;
+  if (action.action === "open") return false;
   if (target?.kind === "owned") return false;
   // Opt-in for scheduled jobs: the user's bound tab on an allowlisted origin runs mutations unprompted.
   // Console text stays confirmed; the tab itself is still origin-locked by validateAction.
