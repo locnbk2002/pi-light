@@ -98,10 +98,24 @@ export function isMutation(action: BrowserAction): boolean { return MUTATIONS.ha
  * Local confirmation policy (user decision 2026-11-08): opening a tab always asks; actions on the user's
  * bound tab ask for mutations and console text; Pi-owned tabs run without prompts. Read-only mode is separate.
  */
-export function needsConfirmation(action: BrowserAction, target?: ControlledTab): boolean {
+export function needsConfirmation(action: BrowserAction, target?: ControlledTab, unattended: ReadonlySet<string> = new Set()): boolean {
   if (action.action === "open") return true;
   if (target?.kind === "owned") return false;
+  // Opt-in for scheduled jobs: the user's bound tab on an allowlisted origin runs mutations unprompted.
+  // Console text stays confirmed; the tab itself is still origin-locked by validateAction.
+  if (target?.kind === "bound" && unattended.has(target.origin) && !SENSITIVE_READS.has(action.action)) return false;
   return isMutation(action) || SENSITIVE_READS.has(action.action);
+}
+export const UNATTENDED_ENV = "PI_LIGHT_BROWSER_UNATTENDED_ORIGINS";
+/** Parses the comma-separated origin allowlist set by an unattended job (e.g. a launchd schedule). */
+export function unattendedOrigins(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  const raw = env[UNATTENDED_ENV];
+  if (!raw) return new Set();
+  return new Set(raw.split(",").map(s => s.trim()).filter(Boolean).map(s => {
+    const origin = webOrigin(s);
+    if (origin !== s.replace(/\/$/, "")) throw new Error(`${UNATTENDED_ENV} entries must be bare origins`);
+    return origin;
+  }));
 }
 // Chromium browsers (Brave, Chrome, Edge) use chrome-extension://<32 chars a-p>.
 export function validExtensionOrigin(origin: unknown): boolean {

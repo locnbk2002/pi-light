@@ -91,6 +91,8 @@ Approval: opening a tab always asks. On a tab Pi opened, every other action runs
 
 Without `tab`, actions use the bound tab, then `main`, then the only controlled tab.
 
+Scheduled jobs (for example a launchd or systemd timer running `pi -p`) can opt in to unattended control with `PI_LIGHT_BROWSER_UNATTENDED_ORIGINS`, a comma-separated list of bare origins such as `https://chat.example.com`. Only a one-shot run that is not a subagent gets the browser this way. On a bound tab whose origin is listed, mutations (`click`, `fill`, `press`, `evaluate`, `navigate` on that origin) run without a prompt; `open` and `console` still need local confirmation, so they fail without a TUI, and other origins still ask. An entry that is not a bare HTTP(S) origin stops the extension with an error. Leave it unset for interactive sessions.
+
 How control works and what it costs:
 
 - The add-on uses the browser's debugger API through a fixed list of allowed DevTools methods, and only on tabs you bound or Pi opened. The browser shows a "debugging this browser" bar while it does; dismissing it releases control of the tab.

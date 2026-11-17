@@ -260,7 +260,7 @@ const DESCRIPTION = [
 
 type BrowserContext = { hasUI: boolean; mode: string; ui: { confirm: (title: string, message: string, options?: { signal?: AbortSignal }) => Promise<boolean>; notify: (message: string, level?: string) => void } };
 // The host's requested integration contract is deliberately untyped; inputs are validated below.
-export function registerBrowserTools(pi: any, bridge = new BrowserBridge()): void {
+export function registerBrowserTools(pi: any, options: { unattendedOrigins?: ReadonlySet<string> } = {}, bridge = new BrowserBridge()): void {
   pi.registerCommand("browser-connect", { description: "Show the one-time browser pairing secret (TUI only) and join the shared relay", handler: async (_args: string, ctx: BrowserContext) => {
     if (!ctx.hasUI || ctx.mode !== "tui") throw new Error("The browser pairing secret requires the local TUI");
     const secret = bridge.pairingSecret();
@@ -298,7 +298,7 @@ export function registerBrowserTools(pi: any, bridge = new BrowserBridge()): voi
         action = validateAction(params, target);
       }
       const mutation = isMutation(action);
-      if (needsConfirmation(action, target)) {
+      if (needsConfirmation(action, target, options.unattendedOrigins)) {
         if (!ctx.hasUI || ctx.mode !== "tui") throw new Error("This browser action requires local interactive confirmation");
         const where = target ? `${target.name} (${target.kind}) ${target.origin}` : "new tab";
         const risk = mutation ? "Page scripts may send data or navigate as a consequence." : "Page console text can contain private data (tokens, form values) and will be sent to the model.";

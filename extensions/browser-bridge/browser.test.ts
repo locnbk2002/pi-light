@@ -10,7 +10,7 @@ import vm from "node:vm";
 import { webcrypto } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { BrowserBridge, type BrowserBridgeOptions, registerBrowserTools } from "./browser-bridge.js";
-import { type ControlledTab, MAX_MESSAGE_BYTES, isMutation, validTabs, validateAction, validExtensionOrigin } from "./browser-policy.js";
+import { type ControlledTab, MAX_MESSAGE_BYTES, isMutation, needsConfirmation, unattendedOrigins, validTabs, validateAction, validExtensionOrigin } from "./browser-policy.js";
 import { ensurePairingSecret, pairingProof, startRelay } from "./browser-relay.mjs";
 
 const EXT = `chrome-extension://${"abcdefghijklmnop".repeat(2)}`;
@@ -724,7 +724,7 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
     resolveTab: (name?: string) => (!name || name === "bound" ? { ...bound } : name === "main" ? { ...owned } : undefined),
     request: async (action: { action: string }) => { requests.push(action); return action.action === "screenshot" ? { data: "QUJD", width: 2, height: 1 } : { ok: 1 }; }
   });
-  registerBrowserTools(pi, fake as unknown as BrowserBridge);
+  registerBrowserTools(pi, {}, fake as unknown as BrowserBridge);
   const tool = tools[0];
   const confirms: string[] = [];
   let answer = true;
@@ -762,6 +762,31 @@ test("browser tool: open always asks, bound-tab mutations and console ask, Pi-ow
 
   await assert.rejects(run({ action: "snapshot", tab: "nope" }), /No such controlled tab/);
   t.diagnostic(`tool description length ${tool.description.length}`);
+});
+
+test("unattended origins: allowlisted bound tab runs mutations unprompted outside the TUI; open, console and other origins still ask", async () => {
+  assert.deepEqual([...unattendedOrigins({})], []);
+  assert.deepEqual([...unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "https://a.test, https://b.test/" })], ["https://a.test", "https://b.test"]);
+  assert.throws(() => unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "https://a.test/path" }), /bare origins/);
+  assert.throws(() => unattendedOrigins({ PI_LIGHT_BROWSER_UNATTENDED_ORIGINS: "file:///x" }), /HTTP/);
+  const allow = new Set([origin]);
+  const boundTab = { name: "bound", generation: "g", kind: "bound" as const, origin };
+  const otherBound = { ...boundTab, origin: "https://other.test" };
+  assert.equal(needsConfirmation({ action: "click", selector: "a" }, boundTab, allow), false);
+  assert.equal(needsConfirmation({ action: "evaluate", code: "1" }, boundTab, allow), false);
+  assert.equal(needsConfirmation({ action: "console" }, boundTab, allow), true);
+  assert.equal(needsConfirmation({ action: "open", url: `${origin}/` }, undefined, allow), true);
+  assert.equal(needsConfirmation({ action: "click", selector: "a" }, otherBound, allow), true);
+  assert.equal(needsConfirmation({ action: "click", selector: "a" }, boundTab), true);
+
+  const tools: any[] = [];
+  const pi = { registerCommand: () => {}, registerTool: (tool: any) => tools.push(tool), on: () => {} };
+  const fake = { start: async () => {}, waitForBrowser: async () => true, connected: true, tabs: [bound], resolveTab: () => ({ ...bound }), request: async () => ({ ok: 1 }) };
+  registerBrowserTools(pi, { unattendedOrigins: new Set([bound.origin]) }, fake as unknown as BrowserBridge);
+  const headless = { hasUI: false, mode: "print", ui: { confirm: async () => { throw new Error("must not prompt"); }, notify: () => {} } };
+  await tools[0].execute("id", { action: "click", selector: "a" }, undefined, undefined, headless);
+  await assert.rejects(tools[0].execute("id", { action: "open", url: `${bound.origin}/` }, undefined, undefined, headless), /interactive confirmation/);
+  await assert.rejects(tools[0].execute("id", { action: "console" }, undefined, undefined, headless), /interactive confirmation/);
 });
 
 test("a request right after close is not refused as busy", { timeout: 5000 }, async t => {
@@ -1066,4 +1091,28 @@ test("one session ending during worker-restart re-adoption does not strand anoth
   assert.deepEqual(addon.removed, [100], "A's unkept tab closed");
   assert.deepEqual(plain(addon.stored.owned), [{ name: "main", session: B, tabId: 101, keep: false }]);
   assert.equal(vm.runInContext("pendingOwned.length", addon.context), 0);
+});
+
+test("browser extension: only a one-shot non-subagent run with an allowlist gets the browser outside an interactive session", async () => {
+  const { default: piLightBrowserBridge } = await import("./index.ts");
+  const saved = { argv: process.argv, origins: process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS, id: process.env.PI_SUBAGENT_ID };
+  const registered = (argv: string[], env: { origins?: string; id?: string }) => {
+    process.argv = ["node", "pi", ...argv];
+    if (env.origins === undefined) delete process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS; else process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS = env.origins;
+    if (env.id === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = env.id;
+    const tools: string[] = [];
+    piLightBrowserBridge({ registerCommand() {}, registerTool(tool: { name: string }) { tools.push(tool.name); }, on() {} } as never);
+    return tools.includes("browser");
+  };
+  try {
+    assert.equal(registered([], {}), true, "interactive session");
+    assert.equal(registered(["-p", "job"], {}), false, "one-shot without an allowlist");
+    assert.equal(registered(["-p", "job"], { origins: "https://a.test" }), true, "scheduled job");
+    assert.equal(registered(["-p", "task"], { origins: "https://a.test", id: "child-1" }), false, "a subagent child never qualifies, even with an inherited allowlist");
+    assert.equal(registered([], { origins: "https://a.test", id: "child-2" }), false, "herdr pane child");
+  } finally {
+    process.argv = saved.argv;
+    if (saved.origins === undefined) delete process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS; else process.env.PI_LIGHT_BROWSER_UNATTENDED_ORIGINS = saved.origins;
+    if (saved.id === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = saved.id;
+  }
 });
