@@ -1,6 +1,6 @@
 {
   "name": "pi-light",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "description": "Opus-controlled Pi workflow with controller model fallback, Claude account rotation, subagent effort judging, herdr subagents (headless fallback), browser bridge and setup.",
   "keywords": [
