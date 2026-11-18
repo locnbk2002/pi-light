@@ -36,6 +36,7 @@ export function hasModelFlag(argv = process.argv.slice(2)): boolean {
 
 // Worded without retry or limit keywords: Pi must not auto-retry it and the classifiers must not match it.
 const NO_ACCOUNT = 'no Claude account is available (each is blocked, rejected or holding its 10% reserve)';
+const FAILURE_TEXT = { limit: 'hit its usage limit', auth: 'login was rejected', model: 'cannot run this model' } as const;
 
 function registerControllerModel(pi: ExtensionAPI, controllerChain: () => readonly string[], cooldowns: Cooldowns,
   onRoute?: (ctx: ExtensionContext, decision: ControllerRouteDecision) => void, accounts?: ClaudeAccountRouter): void {
@@ -64,16 +65,16 @@ function registerControllerModel(pi: ExtensionAPI, controllerChain: () => readon
         const kind = request.reason === 'retry' && failed && isClaude(failed.model)
           ? accountFailureKind(failed.stopReason, failed.errorMessage) : undefined;
         if (kind) {
-          const result = await accounts!.failover(kind, failed!.errorMessage);
+          const result = await accounts!.failover(kind, failed!.errorMessage, splitModel(failed!.model).id);
           if (result.next) {
             account = result.next;
             decision = { model: failed!.model };
-            ctx.ui.notify(`Claude account ${result.failed} ${kind === 'limit' ? 'hit its usage limit' : 'login was rejected'}. Retrying on account ${result.next}.`, 'warning');
+            ctx.ui.notify(`Claude account ${result.failed} ${FAILURE_TEXT[kind]}. Retrying on account ${result.next}.`, 'warning');
           }
         }
         decision ??= decide();
         if (!account && isClaude(decision.model)) {
-          account = await accounts!.pick(request.reason === 'user' || request.reason === 'retry');
+          account = await accounts!.pick(request.reason === 'user' || request.reason === 'retry', splitModel(decision.model).id);
           if (!account) {
             // No managed account: never let Claude run on the bridge's own login. Route among the other models.
             const others = chain.filter(model => !isClaude(model));
@@ -89,7 +90,7 @@ function registerControllerModel(pi: ExtensionAPI, controllerChain: () => readon
       if (unsafeRetry) {
         // Compare the whole identity: the model and, for managed Claude, the account and its token. An
         // ordinary pick (for example, the account entered its reserve) also moves the request.
-        const before = managed && isClaude(failed!.model) ? accounts!.streamedIdentity : undefined;
+        const before = managed && isClaude(failed!.model) ? accounts!.streamedIdentityFor(splitModel(failed!.model).id) : undefined;
         const after = account ? accounts!.identity(account) : undefined;
         if (decision.model !== failed!.model) refuseReplay(decision.model);
         if (before?.name !== after?.name || before?.fingerprint !== after?.fingerprint) refuseReplay(`Claude account ${after?.name ?? 'none'}`);
@@ -137,8 +138,8 @@ function createSettleFailover(controllerChain: () => readonly string[], cooldown
       // Claude account failover comes first: another account of the same model before another model.
       const accountKind = accounts?.serving && failed.provider === BRIDGE_PROVIDER ? accountFailureKind(failed.stopReason, failed.errorMessage) : undefined;
       if (accounts && accountKind) {
-        const result = await accounts.failover(accountKind, failed.errorMessage);
-        const what = accountKind === 'limit' ? 'hit its usage limit' : 'login was rejected';
+        const result = await accounts.failover(accountKind, failed.errorMessage, failed.model);
+        const what = FAILURE_TEXT[accountKind];
         if (result.next) {
           if (!safeToReplay(failed)) {
             ctx.ui.notify(`Claude account ${result.failed} ${what} after this request had already produced output, so it is not replayed. Your next prompt uses account ${result.next}.`, 'warning');
@@ -181,7 +182,8 @@ function createSettleFailover(controllerChain: () => readonly string[], cooldown
 }
 
 function createAccounts(config: ModelConfig): ClaudeAccountRouter | undefined {
-  return config.claudeAccounts.enabled ? new ClaudeAccountRouter(accountsDir(getAgentDir())) : undefined;
+  return config.claudeAccounts.enabled
+    ? new ClaudeAccountRouter(accountsDir(getAgentDir()), undefined, undefined, config.claudeAccounts.models) : undefined;
 }
 
 /**

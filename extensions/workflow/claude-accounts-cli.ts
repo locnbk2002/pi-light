@@ -14,6 +14,7 @@ import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import { loadAccounts, redactSecrets, removeAccount, saveAccount, StateStore, summarize, validateAccountName,
   validateToken } from './claude-accounts.ts';
 import { accountsDir, ClaudeAccountRouter } from './claude-account-routing.ts';
+import { loadModelChains } from './model-fallback.ts';
 
 const dir = accountsDir(getAgentDir());
 const USAGE = 'Usage: claude-accounts add <name> [--org <uuid>] [--check] | list | status | remove <name>';
@@ -79,7 +80,8 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === 'status') {
-    for (const line of new ClaudeAccountRouter(dir).describe()) console.log(line);
+    const { claudeAccounts } = loadModelChains();
+    for (const line of new ClaudeAccountRouter(dir, undefined, undefined, claudeAccounts.models).describe()) console.log(line);
     return;
   }
   if (command === 'remove') {

@@ -28,6 +28,45 @@ export const BLOCK_MARGIN_MS = 60_000;
 export const DEFAULT_BLOCK_MS = 30 * 60_000;
 const PIN_TTL_MS = 30 * 24 * 3600_000;
 const WEEK_HOURS = 168;
+/** Models that also draw from the plan's separate weekly allowance (`seven_day_overage_included`). */
+const INCLUDED_WINDOW_MODEL = /(?:^|-)fable(?:-|$)/;
+/** Rate-limit claims that exhaust the whole account; any other rejected claim stops only the model that hit it. */
+const ACCOUNT_WIDE_CLAIMS = new Set(['five_hour', 'seven_day']);
+const MODEL_ID = /^[A-Za-z0-9._-]{1,80}$/;
+const MODEL_PATTERN = /^[A-Za-z0-9._*-]{1,80}$/;
+
+// ---------------------------------------------------------------------------------------------
+// Which accounts may serve a model
+
+/** Account name -> model id patterns (`*` matches any run of characters). */
+export type AccountModels = Readonly<Record<string, readonly string[]>>;
+
+export function validateModelPattern(pattern: string): string {
+  if (!MODEL_PATTERN.test(pattern)) throw new Error('model patterns use letters, digits, ".", "_", "-" and "*" (at most 80 characters)');
+  return pattern;
+}
+
+function patternMatches(pattern: string, model: string): boolean {
+  const source = pattern.split('*').map(part => part.replace(/[.]/g, '\\.')).join('.*');
+  return new RegExp(`^${source}$`).test(model);
+}
+/** Literal characters: the more a pattern names, the more specific it is. */
+const specificity = (pattern: string) => pattern.replace(/\*/g, '').length;
+
+/**
+ * Accounts allowed to serve `model`. Without a map, or without a model, every account may. With a map,
+ * only listed accounts whose patterns match, and among them only those with the most specific match,
+ * so `{ work: ['claude-mythos-*'], personal: ['*'] }` sends Mythos to work and everything else to personal.
+ */
+export function accountsForModel(names: readonly string[], map: AccountModels | undefined, model: string | undefined): string[] {
+  if (!map || model === undefined) return [...names];
+  // The winning pattern is decided over the whole map, loaded or not: a missing or invalid account
+  // file for the most specific owner leaves the model with no account, never with a broader one.
+  const best = (name: string) => Math.max(-1, ...(map[name] ?? []).filter(pattern => patternMatches(pattern, model)).map(specificity));
+  const top = Math.max(-1, ...Object.keys(map).map(best));
+  if (top < 0) return [];
+  return names.filter(name => best(name) === top);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Redaction
@@ -135,12 +174,21 @@ export function summarize(account: StoredAccount): AccountSummary {
 // Usage state
 
 export interface UsageWindow { used: number; resetsAt?: number }
-export interface AccountUsage { fiveHour?: UsageWindow; sevenDay?: UsageWindow; measuredAt: number }
+export interface AccountUsage {
+  fiveHour?: UsageWindow;
+  sevenDay?: UsageWindow;
+  /** The plan's separate weekly allowance for included models (Fable on Max); only those models use it. */
+  sevenDayIncluded?: UsageWindow;
+  measuredAt: number;
+}
+export interface ModelBlock { until: number; reason: string }
 export interface AccountRecord {
   usage?: AccountUsage;
   /** Epoch ms; the account is skipped until then. */
   blockedUntil?: number;
   blockReason?: string;
+  /** Blocks of one model on this account (model not offered, usage credits needed, its own allowance spent). */
+  modelBlocks?: Record<string, ModelBlock>;
   /** Rejected logins, one per token fingerprint; a replaced token has a new fingerprint and is usable. */
   authFailures?: { fingerprint: string; at: number; reason: string }[];
   /** Its newest usage could not be read (corrupt, or vanishing on every try); treated as being in the reserve. */
@@ -171,6 +219,8 @@ export interface ParsedUsage {
   status?: string;
   overageStatus?: string;
   resetsAt?: number;
+  /** Rate-limit claim of the report (`five_hour`, `seven_day`, …); absent when the rejection names no window. */
+  claim?: string;
 }
 /** Parse the bridge's synthetic `anthropic-ratelimit-unified-*` headers (header names are case-insensitive). */
 export function parseUsageHeaders(headers: Record<string, string> | undefined, now: number): ParsedUsage {
@@ -183,29 +233,52 @@ export function parseUsageHeaders(headers: Record<string, string> | undefined, n
   };
   const fiveHour = window('5h');
   const sevenDay = window('7d');
+  const sevenDayIncluded = window('7d_oi');
+  const windows = { ...(fiveHour ? { fiveHour } : {}), ...(sevenDay ? { sevenDay } : {}), ...(sevenDayIncluded ? { sevenDayIncluded } : {}) };
   return {
-    usage: fiveHour || sevenDay ? { ...(fiveHour ? { fiveHour } : {}), ...(sevenDay ? { sevenDay } : {}), measuredAt: now } : undefined,
+    usage: Object.keys(windows).length ? { ...windows, measuredAt: now } : undefined,
     status: lower[`${HEADER}status`],
     overageStatus: lower[`${HEADER}overage-status`],
     resetsAt: secondsToMs(num(lower[`${HEADER}reset`])),
+    claim: lower[`${HEADER}representative-claim`],
   };
 }
 
+/** What a rejected report blocked: the whole account, or only the model that ran. */
+export type UsageBlock = { until: number; model?: string };
+
 /**
- * Store a usage report; a rejected status without allowed overage also blocks the account.
- * Returns the new block's end when the report blocked it.
+ * Store a usage report. A rejected status without allowed overage blocks the account when it names a
+ * plan window (5-hour or weekly). Any other rejection (usage credits required, an included allowance
+ * spent) blocks only `model` on the account; without a model it blocks the account as before.
  */
-export function recordUsage(state: AccountsState, account: string, parsed: ParsedUsage, now: number): number | undefined {
+export function recordUsage(state: AccountsState, account: string, parsed: ParsedUsage, now: number, model?: string): UsageBlock | undefined {
   const record = state.accounts[account] ??= {};
   if (parsed.usage) {
     // Keep a window the report omitted, so a partial report does not erase known usage.
     record.usage = { ...record.usage, ...parsed.usage, measuredAt: now };
   }
   if (parsed.status === 'rejected' && parsed.overageStatus !== 'allowed') {
+    if (model !== undefined && !ACCOUNT_WIDE_CLAIMS.has(parsed.claim ?? '')) {
+      // The reset belongs to this model only: never stored as the account's limit reset.
+      return { until: blockModel(state, account, model, `${model} rejected (${parsed.claim ?? 'usage credits required'})`, now, parsed.resetsAt), model };
+    }
     record.limitResetsAt = parsed.resetsAt;
-    return blockAccount(state, account, 'usage limit reported', now);
+    return { until: blockAccount(state, account, 'usage limit reported', now) };
   }
   return undefined;
+}
+
+/**
+ * Block one model on an account: until `resetsAt` (this model's own reported reset) plus a margin, else
+ * 30 minutes. An existing longer block of the model is kept. The account's limit reset is never used.
+ */
+export function blockModel(state: AccountsState, account: string, model: string, reason: string, now: number, resetsAt?: number): number {
+  if (!MODEL_ID.test(model)) throw new Error('invalid model id');
+  const record = state.accounts[account] ??= {};
+  const until = Math.max(resetsAt && resetsAt > now ? resetsAt + BLOCK_MARGIN_MS : now + DEFAULT_BLOCK_MS, record.modelBlocks?.[model]?.until ?? 0);
+  record.modelBlocks = { ...record.modelBlocks, [model]: { until, reason: redactSecrets(reason).slice(0, 200) } };
+  return until;
 }
 
 /** A window whose reset has passed is empty again. */
@@ -238,21 +311,27 @@ export function markAuthFailed(state: AccountsState, account: string, fingerprin
 
 export interface Candidate { name: string; fingerprint: string }
 
-export function isUsable(state: AccountsState, candidate: Candidate, now: number): boolean {
+export function isUsable(state: AccountsState, candidate: Candidate, now: number, model?: string): boolean {
   const record = state.accounts[candidate.name];
   if (!record) return true;
   if (record.authFailures?.some(item => item.fingerprint === candidate.fingerprint)) return false;
   if (record.blockedUntil !== undefined && record.blockedUntil > now) return false;
+  if (model !== undefined && (record.modelBlocks?.[model]?.until ?? 0) > now) return false;
   return true;
 }
 
-/** Inside the reserve on either window. `strict` applies the return thresholds to an account the session left. */
-export function inReserve(state: AccountsState, name: string, now: number, strict = false): boolean {
+/**
+ * Inside the reserve on either window, and for an included model (Fable) also on its own weekly
+ * allowance. `strict` applies the return thresholds to an account the session left.
+ */
+export function inReserve(state: AccountsState, name: string, now: number, strict = false, model?: string): boolean {
   if (state.accounts[name]?.unreadable) return true;
   const usage = state.accounts[name]?.usage;
   const fiveHour = effectiveUsed(usage?.fiveHour, now);
   const sevenDay = effectiveUsed(usage?.sevenDay, now);
-  return (fiveHour ?? 0) >= (strict ? RETURN_FIVE_HOUR : RESERVE) || (sevenDay ?? 0) >= (strict ? RETURN_SEVEN_DAY : RESERVE);
+  const included = model !== undefined && INCLUDED_WINDOW_MODEL.test(model) ? effectiveUsed(usage?.sevenDayIncluded, now) : undefined;
+  const weekly = strict ? RETURN_SEVEN_DAY : RESERVE;
+  return (fiveHour ?? 0) >= (strict ? RETURN_FIVE_HOUR : RESERVE) || (sevenDay ?? 0) >= weekly || (included ?? 0) >= weekly;
 }
 
 /** Weekly quota that must be spent per hour so it is not wasted at reset: higher drains first. */
@@ -267,9 +346,10 @@ function weeklyDrain(window: UsageWindow | undefined, now: number): number {
  * Usable accounts outside the reserve, best first: cool 5-hour window, measured before unmeasured,
  * highest weekly drain, lower 5-hour use, then name for a stable order.
  */
-export function rankAccounts(state: AccountsState, candidates: readonly Candidate[], now: number, left: readonly string[] = []): string[] {
+export function rankAccounts(state: AccountsState, candidates: readonly Candidate[], now: number, left: readonly string[] = [],
+  model?: string): string[] {
   const scored = candidates
-    .filter(candidate => isUsable(state, candidate, now) && !inReserve(state, candidate.name, now, left.includes(candidate.name)))
+    .filter(candidate => isUsable(state, candidate, now, model) && !inReserve(state, candidate.name, now, left.includes(candidate.name), model))
     .map(candidate => {
       const usage = state.accounts[candidate.name]?.usage;
       const fiveHour = effectiveUsed(usage?.fiveHour, now) ?? 0;
@@ -294,14 +374,14 @@ export interface AccountChoice {
  * - At a boundary a pinned account stays while it is usable and outside the reserve.
  */
 export function chooseAccount(state: AccountsState, session: string, candidates: readonly Candidate[], now: number,
-  boundary: boolean): AccountChoice {
+  boundary: boolean, model?: string): AccountChoice {
   const pin = state.pins[session];
   const pinned = pin && candidates.find(candidate => candidate.name === pin.account);
-  if (pinned && isUsable(state, pinned, now) && (!boundary || !inReserve(state, pinned.name, now))) {
+  if (pinned && isUsable(state, pinned, now, model) && (!boundary || !inReserve(state, pinned.name, now, false, model))) {
     pin.at = now;
     return { account: pinned.name, previous: pinned.name, changed: false };
   }
-  const ranked = rankAccounts(state, candidates, now, pin?.left ?? []);
+  const ranked = rankAccounts(state, candidates, now, pin?.left ?? [], model);
   const account = ranked[0];
   if (!account) return { previous: pin?.account, changed: false };
   const left = pin && pin.account !== account ? [...new Set([...(pin.left ?? []), pin.account])].filter(name => name !== account) : pin?.left;
@@ -331,7 +411,8 @@ const BLOCK_KEEP_MS = 24 * 3600_000;
 /** A temp file this old was left by a writer that crashed between creating and renaming it. */
 const TEMP_KEEP_MS = 3600_000;
 const READ_ATTEMPTS = 3;
-const USAGE_FIELDS = ['fiveHour', 'sevenDay', 'limitResetsAt'] as const;
+const WINDOW_FIELDS = ['fiveHour', 'sevenDay', 'sevenDayIncluded'] as const;
+const USAGE_FIELDS = [...WINDOW_FIELDS, 'limitResetsAt'] as const;
 const nonce = () => `${process.pid.toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 let sequence = 0;
 /** Time, then a per-process sequence, so this process's later write of the same millisecond sorts newer. */
@@ -344,13 +425,13 @@ const isWindow = (value: unknown): value is UsageWindow => !!value && typeof val
   && ((value as UsageWindow).resetsAt === undefined || isNumber((value as UsageWindow).resetsAt));
 /** A sample's time is a number and every window or reset it names has a valid shape. */
 const validSample = (data: Record<string, unknown>) => isNumber(data.at)
-  && (['fiveHour', 'sevenDay'] as const).every(field => data[field] === undefined || isWindow(data[field]))
+  && WINDOW_FIELDS.every(field => data[field] === undefined || isWindow(data[field]))
   && (data.limitResetsAt === undefined || isNumber(data.limitResetsAt));
 /** Files of one key, newest first (generation time, then name as a tie-break). */
 const newestFirst = (a: { ms: number; file: string }, b: { ms: number; file: string }) => b.ms - a.ms || (b.file > a.file ? 1 : -1);
 
 /** One usage report as stored: the windows it carried and, for a rejected report, the limit reset. */
-export interface UsageSample { at: number; fiveHour?: UsageWindow; sevenDay?: UsageWindow; limitResetsAt?: number }
+export interface UsageSample { at: number; fiveHour?: UsageWindow; sevenDay?: UsageWindow; sevenDayIncluded?: UsageWindow; limitResetsAt?: number }
 
 export class StateStore {
   /** The `state` directory inside the accounts directory. */
@@ -417,7 +498,7 @@ export class StateStore {
           if (!found.fiveHour || !found.sevenDay) target.unreadable = true;
           continue;
         }
-        for (const field of ['fiveHour', 'sevenDay'] as const) {
+        for (const field of WINDOW_FIELDS) {
           if (found[field] || !isWindow(data[field])) continue;
           found[field] = true;
           target.usage = { ...target.usage, [field]: data[field], measuredAt: Math.max(target.usage?.measuredAt ?? 0, data.at as number) };
@@ -441,6 +522,14 @@ export class StateStore {
         const data = this.readJson(file);
         if (!data || !isNumber(data.until)) continue;
         const target = record(match[1]);
+        if (typeof data.model === 'string') {
+          if (!MODEL_ID.test(data.model)) continue;
+          const current = target.modelBlocks?.[data.model];
+          if (!current || data.until > current.until) {
+            target.modelBlocks = { ...target.modelBlocks, [data.model]: { until: data.until, reason: typeof data.reason === 'string' ? data.reason : 'unavailable' } };
+          }
+          continue;
+        }
         if (target.blockedUntil === undefined || data.until > target.blockedUntil) {
           target.blockedUntil = data.until;
           target.blockReason = typeof data.reason === 'string' ? data.reason : 'limit';
@@ -473,8 +562,10 @@ export class StateStore {
     }
   }
 
-  addBlock(account: string, until: number, reason: string): void {
-    this.write(`block-${validateAccountName(account)}-${nonce()}.json`, { until, reason: redactSecrets(reason).slice(0, 200) });
+  /** Block the account, or with `model` only that model on the account. */
+  addBlock(account: string, until: number, reason: string, model?: string): void {
+    if (model !== undefined && !MODEL_ID.test(model)) throw new Error('invalid model id');
+    this.write(`block-${validateAccountName(account)}-${nonce()}.json`, { until, reason: redactSecrets(reason).slice(0, 200), ...(model !== undefined ? { model } : {}) });
   }
 
   addAuthFailure(account: string, fingerprint: string, at: number, reason: string): void {

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createEventBus, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import piLight from './index.ts';
 import { ACCOUNT_PROVIDER, accountFailureKind, accountsDir, BRIDGE_PROVIDER, ClaudeAccountRouter, safeToReplay } from './claude-account-routing.ts';
-import { inReserve, saveAccount, StateStore, tokenFingerprint, writeFileAtomic } from './claude-accounts.ts';
+import { accountsForModel, inReserve, saveAccount, StateStore, tokenFingerprint, writeFileAtomic } from './claude-accounts.ts';
 import { parseClaudeAccountSettings } from './model-fallback.ts';
 
 const HOUR = 3600_000;
@@ -669,4 +669,183 @@ test('controller: a picked Claude model outside the configured list keeps its ac
   await harness.command('claude-accounts', 'reload');
   assert.deepEqual(wrapperIds().sort(), [fable, OPUS].sort(), 'reload installs wrappers for this session\'s list');
   assert.equal(await harness.route({ reason: 'user' }), `${ACCOUNT_PROVIDER}/${fable}`);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Accounts per model: Mythos on the work account, everything else on the personal one
+
+const MYTHOS = 'claude-mythos-5-2';
+const FABLE = 'claude-fable-5-2';
+const BY_MODEL = { work: ['claude-mythos-*'], personal: ['*'] };
+
+function startModelRouter(dir: string, registry: ExtensionContext['modelRegistry'], models: Record<string, string[]> | undefined = BY_MODEL) {
+  const router = new ClaudeAccountRouter(dir, () => NOW, undefined, models);
+  router.startSession('s1', registry);
+  const config = router.providerConfig([FABLE, MYTHOS, OPUS])!;
+  const stream = (id: string) => config.streamSimple!({ provider: ACCOUNT_PROVIDER, id } as never, {} as never, { sessionId: 'pi-session-1' } as never);
+  return { router, stream };
+}
+
+test('settings: claudeAccounts.models maps accounts to model patterns and rejects bad entries', () => {
+  assert.deepEqual(JSON.parse(JSON.stringify(parseClaudeAccountSettings({ claudeAccounts: { enabled: true, models: BY_MODEL } }))),
+    { claudeAccounts: { enabled: true, models: BY_MODEL } });
+  assert.match(parseClaudeAccountSettings({ claudeAccounts: { enabled: true, models: { work: [] } } }).error!, /non-empty/);
+  assert.match(parseClaudeAccountSettings({ claudeAccounts: { enabled: true, models: { work: ['claude mythos'] } } }).error!, /patterns/);
+  assert.match(parseClaudeAccountSettings({ claudeAccounts: { enabled: true, models: { Work: ['*'] } } }).error!, /Account names/);
+  assert.match(parseClaudeAccountSettings({ claudeAccounts: { enabled: true, models: {} } }).error!, /at least one/);
+  assert.equal(parseClaudeAccountSettings({ claudeAccounts: { enabled: true, models: [] } }).claudeAccounts.enabled, false);
+});
+
+test('accounts per model: the most specific pattern wins; unlisted accounts serve nothing; no map serves all', () => {
+  const names = ['personal', 'work'];
+  assert.deepEqual(accountsForModel(names, BY_MODEL, MYTHOS), ['work']);
+  assert.deepEqual(accountsForModel(names, BY_MODEL, FABLE), ['personal']);
+  assert.deepEqual(accountsForModel(names, BY_MODEL, OPUS), ['personal']);
+  assert.deepEqual(accountsForModel(names, { personal: ['*'], work: ['*'] }, FABLE), ['personal', 'work'], 'equal patterns still rotate');
+  assert.deepEqual(accountsForModel(names, { work: ['claude-mythos-*'] }, FABLE), [], 'personal is not listed');
+  assert.deepEqual(accountsForModel(names, { work: ['claude.mythos-*'] }, 'claudeXmythos-5'), [], 'a dot is literal');
+  assert.deepEqual(accountsForModel(names, undefined, MYTHOS), names);
+  assert.deepEqual(accountsForModel(names, BY_MODEL, undefined), names);
+});
+
+test('account failure classification: model-only failures (not offered, credits needed, own allowance spent)', () => {
+  assert.equal(accountFailureKind('error', "Claude quota exceeded — rate limit: You've hit your monthly spend limit. Switch to another model"), 'model');
+  assert.equal(accountFailureKind('error', "There's an issue with the selected model (claude-mythos-5-2). It may not exist or you may not have access to it."), 'model');
+  assert.equal(accountFailureKind('error', 'Claude quota exceeded — rate limit (seven_day_overage_included) — resets 7:00'), 'model');
+  assert.equal(accountFailureKind('error', 'usage_not_included'), 'model');
+  assert.equal(accountFailureKind('error', 'Claude quota exceeded — rate limit (seven_day) — resets 7:00'), 'limit');
+});
+
+test('router by model: Mythos runs on work, Fable on personal, each with its own pin and no overflow', async () => {
+  await withRebuildHook(async rebuilds => {
+    const dir = accountDir();
+    const { registry, streams } = fakeRegistry();
+    const { router, stream } = startModelRouter(dir, registry);
+    assert.equal(await router.pick(true, FABLE), 'personal');
+    stream(FABLE);
+    assert.equal(await router.pick(true, MYTHOS), 'work');
+    stream(MYTHOS);
+    assert.equal(streams[1].env!.CLAUDE_CODE_OAUTH_TOKEN, TOKENS.work);
+    assert.equal(await router.pick(true, FABLE), 'personal', 'Fable goes back to personal, not to the account Mythos used');
+    assert.equal(rebuilds.length, 1, 'only the switch to a different account rebuilt');
+    assert.throws(() => stream(OPUS), /No Claude account was chosen/, 'a stream uses only its own model\'s route');
+    const state = new StateStore(dir).read();
+    assert.equal(state.pins['s1#personal']?.account, 'personal');
+    assert.equal(state.pins['s1#work']?.account, 'work');
+    // Personal is exhausted: Fable has no other account, so the controller falls back to another model.
+    new StateStore(dir).addBlock('personal', NOW + HOUR, 'limit');
+    assert.equal(await router.pick(true, FABLE), undefined);
+    assert.equal(await router.pick(true, MYTHOS), 'work', 'Mythos is unaffected');
+  });
+});
+
+test('router by model: a stream refuses an account that does not serve the model', async () => {
+  const dir = accountDir();
+  const { registry } = fakeRegistry();
+  const router = new ClaudeAccountRouter(dir, () => NOW, undefined, BY_MODEL);
+  router.startSession('s1', registry);
+  const config = router.providerConfig([FABLE])!;
+  new StateStore(dir).addBlock('personal', NOW + HOUR, 'limit');
+  assert.equal(await router.pick(true), 'work', 'a pick without a model may choose any account');
+  assert.throws(() => config.streamSimple!({ provider: ACCOUNT_PROVIDER, id: FABLE } as never, {} as never, {} as never), /does not serve/);
+});
+
+test('router by model: a rejected report that names no plan window blocks only that model on the account', async () => {
+  const dir = accountDir();
+  const { registry, streams } = fakeRegistry();
+  const { router, stream } = startModelRouter(dir, registry, { personal: ['*'], work: ['*'] });
+  // Work's Team seat needs usage credits for Fable: Claude Code reports a rejection without a window.
+  new StateStore(dir).addUsage('personal', { at: NOW, fiveHour: { used: 0.86 }, sevenDay: { used: 0.5 } });
+  assert.equal(await router.pick(true, FABLE), 'work');
+  stream(FABLE);
+  await streams[0].options.onResponse({ status: 200, headers: { 'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-reset': String((NOW + 300 * HOUR) / 1000) } }, {});
+  assert.deepEqual(await router.failover('limit', "Claude quota exceeded — rate limit: You've hit your monthly spend limit"),
+    { failed: 'work', next: 'personal' });
+  const state = new StateStore(dir).read();
+  assert.equal(state.accounts.work.blockedUntil, undefined, 'the account itself is not blocked');
+  assert.ok(state.accounts.work.modelBlocks![FABLE].until > NOW + 299 * HOUR, 'blocked until the reported reset');
+  assert.deepEqual(Object.keys(state.accounts.work.modelBlocks!), [FABLE], 'work still serves its other models');
+  assert.match(router.describe().join('\n'), /claude-fable-5-2 blocked until/);
+});
+
+test('router by model: a model failure blocks that model only; a plan-window rejection still blocks the account', async () => {
+  const dir = accountDir();
+  const { registry, streams } = fakeRegistry();
+  const { router, stream } = startModelRouter(dir, registry, { personal: ['*'], work: ['*'] });
+  assert.equal(await router.pick(true, MYTHOS), 'personal');
+  stream(MYTHOS);
+  assert.deepEqual(await router.failover('model', "There's an issue with the selected model (claude-mythos-5-2)."), { failed: 'personal', next: 'work' });
+  assert.equal(new StateStore(dir).read().accounts.personal.blockedUntil, undefined);
+  assert.equal(await router.pick(true, FABLE), 'work', 'the session keeps the account it moved to');
+  stream(FABLE);
+  await streams[1].options.onResponse({ status: 200, headers: { ...usageHeaders(1, 0.5, 15, 'rejected'),
+    'anthropic-ratelimit-unified-representative-claim': 'five_hour' } }, {});
+  assert.ok(new StateStore(dir).read().accounts.work.blockedUntil! > NOW, 'a 5-hour rejection blocks the whole account');
+  assert.equal(await router.pick(true, FABLE), 'personal');
+});
+
+test('reserve: the Fable allowance counts only for Fable', async () => {
+  const dir = accountDir(['personal']);
+  const { registry, streams } = fakeRegistry();
+  const { router, stream } = startModelRouter(dir, registry, { personal: ['*'] });
+  await router.pick(true, FABLE);
+  stream(FABLE);
+  await streams[0].options.onResponse({ status: 200, headers: { ...usageHeaders(0.1, 0.4, 15),
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.91', 'anthropic-ratelimit-unified-7d_oi-reset': String((NOW + 15 * HOUR) / 1000) } }, {});
+  const state = new StateStore(dir).read();
+  assert.equal(state.accounts.personal.usage!.sevenDayIncluded!.used, 0.91);
+  assert.equal(inReserve(state, 'personal', NOW, false, FABLE), true);
+  assert.equal(inReserve(state, 'personal', NOW, false, OPUS), false);
+  assert.equal(await router.pick(true, FABLE), undefined, 'Fable keeps its 10% reserve');
+  assert.equal(await router.pick(true, OPUS), 'personal');
+  assert.match(router.describe().join('\n'), /Fable allowance 91%/);
+});
+
+test('router by model: a missing account file for the most specific owner leaves the model with no account', async () => {
+  const dir = accountDir(['personal']);
+  const { registry } = fakeRegistry();
+  const { router, stream } = startModelRouter(dir, registry);
+  assert.equal(await router.pick(true, MYTHOS), undefined, 'Mythos never moves to the wildcard account');
+  assert.throws(() => stream(MYTHOS), /No Claude account was chosen/);
+  assert.equal(await router.pick(true, FABLE), 'personal');
+});
+
+test('router by model: a model-only reset never lengthens another model\'s or the account\'s block', async () => {
+  const dir = accountDir();
+  const { registry, streams } = fakeRegistry();
+  const { router, stream } = startModelRouter(dir, registry, { personal: ['*'], work: ['*'] });
+  new StateStore(dir).addUsage('personal', { at: NOW, fiveHour: { used: 0.86 }, sevenDay: { used: 0.5 } });
+  assert.equal(await router.pick(true, FABLE), 'work');
+  stream(FABLE);
+  await streams[0].options.onResponse({ status: 200, headers: { 'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-reset': String((NOW + 300 * HOUR) / 1000) } }, {});
+  // A fresh process: an Opus 429 without a usage report blocks work for the default time only.
+  const fresh = startModelRouter(dir, registry, { personal: ['*'], work: ['*'] });
+  assert.equal(await fresh.router.pick(true, OPUS), 'work');
+  fresh.stream(OPUS);
+  await fresh.router.failover('limit', '429 rate_limit_error', OPUS);
+  let state = new StateStore(dir).read();
+  assert.equal(state.accounts.work.blockedUntil, NOW + 30 * 60_000, 'the Fable reset is not the account\'s');
+  assert.equal(state.accounts.work.limitResetsAt, undefined);
+  await fresh.router.failover('model', "There's an issue with the selected model (claude-mythos-5-2).", MYTHOS);
+  state = new StateStore(dir).read();
+  assert.equal(state.accounts.work.modelBlocks![MYTHOS].until, NOW + 30 * 60_000, 'nor another model\'s');
+  assert.ok(state.accounts.work.modelBlocks![FABLE].until > NOW + 299 * HOUR);
+});
+
+test('router by model: a nested route for another model (compaction) does not move a routed request', async () => {
+  const dir = accountDir();
+  const { registry, streams } = fakeRegistry();
+  const { router, stream } = startModelRouter(dir, registry);
+  assert.equal(await router.pick(false, FABLE), 'personal');
+  // Pi compacts after routing the request: the summary routes and streams Mythos first.
+  assert.equal(await router.pick(true, MYTHOS), 'work');
+  stream(MYTHOS);
+  stream(FABLE);
+  assert.equal(streams[0].env!.CLAUDE_CODE_OAUTH_TOKEN, TOKENS.work);
+  assert.equal(streams[1].env!.CLAUDE_CODE_OAUTH_TOKEN, TOKENS.personal, 'the Fable request keeps its own account');
+  // A later Mythos failure is charged to work even though Fable streamed last.
+  assert.deepEqual(await router.failover('model', "There's an issue with the selected model", MYTHOS), { failed: 'work', next: undefined });
+  assert.equal(new StateStore(dir).read().accounts.personal, undefined, 'personal is untouched');
 });

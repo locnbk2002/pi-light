@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { validateAccountName, validateModelPattern, type AccountModels } from './claude-accounts.ts';
 
 /** The preferred controller: native Anthropic Opus. */
 export const MAIN_MODEL = { provider: 'anthropic', model: 'claude-opus-5-5' } as const;
@@ -187,8 +188,26 @@ export function parseEffortSettings(raw: unknown): { effort: EffortSettings; err
   }
 }
 
-export interface ClaudeAccountSettings { enabled: boolean }
+export interface ClaudeAccountSettings {
+  enabled: boolean;
+  /** Account name -> model id patterns it serves; absent means every account serves every model. */
+  models?: AccountModels;
+}
 const ACCOUNTS_OFF: ClaudeAccountSettings = Object.freeze({ enabled: false });
+
+function parseAccountModels(raw: unknown): AccountModels {
+  const map = asObject(raw, `${ACCOUNTS_KEY}.models`);
+  const models: Record<string, readonly string[]> = Object.create(null);
+  for (const [name, patterns] of Object.entries(map)) {
+    validateAccountName(name);
+    if (!Array.isArray(patterns) || !patterns.length || !patterns.every(item => typeof item === 'string')) {
+      throw new Error(`${ACCOUNTS_KEY}.models.${name} must be a non-empty list of model id patterns`);
+    }
+    models[name] = Object.freeze(patterns.map(validateModelPattern));
+  }
+  if (!Object.keys(models).length) throw new Error(`${ACCOUNTS_KEY}.models must name at least one account`);
+  return Object.freeze(models);
+}
 
 /** Claude account rotation settings; anything but `{ "enabled": true }` keeps rotation off. */
 export function parseClaudeAccountSettings(raw: unknown): { claudeAccounts: ClaudeAccountSettings; error?: string } {
@@ -196,9 +215,10 @@ export function parseClaudeAccountSettings(raw: unknown): { claudeAccounts: Clau
     const input = asObject(raw, 'top level');
     if (!(ACCOUNTS_KEY in input)) return { claudeAccounts: ACCOUNTS_OFF };
     const block = asObject(input[ACCOUNTS_KEY], ACCOUNTS_KEY);
-    for (const key of Object.keys(block)) if (key !== 'enabled') throw new Error(`unknown ${ACCOUNTS_KEY} key "${key.slice(0, 40)}"`);
+    for (const key of Object.keys(block)) if (key !== 'enabled' && key !== 'models') throw new Error(`unknown ${ACCOUNTS_KEY} key "${key.slice(0, 40)}"`);
     if (typeof block.enabled !== 'boolean') throw new Error(`${ACCOUNTS_KEY}.enabled must be true or false`);
-    return { claudeAccounts: Object.freeze({ enabled: block.enabled }) };
+    const models = 'models' in block ? parseAccountModels(block.models) : undefined;
+    return { claudeAccounts: Object.freeze({ enabled: block.enabled, ...(models ? { models } : {}) }) };
   } catch (error) {
     return { claudeAccounts: ACCOUNTS_OFF, error: error instanceof Error ? error.message : 'invalid' };
   }
