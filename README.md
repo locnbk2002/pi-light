@@ -12,7 +12,7 @@ The package root is the workflow core. Each feature is its own extension under `
 | `extensions/herdr-layout` | herdr subagent pane layout |
 | `extensions/herdr-permission-bridge` | herdr `blocked` status while a permission prompt waits |
 | `extensions/setup` | `/pi-light setup` |
-| `extensions/subscription-usage` | `/usage` (5h / 7d subscription windows for every Claude and ChatGPT/Codex login on the machine) and a footer status for the active model's account |
+| `extensions/subscription-usage` | `/usage` (5h / 7d subscription windows for every Claude and ChatGPT/Codex login on the machine; Claude rotation accounts show their last recorded usage, since `setup-token` tokens cannot read the usage endpoint) and a footer status for the active model's account |
 
 - **Stage routing (in `pi-light-kit`).** Opus is the controller by default; `/model` picks another for one session. With the kit installed, each request is routed as advice, brainstorm, plan or implement and mapped to a stage skill; the agent only edits files when you ask for an implementation. The `route_task` tool, the request binding and the `locbt_workflow` prompt section moved from pi-light to the kit.
 - **Advisors.** Advice comes from subagents: spawn `counsel` for autonomous counsel and `advisor` for an interactive interview (herdr only). A cross-family review is a `subagent` call on the other-family model. Both agent definitions ship in `agents/` (`counsel.md`, `advisor.md`) and use `claude-fable-5-2`.

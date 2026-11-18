@@ -10,23 +10,33 @@
 //   Claude Code         ~/.claude/.credentials.json (used by claude-bridge)
 //                       ~/.claude/.credentials-<profile>.json (cc-save profiles)
 //   Codex CLI           ~/.codex/auth.json
+//   pi-light rotation   <agent>/pi-light/claude-accounts/<name>.json (`claude setup-token`)
 // Tokens read from files are never refreshed here (refresh rotates the token
 // and would log out Claude Code / Codex CLI); expired ones are reported.
+// setup-token tokens lack the user:profile scope the usage endpoint needs, so
+// rotation accounts show the usage the workflow extension last recorded from
+// response headers (<accounts>/state/usage-<name>-<ms>-<nonce>.json), with its age.
+// Provider renames in pi-light-models.json ("providers": {"openai-codex": "openai"})
+// are mapped back, so a renamed provider keeps its family.
 //
 // Endpoints are undocumented (the same ones Claude Code /usage and Codex CLI use).
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 type Family = "claude" | "codex";
 type Win = { label: string; used: number; resetAt?: number }; // used: 0..100, resetAt: epoch ms
-type Account = { name: string; family: Family; token?: string; accountId?: string; dedupe?: string; note?: string };
-type Report = { account: Account; plan?: string; windows: Win[]; error?: string };
+type Recorded = { windows: Win[]; at: number };
+type Account = { name: string; family: Family; token?: string; accountId?: string; dedupe?: string; note?: string; recorded?: Recorded };
+type Report = { account: Account; plan?: string; windows: Win[]; error?: string; asOf?: number };
 
 const HOME = homedir();
-const PI_AUTH = join(HOME, ".pi/agent/auth.json");
+const AGENT_DIR = getAgentDir();
+const PI_AUTH = join(AGENT_DIR, "auth.json");
+const PI_MODELS = join(AGENT_DIR, "pi-light-models.json");
+const ROTATION_DIR = join(AGENT_DIR, "pi-light", "claude-accounts");
 const CC_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(HOME, ".claude");
 const CODEX_AUTH = join(process.env.CODEX_HOME ?? join(HOME, ".codex"), "auth.json");
 const STATUS_KEY = "usage";
@@ -49,12 +59,21 @@ const jwtAccountId = (jwt?: string): string | undefined => {
 	}
 };
 
-const familyOf = (provider?: string): Family | undefined =>
-	provider === "anthropic" || provider === "claude-bridge" || provider?.startsWith("anthropic-")
+// pi-light-models.json "providers" renames a built-in provider (from -> to); map `to` back.
+const providerAliases = (): Record<string, string> => {
+	const map = readJson(PI_MODELS)?.providers;
+	if (!map || typeof map !== "object") return {};
+	return Object.fromEntries(Object.entries(map).flatMap(([from, to]) => (typeof to === "string" ? [[to, from]] : [])));
+};
+
+const familyOf = (id?: string): Family | undefined => {
+	const provider = (id && providerAliases()[id]) || id;
+	return provider === "anthropic" || provider === "claude-bridge" || provider === "pi-light-claude" || provider?.startsWith("anthropic-")
 		? "claude"
 		: provider?.startsWith("openai-codex")
 			? "codex"
 			: undefined;
+};
 
 // ---------- account discovery ----------
 
@@ -89,6 +108,48 @@ function claudeCodeAccount(file: string, name: string): Account | undefined {
 	};
 }
 
+// pi-light Claude rotation accounts, with the newest recorded sample of each window.
+function rotationAccounts(): Account[] {
+	let names: string[] = [];
+	try {
+		names = readdirSync(ROTATION_DIR)
+			.filter((f) => f.endsWith(".json") && f !== "state.json")
+			.map((f) => f.slice(0, -".json".length))
+			.filter((name) => /^[a-z0-9][a-z0-9_-]{0,31}$/.test(name));
+	} catch {
+		return [];
+	}
+	let samples: string[] = [];
+	try {
+		samples = readdirSync(join(ROTATION_DIR, "state"));
+	} catch {}
+	const windows: [string, string][] = [
+		["fiveHour", "5h"],
+		["sevenDay", "7d"],
+	];
+	return names.sort().map((name) => {
+		const file = new RegExp(`^usage-${name}-(\\d{13})-[a-z0-9]+\\.json$`);
+		const newest: Record<string, { win: Win; at: number }> = {};
+		for (const f of samples) {
+			if (!file.test(f)) continue;
+			const d = readJson(join(ROTATION_DIR, "state", f));
+			if (typeof d?.at !== "number") continue;
+			for (const [key, label] of windows) {
+				const w = d[key];
+				if (typeof w?.used !== "number" || (newest[key] && newest[key].at >= d.at)) continue;
+				newest[key] = { win: { label, used: w.used * 100, resetAt: typeof w.resetsAt === "number" ? w.resetsAt : undefined }, at: d.at };
+			}
+		}
+		const found = windows.flatMap(([key]) => (newest[key] ? [newest[key]] : []));
+		return {
+			name: `pi-light ${name}`,
+			family: "claude" as const,
+			note: "no usage recorded yet",
+			recorded: found.length ? { windows: found.map((n) => n.win), at: Math.max(...found.map((n) => n.at)) } : undefined,
+		};
+	});
+}
+
 async function discoverAccounts(ctx: ExtensionContext): Promise<Account[]> {
 	const accounts: Account[] = [];
 	const auth = readJson(PI_AUTH) ?? {};
@@ -96,6 +157,8 @@ async function discoverAccounts(ctx: ExtensionContext): Promise<Account[]> {
 		const acc = await piAccount(ctx, id, cred);
 		if (acc) accounts.push(acc);
 	}
+
+	accounts.push(...rotationAccounts());
 
 	// Claude Code: active login (claude-bridge) first, then saved profiles.
 	const activeProfile = safeRead(join(CC_DIR, ".active-profile"));
@@ -163,6 +226,7 @@ const windowLabel = (seconds?: number) =>
 	!seconds ? "?" : seconds % 86_400 === 0 ? `${seconds / 86_400}d` : `${Math.round(seconds / 3600)}h`;
 
 async function fetchUsage(acc: Account): Promise<Report> {
+	if (acc.recorded) return { account: acc, windows: acc.recorded.windows, asOf: acc.recorded.at };
 	if (!acc.token) return { account: acc, windows: [], error: acc.note ?? "no token" };
 	try {
 		if (acc.family === "claude") {
@@ -199,12 +263,22 @@ function countdown(resetAt?: number): string {
 	return d ? `${d}d${h}h` : h ? `${h}h${String(m).padStart(2, "0")}m` : `${m}m`;
 }
 
+// A window whose reset time has passed no longer holds the recorded usage.
 const fmtWindows = (ws: Win[]) =>
-	ws.map((w) => `${w.label} ${Math.round(w.used)}%${w.resetAt ? ` ${countdown(w.resetAt)}` : ""}`).join(" · ");
+	ws
+		.map((w) =>
+			w.resetAt && w.resetAt <= Date.now()
+				? `${w.label} reset`
+				: `${w.label} ${Math.round(w.used)}%${w.resetAt ? ` ${countdown(w.resetAt)}` : ""}`,
+		)
+		.join(" · ");
+
+const ago = (at: number) => `${countdown(Date.now() + Math.max(0, Date.now() - at)) || "0m"} ago`;
 
 function fmtReport(r: Report): string {
 	const head = `${r.account.name}${r.plan ? ` [${r.plan}]` : ""}`;
-	return r.error ? `${head}: ${r.error}` : `${head}: ${fmtWindows(r.windows) || "no data"}`;
+	if (r.error) return `${head}: ${r.error}`;
+	return `${head}: ${fmtWindows(r.windows) || "no data"}${r.asOf ? ` (as of ${ago(r.asOf)})` : ""}`;
 }
 
 // ---------- rate-limit headers ----------
