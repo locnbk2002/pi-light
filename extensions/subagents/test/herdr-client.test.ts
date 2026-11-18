@@ -44,9 +44,39 @@ const pluginPaneEnvelope = JSON.stringify({
   },
 });
 
+function paneListEnvelope(panes: Array<[paneId: string, tabId: string]>): string {
+  return JSON.stringify({
+    id: "cli:pane:list",
+    result: {
+      panes: panes.map(([pane_id, tab_id]) => ({
+        pane_id,
+        tab_id,
+        workspace_id: pane_id.split(":")[0],
+      })),
+    },
+  });
+}
+
+function openedPaneEnvelope(paneId: string, tabId: string): string {
+  return JSON.stringify({
+    id: "cli:plugin",
+    result: {
+      plugin_pane: { pane: { pane_id: paneId, tab_id: tabId, workspace_id: "w1" } },
+    },
+  });
+}
+
+function argAfter(args: string[], flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  return i === -1 ? undefined : args[i + 1];
+}
+
 describe("HerdrClient", () => {
   it("paneStart builds the plugin pane command with the launch script env", async () => {
-    const { exec, calls } = fakeExec([{ stdout: pluginPaneEnvelope }]);
+    const { exec, calls } = fakeExec([
+      { stdout: paneListEnvelope([["w1:p1", "w1:t1"]]) },
+      { stdout: pluginPaneEnvelope },
+    ]);
     const client = createHerdrClient({ exec });
 
     const result = await client.paneStart({
@@ -58,9 +88,10 @@ describe("HerdrClient", () => {
     });
 
     assert.equal(HERDR_PLUGIN_ARGV_ENTRYPOINT, "argv");
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].cmd, "herdr");
-    assert.deepEqual(calls[0].args, [
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].args, ["pane", "list"]);
+    assert.equal(calls[1].cmd, "herdr");
+    assert.deepEqual(calls[1].args, [
       "plugin",
       "pane",
       "open",
@@ -86,6 +117,79 @@ describe("HerdrClient", () => {
       workspaceId: "w1",
       tabId: "w1:t1",
     });
+  });
+
+  it("paneStart opens a new tab when the target's tab already holds two panes", async () => {
+    const { exec, calls } = fakeExec([
+      { stdout: paneListEnvelope([["w1:p1", "w1:t1"], ["w1:p2", "w1:t1"]]) },
+      { stdout: openedPaneEnvelope("w1:p3", "w1:t2") },
+    ]);
+    const client = createHerdrClient({ exec });
+
+    const result = await client.paneStart({
+      name: "worker-2",
+      cwd: "/tmp/project",
+      targetPaneId: "w1:p1",
+      launchScriptFile: "/tmp/launch.sh",
+    });
+
+    const args = calls[1].args;
+    assert.equal(argAfter(args, "--placement"), "tab");
+    assert.equal(argAfter(args, "--workspace"), "w1");
+    assert.equal(args.indexOf("--target-pane"), -1);
+    assert.equal(args.indexOf("--direction"), -1);
+    assert.ok(args.includes("--no-focus"));
+    assert.equal(result.tabId, "w1:t2");
+  });
+
+  it("paneStart fills its own overflow tab to two panes before opening another", async () => {
+    const full = [
+      ["w1:p1", "w1:t1"],
+      ["w1:p2", "w1:t1"],
+    ] as Array<[string, string]>;
+    const { exec, calls } = fakeExec([
+      { stdout: paneListEnvelope(full) },
+      { stdout: openedPaneEnvelope("w1:p3", "w1:t2") },
+      // A user tab with one pane must not be borrowed; our overflow tab has room.
+      { stdout: paneListEnvelope([...full, ["w1:p9", "w1:t9"], ["w1:p3", "w1:t2"]]) },
+      { stdout: openedPaneEnvelope("w1:p4", "w1:t2") },
+      { stdout: paneListEnvelope([...full, ["w1:p3", "w1:t2"], ["w1:p4", "w1:t2"]]) },
+      { stdout: openedPaneEnvelope("w1:p5", "w1:t3") },
+    ]);
+    const client = createHerdrClient({ exec });
+    const start = () =>
+      client.paneStart({
+        name: "worker",
+        cwd: "/tmp/project",
+        targetPaneId: "w1:p1",
+        launchScriptFile: "/tmp/launch.sh",
+      });
+
+    await start();
+    await start();
+    assert.equal(argAfter(calls[3].args, "--placement"), "split");
+    assert.equal(argAfter(calls[3].args, "--target-pane"), "w1:p3");
+
+    await start();
+    assert.equal(argAfter(calls[5].args, "--placement"), "tab");
+  });
+
+  it("paneStart falls back to a split when the pane list fails", async () => {
+    const { exec, calls } = fakeExec([
+      { stderr: "boom", code: 1 },
+      { stdout: pluginPaneEnvelope },
+    ]);
+    const client = createHerdrClient({ exec });
+
+    await client.paneStart({
+      name: "worker-1",
+      cwd: "/tmp/project",
+      targetPaneId: "w1:p1",
+      launchScriptFile: "/tmp/launch.sh",
+    });
+
+    assert.equal(argAfter(calls[1].args, "--placement"), "split");
+    assert.equal(argAfter(calls[1].args, "--target-pane"), "w1:p1");
   });
 
   it("paneStart defaults direction right and omits --target-pane without a target", async () => {

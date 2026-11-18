@@ -48,12 +48,19 @@ export const HERDR_PLUGIN_ID = "pi-herdr-subagents";
 export const HERDR_PLUGIN_ENTRYPOINT = "subagent";
 export const HERDR_PLUGIN_ARGV_ENTRYPOINT = "argv";
 export const MIN_HERDR_VERSION = "0.8.2";
+/** Most panes a subagent launch may leave in one tab before a new tab is used. */
+export const MAX_PANES_PER_TAB = 2;
 
 export interface HerdrClient {
   /**
-   * Split a plugin-owned pane beside the orchestrator and dispatch one generated
-   * launch script through the plugin's fixed argv entrypoint. No shell typing,
-   * launch race, or per-call argv support is required from Herdr.
+   * Open a plugin-owned pane and dispatch one generated launch script through
+   * the plugin's fixed argv entrypoint. No shell typing, launch race, or
+   * per-call argv support is required from Herdr.
+   *
+   * Placement keeps at most MAX_PANES_PER_TAB panes per tab: the pane splits
+   * beside the target while the target's tab has room, otherwise it splits
+   * into an overflow tab this client opened earlier that still has room,
+   * otherwise it opens in a new tab of the target's workspace.
    */
   paneStart(p: {
     name: string;
@@ -130,6 +137,8 @@ const defaultExec: ExecFn = (cmd, args, opts) =>
 
 export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): HerdrClient {
   const exec = opts?.exec ?? defaultExec;
+  /** Tabs this client opened for subagents; only these are reused for overflow. */
+  const overflowTabs = new Set<string>();
 
   function resolveBin(): string {
     return opts?.bin ?? process.env.HERDR_BIN ?? "herdr";
@@ -175,8 +184,43 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
     return (envelope.result ?? {}) as T;
   }
 
+  type Placement =
+    | { kind: "split"; targetPaneId?: string }
+    | { kind: "tab"; workspaceId?: string };
+
+  async function choosePlacement(targetPaneId: string | undefined): Promise<Placement> {
+    if (!targetPaneId) return { kind: "split" };
+    let panes: PaneInfo[];
+    try {
+      const result = await execHerdrJson<{ panes?: PaneInfo[] }>(["pane", "list"]);
+      panes = result.panes ?? [];
+    } catch {
+      // Layout lookup is best-effort; fall back to the plain split.
+      return { kind: "split", targetPaneId };
+    }
+    const target = panes.find((pane) => pane.pane_id === targetPaneId);
+    if (!target?.tab_id) return { kind: "split", targetPaneId };
+    const panesIn = (tabId: string) => panes.filter((pane) => pane.tab_id === tabId);
+    if (panesIn(target.tab_id).length < MAX_PANES_PER_TAB) {
+      return { kind: "split", targetPaneId };
+    }
+    for (const tabId of overflowTabs) {
+      const tabPanes = panesIn(tabId);
+      if (tabPanes.length === 0) {
+        overflowTabs.delete(tabId); // tab closed since we opened it
+        continue;
+      }
+      if (tabPanes[0].workspace_id !== target.workspace_id) continue;
+      if (tabPanes.length < MAX_PANES_PER_TAB) {
+        return { kind: "split", targetPaneId: tabPanes[tabPanes.length - 1].pane_id };
+      }
+    }
+    return { kind: "tab", workspaceId: target.workspace_id };
+  }
+
   return {
     async paneStart(p) {
+      const placement = await choosePlacement(p.targetPaneId);
       const args = [
         "plugin",
         "pane",
@@ -186,10 +230,14 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
         "--entrypoint",
         HERDR_PLUGIN_ENTRYPOINT,
         "--placement",
-        "split",
+        placement.kind,
       ];
-      if (p.targetPaneId) args.push("--target-pane", p.targetPaneId);
-      args.push("--direction", p.direction ?? "right");
+      if (placement.kind === "split") {
+        if (placement.targetPaneId) args.push("--target-pane", placement.targetPaneId);
+        args.push("--direction", p.direction ?? "right");
+      } else if (placement.workspaceId) {
+        args.push("--workspace", placement.workspaceId);
+      }
       args.push("--cwd", p.cwd);
       for (const [key, value] of Object.entries({
         ...p.env,
@@ -210,6 +258,7 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
           `herdr plugin pane open returned no pane id: ${JSON.stringify(result)}`,
         );
       }
+      if (placement.kind === "tab" && pane.tab_id) overflowTabs.add(pane.tab_id);
       return {
         paneId: pane.pane_id,
         terminalId: pane.terminal_id ?? "",

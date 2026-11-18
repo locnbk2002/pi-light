@@ -19,7 +19,7 @@ The package root is the workflow core. Each feature is its own extension under `
 - **Model fallback.** When a provider limit is hit, the controller falls back from Opus to Sol.
 - **Cross-family review.** Reviews of the controller's own work run on a model from another vendor family: an Opus-written change is reviewed by Sol (and by Opus if Sol wrote it). pi-light names that model to the kit's routing policy, which tells the controller to pass it explicitly when it delegates a review subagent.
 - **Browser bridge.** A Chromium add-on (Brave, Chromium, Chrome, Edge) lets every running Pi session open and drive its own tabs in your signed-in browser at the same time, and use a tab you bind with the toolbar button. You pair each browser profile once; there is no per-session token. Opening a tab runs without asking. On the tab you bound, clicks, typing, key presses, navigation, scripts and console reads ask each time; on tabs Pi opened, later actions run without asking (see Browser tool below).
-- **herdr subagent layout.** Up to 3 subagents stack beside your pane. When a 4th starts, all of them move to their own tabs. `PI_HERDR_MAX_SPLIT` changes the limit, and `PI_HERDR_LAYOUT=tab|split` changes the mode.
+- **herdr subagent layout.** A tab holds at most 2 panes. The first subagent splits beside your pane; once your tab has 2 panes, the next subagent opens in a new tab, and the one after it splits into that tab. Only tabs pi-light opened are reused, never your own. `PI_HERDR_LAYOUT=tab` instead moves every subagent to its own tab.
 
 ## Install
 
