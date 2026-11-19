@@ -4,12 +4,19 @@
 // and per-run artifact isolation.
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import herdrSubagents, { __test__ } from "../index.ts";
-import { buildLaunchPlan, buildResumeLaunchPlan, type LaunchPlanContext } from "../src/launch.ts";
+import {
+  buildLaunchPlan,
+  buildResumeLaunchPlan,
+  parseLaunchRecord,
+  sessionModelArg,
+  type LaunchPlanContext,
+} from "../src/launch.ts";
+import { seedSubagentSessionFile } from "../src/session.ts";
 import type { SubagentOutcome } from "../src/watcher.ts";
 
 const ENV_KEYS = [
@@ -203,6 +210,121 @@ describe("fix 7: per-run artifacts never collide", () => {
     const ra = buildResumeLaunchPlan({ sessionPath: a.sessionFile, message: "m" }, record, planCtx({ id: "cccc3333" }));
     const rb = buildResumeLaunchPlan({ sessionPath: b.sessionFile, message: "m" }, record, planCtx({ id: "dddd4444" }));
     assert.deepEqual(paths(ra).filter((path) => paths(rb).includes(path)), []);
+  });
+});
+
+describe("resume keeps the original run's model", () => {
+  const modelArgOf = (argv: string[]) => {
+    const i = argv.indexOf("--model");
+    return i === -1 ? undefined : argv[i + 1];
+  };
+  const recordOf = (plan: { files: Array<{ path: string; content: string }> }) =>
+    parseLaunchRecord(plan.files.find((file) => file.path.endsWith(".launch.json"))!.content);
+
+  it("a spawn records its --model argument, thinking level included", () => {
+    const plan = buildLaunchPlan(
+      { name: "R", task: "t", agent: "r", model: "openai/gpt-6.1-sol" },
+      { thinking: "low" },
+      planCtx({ id: "eeee5555" }),
+    );
+    assert.equal(modelArgOf(plan.piArgv), "openai/gpt-6.1-sol:low");
+    assert.equal(recordOf(plan).model, "openai/gpt-6.1-sol:low");
+  });
+
+  it("a spawn without a model records none", () => {
+    const plan = buildLaunchPlan({ name: "R", task: "t" }, null, planCtx({ id: "ffff6666" }));
+    assert.equal(modelArgOf(plan.piArgv), undefined);
+    assert.equal(recordOf(plan).model, undefined);
+  });
+
+  it("resume passes the recorded model, and an explicit override wins and is recorded", () => {
+    const record = { version: 1 as const, agent: "r", denyTools: [], tools: ["read"], model: "openai/gpt-6.1-sol:low" };
+    const kept = buildResumeLaunchPlan({ sessionPath: join(root, "s.jsonl") }, record, planCtx({ id: "abab1212" }));
+    assert.equal(modelArgOf(kept.piArgv), "openai/gpt-6.1-sol:low");
+    assert.equal(recordOf(kept).model, "openai/gpt-6.1-sol:low");
+
+    const overridden = buildResumeLaunchPlan(
+      { sessionPath: join(root, "s.jsonl"), model: "openai/gpt-6.1-sol:high" },
+      record,
+      planCtx({ id: "cdcd3434" }),
+    );
+    assert.equal(modelArgOf(overridden.piArgv), "openai/gpt-6.1-sol:high");
+    assert.equal(recordOf(overridden).model, "openai/gpt-6.1-sol:high");
+  });
+
+  it("parseLaunchRecord accepts records without a model and rejects a malformed one", () => {
+    const base = { version: 1, agent: null, denyTools: [], tools: ["read"] };
+    assert.equal(parseLaunchRecord(JSON.stringify(base)).model, undefined);
+    assert.throws(() => parseLaunchRecord(JSON.stringify({ ...base, model: 7 })), /invalid model/);
+  });
+
+  it("a model recovered from the session is used for the launch but never recorded", () => {
+    const record = { version: 1 as const, agent: "r", denyTools: [], tools: ["read"] };
+    const plan = buildResumeLaunchPlan(
+      { sessionPath: join(root, "s.jsonl"), sessionModel: "openai/gpt-6.1-sol:low" },
+      record,
+      planCtx({ id: "efef5656" }),
+    );
+    assert.equal(modelArgOf(plan.piArgv), "openai/gpt-6.1-sol:low");
+    assert.equal(recordOf(plan).model, undefined);
+  });
+
+  const entry = (type: string, id: string, parentId: string | null, fields: Record<string, unknown> = {}) =>
+    JSON.stringify({ type, id, parentId, timestamp: "2026-11-18T01:00:00.000Z", ...fields });
+  const assistant = (id: string, parentId: string, provider: string, model: string, thinkingLevel?: string) =>
+    entry("message", id, parentId, { message: { role: "assistant", provider, model, thinkingLevel, content: [] } });
+
+  it("sessionModelArg reads the child's own selection on the active branch", () => {
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "s" }),
+      entry("model_change", "a", null, { provider: "openai", modelId: "gpt-6.1-sol" }),
+      entry("thinking_level_change", "b", "a", { thinkingLevel: "low" }),
+      // An abandoned branch that switched model and level.
+      entry("model_change", "c", "b", { provider: "anthropic", modelId: "claude-opus-5-5" }),
+      entry("thinking_level_change", "d", "c", { thinkingLevel: "high" }),
+      // The active leaf branches back under the original selection.
+      assistant("e", "b", "openai", "gpt-6.1-sol", "low"),
+    ];
+    assert.equal(sessionModelArg(lines.join("\n")), "openai/gpt-6.1-sol:low");
+    assert.equal(sessionModelArg(lines.slice(0, 1).join("\n")), undefined);
+  });
+
+  it("sessionModelArg returns undefined for a child on the virtual controller", () => {
+    const lines = [
+      JSON.stringify({ type: "session", version: 3, id: "s" }),
+      entry("model_change", "a", null, { provider: "anthropic", modelId: "claude-opus-5-5" }),
+      entry("model_change", "b", "a", { provider: "pi-light", modelId: "controller" }),
+      assistant("c", "b", "claude-bridge", "claude-opus-5-5", "medium"),
+    ];
+    assert.equal(sessionModelArg(lines.join("\n")), undefined);
+  });
+
+  it("sessionModelArg ignores a fork's inherited parent entries and uses the child's assistant", () => {
+    const parent = join(root, "parent.jsonl");
+    writeFileSync(
+      parent,
+      [
+        JSON.stringify({ type: "session", version: 3, id: "p", timestamp: "2026-11-18T00:59:00.000Z" }),
+        entry("model_change", "p1", null, { provider: "pi-light", modelId: "controller" }),
+        entry("thinking_level_change", "p2", "p1", { thinkingLevel: "high" }),
+        entry("message", "p3", "p2", { message: { role: "user", content: [] } }),
+        assistant("p4", "p3", "claude-bridge", "claude-opus-5-5", "high"),
+        entry("message", "p5", "p4", { message: { role: "user", content: [] } }),
+      ].join("\n") + "\n",
+    );
+    const child = join(root, "child.jsonl");
+    seedSubagentSessionFile({ mode: "fork", parentSessionFile: parent, childSessionFile: child, childCwd: root });
+    const later = new Date(Date.now() + 60_000).toISOString();
+    const own = (id: string, parentId: string, fields: Record<string, unknown>) =>
+      JSON.stringify({ type: "message", id, parentId, timestamp: later, ...fields });
+    appendFileSync(
+      child,
+      [
+        own("c1", "p4", { message: { role: "user", content: [] } }),
+        own("c2", "c1", { message: { role: "assistant", provider: "openai", model: "gpt-6.1-sol", thinkingLevel: "low", content: [] } }),
+      ].join("\n") + "\n",
+    );
+    assert.equal(sessionModelArg(readFileSync(child, "utf8")), "openai/gpt-6.1-sol:low");
   });
 });
 

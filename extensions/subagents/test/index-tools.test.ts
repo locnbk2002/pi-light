@@ -446,6 +446,42 @@ describe("index tools: subagent_resume", () => {
     assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" });
   });
 
+  it("resumes on the session's original model when an older launch record lacks one, without recording it", async () => {
+    const fake = registerAll();
+    const fx = makeFixture();
+    const sessionPath = join(fx.root, "child.jsonl");
+    writeChildSession(sessionPath, "old summary");
+    writeFileSync(
+      sessionPath,
+      [
+        JSON.stringify({ type: "session", version: 3, id: "s1", cwd: "/tmp" }),
+        JSON.stringify({ type: "model_change", id: "mc", parentId: null, provider: "openai", modelId: "gpt-6.1-sol" }),
+        JSON.stringify({ type: "thinking_level_change", id: "tl", parentId: "mc", thinkingLevel: "low" }),
+        JSON.stringify({ type: "message", id: "m1", parentId: "tl", message: { role: "user", content: [{ type: "text", text: "task" }] } }),
+      ].join("\n") + "\n",
+    );
+
+    let launchedScript: string | null = null;
+    __test__.setDeps({
+      client: makeFakeClient({
+        paneStart: async (p: any) => {
+          launchedScript = p.launchScriptFile;
+          return { paneId: "w1:p8", terminalId: "", workspaceId: "", tabId: "" };
+        },
+      }),
+      watch: async (): Promise<SubagentOutcome> => ({ kind: "completed", summary: "s", exitCode: 0, summarySource: "sidecar" }),
+      createStream: () => makeFakeStream() as any,
+    });
+
+    const tool = fake.findTool("subagent_resume");
+    await tool.execute("t1", { sessionPath }, undefined, undefined, fx.ctx);
+
+    assert.match(readFileSync(launchedScript!, "utf8"), /'--model' 'openai\/gpt-6\.1-sol:low'/);
+    const record = JSON.parse(readFileSync(`${sessionPath}.launch.json`, "utf8"));
+    assert.equal(record.model, undefined, "an inferred model is not recorded as launch evidence");
+    await waitFor(() => fake.sent.length === 1);
+  });
+
   it("keeps a sidecar summary on resume even when no new text entries exist", async () => {
     const fake = registerAll();
     const fx = makeFixture();

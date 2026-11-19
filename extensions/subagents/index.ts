@@ -56,6 +56,7 @@ import {
   launchRecordPath,
   parseLaunchRecord,
   resolveResumeLaunchBehavior,
+  sessionModelArg,
   type LaunchRecord,
 } from "./src/launch.ts";
 import {
@@ -615,6 +616,16 @@ function readLaunchRecord(sessionPath: string): LaunchRecord | { error: string }
   }
 }
 
+/** For records written before the model was stored: the model the session's child last ran on. */
+function recoverSessionModel(sessionPath: string, record: LaunchRecord): string | undefined {
+  if (record.model) return undefined;
+  try {
+    return sessionModelArg(readFileSync(sessionPath, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 const HEADLESS_INTERACTIVE_REFUSAL =
   "interactive agent needs herdr; run the interview in the main session with ask_user";
 
@@ -1001,7 +1012,7 @@ const RESUME_DESCRIPTION =
 
 async function executeSubagentResume(
   pi: ExtensionAPI,
-  params: { sessionPath: string; name?: string; message?: string; autoExit?: boolean },
+  params: { sessionPath: string; name?: string; message?: string; autoExit?: boolean; model?: string },
   ctx: LaunchCtx,
 ) {
   if (params.name !== undefined) {
@@ -1052,8 +1063,9 @@ async function executeSubagentResume(
 
   let plan;
   try {
-    const { sessionPath, name, message, autoExit } = params;
-    plan = buildResumeLaunchPlan({ sessionPath, name, message, autoExit }, record, {
+    const { sessionPath, name, message, autoExit, model } = params;
+    const sessionModel = model ? undefined : recoverSessionModel(sessionPath, record);
+    plan = buildResumeLaunchPlan({ sessionPath, name, message, autoExit, model, sessionModel }, record, {
       sessionDir: ctx.sessionManager.getSessionDir(),
       sessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile: ctx.sessionManager.getSessionFile() ?? "",
@@ -1138,6 +1150,12 @@ function registerResumeTool(pi: ExtensionAPI): void {
         Type.Boolean({
           description:
             "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+        }),
+      ),
+      model: Type.Optional(
+        Type.String({
+          description:
+            "Model override in provider/id form. Omit to keep the model the session originally ran on (for example a cross-family reviewer stays on its model).",
         }),
       ),
     }),

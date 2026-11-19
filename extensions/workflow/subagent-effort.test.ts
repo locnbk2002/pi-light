@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildLaunchPlan, buildResumeLaunchPlan } from '../subagents/src/launch.ts';
 import { CONTROLLER_MODEL, hasThinkingSuffix, innerExplicitLevel, planSubagentEffort } from './subagent-effort.ts';
 
 const SOL = 'openai-codex/gpt-6.1-sol';
@@ -39,10 +40,24 @@ test('child fix-up finds the explicit level only in a double suffix', () => {
   assert.equal(innerExplicitLevel(['@task.md']), undefined);
 });
 
-test('the subagent launch format this relies on is unchanged', async () => {
-  // extensions/subagents/src/launch.ts: `--model ${model}:${thinking}`, only when a model is set.
-  const source = await readFile(join(import.meta.dirname, '..', 'subagents', 'src', 'launch.ts'), 'utf8');
-  assert.match(source, /const effectiveModel = params\.model \?\? agentDefs\?\.model;/);
-  assert.match(source, /const effectiveThinking = agentDefs\?\.thinking;/);
-  assert.match(source, /if \(effectiveModel\) \{\s*piArgv\.push\("--model", effectiveThinking \? `\$\{effectiveModel\}:\$\{effectiveThinking\}` : effectiveModel\);/);
+test('spawn and resume pass the model as base:explicit:agentlevel, and the child restores the explicit level', () => {
+  const ctx = {
+    sessionDir: join(tmpdir(), 'effort-launch'),
+    sessionId: 'orch',
+    parentSessionFile: join(tmpdir(), 'effort-launch', 'parent.jsonl'),
+    parentCwd: tmpdir(),
+    env: { PATH: '/usr/bin:/bin', PI_HERDR_PI_BIN: '/usr/bin/pi' },
+    now: new Date('2026-11-19T00:00:00.000Z'),
+    toolCeiling: { active: ['read'] },
+    projectTrusted: true,
+  };
+  const spawned = buildLaunchPlan({ name: 'R', task: 't', model: `${SOL}:high` }, { thinking: 'low' }, { ...ctx, id: 'aaaa1111' });
+  assert.equal(innerExplicitLevel(spawned.piArgv.slice(1)), 'high');
+  const plain = buildLaunchPlan({ name: 'R', task: 't' }, null, { ...ctx, id: 'bbbb2222' });
+  assert.ok(!plain.piArgv.includes('--model'), 'no model flag without a model, so the child joins the controller chain');
+
+  const record = JSON.parse(spawned.files.find(file => file.path.endsWith('.launch.json'))!.content);
+  const resumed = buildResumeLaunchPlan({ sessionPath: spawned.sessionFile }, record, { ...ctx, id: 'cccc3333' });
+  assert.equal(resumed.piArgv[resumed.piArgv.indexOf('--model') + 1], `${SOL}:high:low`);
+  assert.equal(innerExplicitLevel(resumed.piArgv.slice(1)), 'high');
 });

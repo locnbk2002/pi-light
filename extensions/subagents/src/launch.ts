@@ -196,6 +196,8 @@ export interface LaunchRecord {
   denyTools: string[];
   /** The child's --tools allowlist. */
   tools: string[];
+  /** The child's --model argument; absent when it ran without one. */
+  model?: string;
 }
 
 export function launchRecordPath(sessionFile: string): string {
@@ -216,7 +218,92 @@ export function parseLaunchRecord(text: string): LaunchRecord {
   const agent = data.agent;
   if (agent !== null && !isSafeAgentName(agent)) throw new Error("launch record has an invalid agent name");
   if (!isStringArray(data.denyTools) || !isStringArray(data.tools)) throw new Error("launch record is malformed");
-  return { version: 1, agent, denyTools: data.denyTools, tools: data.tools };
+  if (data.model !== undefined && (typeof data.model !== "string" || !data.model)) {
+    throw new Error("launch record has an invalid model");
+  }
+  return {
+    version: 1,
+    agent,
+    denyTools: data.denyTools,
+    tools: data.tools,
+    ...(data.model ? { model: data.model } : {}),
+  };
+}
+
+/** The workflow extension's virtual controller model (workflow/model-fallback.ts VIRTUAL_CONTROLLER). */
+const VIRTUAL_CONTROLLER_PROVIDER = "pi-light";
+const VIRTUAL_CONTROLLER_ID = "controller";
+
+type RawEntry = Record<string, any>;
+
+/**
+ * The --model argument that reproduces the model a session's child last ran on,
+ * for runs recorded before launch records stored the model. Returns undefined when
+ * the child ran on the controller chain or there is no evidence, so the resume
+ * launches without --model exactly as before.
+ *
+ * Reads only the active branch (leaf = last entry, walked up through parentId, as
+ * Pi restores it) and only the child's own entries: a forked child's file starts
+ * with the parent's entries, which predate the child's header, and Pi does not
+ * record the child's CLI model in a session that already has messages. The
+ * child's own model selection wins; without one, the last assistant message
+ * says which provider and model actually answered.
+ */
+export function sessionModelArg(sessionText: string): string | undefined {
+  const entries: RawEntry[] = [];
+  for (const line of sessionText.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry && typeof entry === "object") entries.push(entry);
+    } catch {
+      // ignore malformed lines
+    }
+  }
+  const header = entries.find((entry) => entry.type === "session");
+  const byId = new Map<string, RawEntry>();
+  for (const entry of entries) if (typeof entry.id === "string") byId.set(entry.id, entry);
+
+  const seededAt = header?.parentSession && typeof header.timestamp === "string" ? Date.parse(header.timestamp) : NaN;
+  const isOwn = (entry: RawEntry) => Number.isNaN(seededAt) || !(Date.parse(entry.timestamp) < seededAt);
+
+  let selection: RawEntry | undefined;
+  let thinking: string | undefined;
+  let assistant: RawEntry | undefined;
+  const seen = new Set<RawEntry>();
+  let current: RawEntry | undefined = entries.filter((entry) => entry !== header).at(-1);
+  // Leaf to root, so the first match of each kind is the latest on the branch.
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (isOwn(current)) {
+      if (!selection && current.type === "model_change" && typeof current.provider === "string" && typeof current.modelId === "string") {
+        selection = current;
+      } else if (thinking === undefined && current.type === "thinking_level_change" && typeof current.thinkingLevel === "string") {
+        thinking = current.thinkingLevel;
+      } else if (
+        !assistant &&
+        current.type === "message" &&
+        current.message?.role === "assistant" &&
+        typeof current.message.provider === "string" &&
+        typeof current.message.model === "string"
+      ) {
+        assistant = current.message;
+      }
+    }
+    current = typeof current.parentId === "string" ? byId.get(current.parentId) : undefined;
+  }
+
+  let model: string;
+  if (selection) {
+    if (selection.provider === VIRTUAL_CONTROLLER_PROVIDER && selection.modelId === VIRTUAL_CONTROLLER_ID) return undefined;
+    model = `${selection.provider}/${selection.modelId}`;
+  } else if (assistant) {
+    model = `${assistant.provider}/${assistant.model}`;
+  } else {
+    return undefined;
+  }
+  const level = thinking ?? (typeof assistant?.thinkingLevel === "string" ? assistant.thinkingLevel : undefined);
+  return level ? `${model}:${level}` : model;
 }
 
 /**
@@ -453,9 +540,10 @@ export function buildLaunchPlan(
   const subagentDonePath = ctx.subagentDonePath ?? join(PACKAGE_ROOT, "subagent-done.ts");
   piArgv.push("-e", subagentDonePath);
 
-  if (effectiveModel) {
-    piArgv.push("--model", effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel);
-  }
+  const modelArg = effectiveModel
+    ? effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel
+    : undefined;
+  if (modelArg) piArgv.push("--model", modelArg);
 
   // System prompt via file — pi's --system-prompt/--append-system-prompt
   // auto-detect file paths, avoiding shell escaping issues with multiline content.
@@ -504,6 +592,7 @@ export function buildLaunchPlan(
       agent: params.agent ?? null,
       denyTools,
       tools: toolAllowlist.split(","),
+      ...(modelArg ? { model: modelArg } : {}),
     }),
   );
 
@@ -574,6 +663,13 @@ export interface ResumeLaunchParams {
   name?: string;
   message?: string;
   autoExit?: boolean;
+  /** Model override; defaults to the model the original run used. Recorded for later resumes. */
+  model?: string;
+  /**
+   * Model recovered from the session for runs recorded without one. Used for this
+   * launch only and never recorded, since it is inferred rather than launch evidence.
+   */
+  sessionModel?: string;
 }
 
 /**
@@ -662,7 +758,17 @@ export function buildResumeLaunchPlan(
   const toolAllowlist = resolveChildTools(ctx.toolCeiling, record.tools.join(","));
   piArgv.push("--tools", toolAllowlist);
   if (!ctx.projectTrusted) piArgv.push(NO_APPROVE_FLAG);
-  files.push(launchRecordFile(params.sessionPath, { ...record, tools: toolAllowlist.split(",") }));
+  // Keep the original run's model: without --model the child would fall back to the default.
+  const recordedModel = params.model || record.model;
+  const model = recordedModel || params.sessionModel;
+  if (model) piArgv.push("--model", model);
+  files.push(
+    launchRecordFile(params.sessionPath, {
+      ...record,
+      tools: toolAllowlist.split(","),
+      ...(recordedModel ? { model: recordedModel } : {}),
+    }),
+  );
 
   let resumeMessageFile: string | null = null;
   if (params.message) {
