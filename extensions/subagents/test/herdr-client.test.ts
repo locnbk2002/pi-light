@@ -174,6 +174,72 @@ describe("HerdrClient", () => {
     assert.equal(argAfter(calls[5].args, "--placement"), "tab");
   });
 
+  it("paneStart keeps the two-pane cap when launches run concurrently", async () => {
+    // Stateful fake herdr: `pane list` reports the live layout and `plugin pane
+    // open` adds its pane only after yielding, like the real CLI round-trip.
+    const panes: Array<[string, string]> = [["w1:p1", "w1:t1"]];
+    const calls: ExecCall[] = [];
+    let nextPane = 2;
+    let nextTab = 2;
+    const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const exec: ExecFn = async (cmd, args) => {
+      calls.push({ cmd, args });
+      await tick();
+      if (args[0] === "pane" && args[1] === "list") {
+        return { stdout: paneListEnvelope(panes), stderr: "", code: 0 };
+      }
+      const paneId = `w1:p${nextPane++}`;
+      const tabId =
+        argAfter(args, "--placement") === "tab"
+          ? `w1:t${nextTab++}`
+          : panes.find(([id]) => id === argAfter(args, "--target-pane"))![1];
+      await tick();
+      panes.push([paneId, tabId]);
+      return { stdout: openedPaneEnvelope(paneId, tabId), stderr: "", code: 0 };
+    };
+    const client = createHerdrClient({ exec });
+    const start = () =>
+      client.paneStart({
+        name: "worker",
+        cwd: "/tmp/project",
+        targetPaneId: "w1:p1",
+        launchScriptFile: "/tmp/launch.sh",
+      });
+
+    await Promise.all([start(), start(), start()]);
+
+    const perTab = new Map<string, number>();
+    for (const [, tabId] of panes) perTab.set(tabId, (perTab.get(tabId) ?? 0) + 1);
+    assert.deepEqual(Object.fromEntries(perTab), { "w1:t1": 2, "w1:t2": 2 });
+    // Each placement decision reads the layout after the previous pane opened.
+    assert.deepEqual(
+      calls.map((call) => call.args[0]),
+      ["pane", "plugin", "pane", "plugin", "pane", "plugin"],
+    );
+  });
+
+  it("paneStart still serves later launches after one fails", async () => {
+    const { exec, calls } = fakeExec([
+      { stdout: paneListEnvelope([["w1:p1", "w1:t1"]]) },
+      { stderr: "open failed", code: 1 },
+      { stdout: paneListEnvelope([["w1:p1", "w1:t1"]]) },
+      { stdout: pluginPaneEnvelope },
+    ]);
+    const client = createHerdrClient({ exec });
+    const start = () =>
+      client.paneStart({
+        name: "worker",
+        cwd: "/tmp/project",
+        targetPaneId: "w1:p1",
+        launchScriptFile: "/tmp/launch.sh",
+      });
+
+    const [first, second] = await Promise.allSettled([start(), start()]);
+    assert.equal(first.status, "rejected");
+    assert.equal(second.status, "fulfilled");
+    assert.equal(calls.length, 4);
+  });
+
   it("paneStart falls back to a split when the pane list fails", async () => {
     const { exec, calls } = fakeExec([
       { stderr: "boom", code: 1 },

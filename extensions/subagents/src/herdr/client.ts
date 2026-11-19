@@ -60,7 +60,9 @@ export interface HerdrClient {
    * Placement keeps at most MAX_PANES_PER_TAB panes per tab: the pane splits
    * beside the target while the target's tab has room, otherwise it splits
    * into an overflow tab this client opened earlier that still has room,
-   * otherwise it opens in a new tab of the target's workspace.
+   * otherwise it opens in a new tab of the target's workspace. Launches are
+   * queued, so concurrent calls each place against the layout the previous
+   * call left behind.
    */
   paneStart(p: {
     name: string;
@@ -139,6 +141,12 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
   const exec = opts?.exec ?? defaultExec;
   /** Tabs this client opened for subagents; only these are reused for overflow. */
   const overflowTabs = new Set<string>();
+  /**
+   * Tail of the launch queue. Placement reads the live layout, so concurrent
+   * launches must each see the pane the previous launch opened; otherwise
+   * they all split the same tab past MAX_PANES_PER_TAB.
+   */
+  let launchQueue: Promise<unknown> = Promise.resolve();
 
   function resolveBin(): string {
     return opts?.bin ?? process.env.HERDR_BIN ?? "herdr";
@@ -218,53 +226,59 @@ export function createHerdrClient(opts?: { exec?: ExecFn; bin?: string }): Herdr
     return { kind: "tab", workspaceId: target.workspace_id };
   }
 
-  return {
-    async paneStart(p) {
-      const placement = await choosePlacement(p.targetPaneId);
-      const args = [
-        "plugin",
-        "pane",
-        "open",
-        "--plugin",
-        HERDR_PLUGIN_ID,
-        "--entrypoint",
-        HERDR_PLUGIN_ENTRYPOINT,
-        "--placement",
-        placement.kind,
-      ];
-      if (placement.kind === "split") {
-        if (placement.targetPaneId) args.push("--target-pane", placement.targetPaneId);
-        args.push("--direction", p.direction ?? "right");
-      } else if (placement.workspaceId) {
-        args.push("--workspace", placement.workspaceId);
-      }
-      args.push("--cwd", p.cwd);
-      for (const [key, value] of Object.entries({
-        ...p.env,
-        PI_HERDR_LAUNCH_SCRIPT: p.launchScriptFile,
-      })) {
-        args.push("--env", `${key}=${value}`);
-      }
-      args.push("--no-focus");
+  async function openPluginPane(p: Parameters<HerdrClient["paneStart"]>[0]): Promise<PaneStartResult> {
+    const placement = await choosePlacement(p.targetPaneId);
+    const args = [
+      "plugin",
+      "pane",
+      "open",
+      "--plugin",
+      HERDR_PLUGIN_ID,
+      "--entrypoint",
+      HERDR_PLUGIN_ENTRYPOINT,
+      "--placement",
+      placement.kind,
+    ];
+    if (placement.kind === "split") {
+      if (placement.targetPaneId) args.push("--target-pane", placement.targetPaneId);
+      args.push("--direction", p.direction ?? "right");
+    } else if (placement.workspaceId) {
+      args.push("--workspace", placement.workspaceId);
+    }
+    args.push("--cwd", p.cwd);
+    for (const [key, value] of Object.entries({
+      ...p.env,
+      PI_HERDR_LAUNCH_SCRIPT: p.launchScriptFile,
+    })) {
+      args.push("--env", `${key}=${value}`);
+    }
+    args.push("--no-focus");
 
-      const result = await execHerdrJson<{
-        plugin_pane?: { pane?: Record<string, unknown> };
-      }>(args);
-      const pane = result.plugin_pane?.pane as
-        | { pane_id?: string; terminal_id?: string; workspace_id?: string; tab_id?: string }
-        | undefined;
-      if (!pane?.pane_id) {
-        throw new HerdrError(
-          `herdr plugin pane open returned no pane id: ${JSON.stringify(result)}`,
-        );
-      }
-      if (placement.kind === "tab" && pane.tab_id) overflowTabs.add(pane.tab_id);
-      return {
-        paneId: pane.pane_id,
-        terminalId: pane.terminal_id ?? "",
-        workspaceId: pane.workspace_id ?? "",
-        tabId: pane.tab_id ?? "",
-      };
+    const result = await execHerdrJson<{
+      plugin_pane?: { pane?: Record<string, unknown> };
+    }>(args);
+    const pane = result.plugin_pane?.pane as
+      | { pane_id?: string; terminal_id?: string; workspace_id?: string; tab_id?: string }
+      | undefined;
+    if (!pane?.pane_id) {
+      throw new HerdrError(
+        `herdr plugin pane open returned no pane id: ${JSON.stringify(result)}`,
+      );
+    }
+    if (placement.kind === "tab" && pane.tab_id) overflowTabs.add(pane.tab_id);
+    return {
+      paneId: pane.pane_id,
+      terminalId: pane.terminal_id ?? "",
+      workspaceId: pane.workspace_id ?? "",
+      tabId: pane.tab_id ?? "",
+    };
+  }
+
+  return {
+    paneStart(p) {
+      const run = launchQueue.then(() => openPluginPane(p));
+      launchQueue = run.catch(() => {}); // a failed launch must not block later ones
+      return run;
     },
 
     async paneRename(paneId, label) {
