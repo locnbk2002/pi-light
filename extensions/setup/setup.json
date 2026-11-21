@@ -1,6 +1,5 @@
 {
   "packages": [
-    "npm:pi-effort",
     "git:github.com/elidickinson/pi-claude-bridge",
     "npm:@gotgenes/pi-permission-system",
     { "source": "git:github.com/locnbk2002/pi-light-kit", "optional": true,

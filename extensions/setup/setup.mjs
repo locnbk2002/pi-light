@@ -117,6 +117,9 @@ export function planSetup({ env = process.env, platform = process.platform, has 
     }
     else if (current !== source && source !== sourceKey(source)) notes.push(`${current} differs from pinned ${source} (left as is).`);
   }
+  if (have.some(p => sourceKey(p) === 'npm:pi-effort')) {
+    notes.push('pi-effort is no longer part of pi-light, which uses Pi\'s built-in thinking level (/thinking, Shift+Tab). Its per-model memory can override subagent effort; remove it with `pi remove npm:pi-effort` unless you need its extras (left as is).');
+  }
 
   const permissionPath = join(dir, MANIFEST.permissions.configPath);
   const permissionText = `${JSON.stringify(buildPermissionConfig(sshHosts(sshConfig)), null, 2)}\n`;

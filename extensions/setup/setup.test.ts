@@ -35,7 +35,8 @@ test('fresh machine: every package, the optional kit, herdr integration and the 
   assert.ok(!plan.steps.some((s: any) => s.cmd === 'ak'), 'setup never runs a kit-installer CLI');
   for (const source of SOURCES) assert.ok(commands.includes(`pi install ${source}`), source);
   assert.ok(!commands.some(c => c.includes('pi-herdr-subagents@')), 'pi-herdr-subagents is no longer a package');
-  assert.ok(commands.includes('pi install npm:pi-effort') && commands.includes('pi install git:github.com/elidickinson/pi-claude-bridge'), 'latest, unpinned');
+  assert.ok(commands.includes('pi install git:github.com/elidickinson/pi-claude-bridge'), 'latest, unpinned');
+  assert.ok(!commands.some(c => c.includes('pi-effort')), 'pi-effort is not installed; Pi owns the thinking level');
   const kit = plan.steps.find((s: any) => s.cmd === 'pi' && s.args[1] === KIT);
   assert.equal((kit as any)?.optional, true);
   assert.ok(commands.includes('herdr integration install pi'));
@@ -45,11 +46,20 @@ test('fresh machine: every package, the optional kit, herdr integration and the 
 });
 
 test('configured machine: nothing to install; pin drift is reported, not reverted', () => {
-  const dir = agentHome(['npm:pi-effort@old', 'git:github.com/elidickinson/pi-claude-bridge@old', 'npm:@gotgenes/pi-permission-system', KIT]);
+  const dir = agentHome(['git:github.com/elidickinson/pi-claude-bridge@old', 'npm:@gotgenes/pi-permission-system', KIT]);
   const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => !t.startsWith('microsoft'),
     run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current (v9) (x)' : pluginLine(VENDORED_PLUGIN), missing: false }) });
   assert.deepEqual(plan.steps.filter((s: any) => s.cmd), []);
   assert.ok(!plan.notes.some((n: string) => n.includes('pi-claude-bridge@old')), 'unpinned packages accept any installed ref');
+  assert.ok(!plan.notes.some((n: string) => n.includes('pi-effort')));
+});
+
+test('a leftover pi-effort install is reported with its removal command, never removed', () => {
+  const dir = agentHome([...SOURCES, 'npm:pi-effort@0.1.1']);
+  const plan = planSetup({ env: { PI_CODING_AGENT_DIR: dir }, platform: 'linux', has: (t: string) => !t.startsWith('microsoft'),
+    run: (_cmd: string, args: string[]) => ({ ok: true, out: args[0] === 'integration' ? 'pi: current (v9) (x)' : pluginLine(VENDORED_PLUGIN), missing: false }) });
+  assert.ok(!plan.steps.some((s: any) => s.cmd === 'pi' && s.args.some((a: string) => a.includes('pi-effort'))));
+  assert.ok(plan.notes.some((n: string) => n.includes('pi remove npm:pi-effort')));
 });
 
 test('a plugin linked from the old pi-herdr-subagents checkout is relinked to the vendored copy', () => {
