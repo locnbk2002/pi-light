@@ -1,7 +1,7 @@
 ---
 name: counsel
 description: Autonomous one-shot counsel for hard design, debugging or trade-off calls; never asks questions; advice only.
-model: anthropic/claude-fable-5-2
+model: anthropic/claude-mythos-5-2
 auto-exit: true
 ---
 

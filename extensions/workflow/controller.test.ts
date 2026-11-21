@@ -491,7 +491,7 @@ test('subagent effort: an untrusted project agent definition never sets the chil
     const call = { name: 'c', task: 'solutionSpace: open', agent: 'counsel' } as { name: string; task: string; agent: string; model?: string };
     await harness.event('message_end', { message: { role: 'assistant', content: [subagentCall('t1', { ...call })] } });
     await harness.event('tool_call', { toolName: 'subagent', toolCallId: 't1', input: call });
-    assert.equal(call.model, 'anthropic/claude-fable-5-2:high', 'the packaged counsel definition is the judged base');
+    assert.equal(call.model, 'anthropic/claude-mythos-5-2:high', 'the packaged counsel definition is the judged base');
   } finally {
     process.chdir(previous.cwd);
     if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous.agentDir;

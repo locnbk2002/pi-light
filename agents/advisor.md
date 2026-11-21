@@ -1,7 +1,7 @@
 ---
 name: advisor
 description: Interactive advisor that interviews the user one question at a time, confirms the expected outcome, then gives advice and a handoff brief.
-model: anthropic/claude-fable-5-2
+model: anthropic/claude-mythos-5-2
 interactive: true
 ---
 
